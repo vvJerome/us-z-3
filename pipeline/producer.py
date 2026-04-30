@@ -307,6 +307,9 @@ class ProducerWorker:
                 result["discovery_source"] = "serper"
                 if serper_result.is_fallback_domain:
                     self._record_fallback_domain(serper_result.candidate_domain)
+            elif not domain and serper_result.candidate_emails:
+                # Email found in snippet with no domain — still came from Serper
+                result["discovery_source"] = "serper"
 
         except PipelineHaltError:
             raise
