@@ -1,0 +1,46 @@
+# Credentials
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Pipeline run artifacts
+output/
+runs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Input data (large JSONL files)
+input/
+
+# Logs
+logs/
+*.log
+verify.log
+
+# Test cache
+.pytest_cache/
+
+# Claude session snapshots
+.claude/snapshots/
+
+# Context archives (PDFs / exports committed intentionally go in docs/)
+context/
+
+# Data
+input/
+output/

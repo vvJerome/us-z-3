@@ -1,0 +1,545 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import aiosqlite
+
+# ---------------------------------------------------------------------------
+# Status taxonomy constants — single source of truth
+# ---------------------------------------------------------------------------
+class State:
+    RAW               = "RAW"
+    DISCOVERING       = "DISCOVERING"
+    DISCOVERED        = "DISCOVERED"
+    VALIDATING        = "VALIDATING"
+    VALIDATED         = "VALIDATED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    DISCOVERY_FAILED  = "DISCOVERY_FAILED"
+    COST_SKIPPED      = "COST_SKIPPED"
+    ERROR             = "ERROR"
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS records (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_id           TEXT NOT NULL UNIQUE,
+    business_name       TEXT,
+    agent_name          TEXT,
+    state               TEXT,
+    jurisdiction        TEXT,
+    position_type       TEXT,
+    name_entity_type    TEXT,
+
+    -- Discovery outputs
+    candidate_email     TEXT,
+    candidate_emails    TEXT,
+    subdomain_emails    TEXT,
+    candidate_domain    TEXT,
+    discovery_source    TEXT,
+    discovery_attempts  INTEGER DEFAULT 0,
+    strategy            TEXT,
+    is_org_agent        INTEGER DEFAULT 0,
+    mx_provider         TEXT,
+
+    -- Validation outputs
+    zuhal_status        TEXT,
+    zuhal_score         REAL,
+    validation_attempts INTEGER DEFAULT 0,
+
+    -- State machine (lifecycle + verdict)
+    record_state        TEXT NOT NULL DEFAULT 'RAW',
+    verdict             TEXT,
+    process_trace       TEXT,
+
+    created_at          TEXT DEFAULT (datetime('now')),
+    updated_at          TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS stats (
+    run_id                   TEXT PRIMARY KEY,
+    total_input              INTEGER DEFAULT 0,
+    producer_processed       INTEGER DEFAULT 0,
+    discovery_hits           INTEGER DEFAULT 0,
+    discovery_misses         INTEGER DEFAULT 0,
+    validated                INTEGER DEFAULT 0,
+    validation_failed        INTEGER DEFAULT 0,
+    serper_calls             INTEGER DEFAULT 0,
+    brave_calls              INTEGER DEFAULT 0,
+    zuhal_calls              INTEGER DEFAULT 0,
+    estimated_cost_usd       REAL DEFAULT 0.0,
+    last_producer_heartbeat  TEXT,
+    last_consumer_heartbeat  TEXT,
+    updated_at               TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS failures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_id       TEXT NOT NULL,
+    phase           TEXT NOT NULL,
+    attempt         INTEGER NOT NULL,
+    error_type      TEXT,
+    error_detail    TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pattern_stats (
+    mx_provider   TEXT NOT NULL,
+    template      TEXT NOT NULL,
+    success_count INTEGER DEFAULT 0,
+    total_count   INTEGER DEFAULT 0,
+    PRIMARY KEY (mx_provider, template)
+);
+
+CREATE TABLE IF NOT EXISTS enrichment_cache (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_name_norm  TEXT NOT NULL,
+    agent_name_norm     TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    response_json       TEXT,
+    cached_at           TEXT DEFAULT (datetime('now')),
+    UNIQUE(business_name_norm, agent_name_norm, state, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_records_state ON records(record_state);
+CREATE INDEX IF NOT EXISTS idx_records_unique_id ON records(unique_id);
+CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
+CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business_name_norm, agent_name_norm, state, provider);
+"""
+
+INSERT_RECORD_SQL = """
+INSERT OR IGNORE INTO records (
+    unique_id, business_name, agent_name, state, jurisdiction,
+    position_type, name_entity_type, candidate_email, candidate_emails,
+    subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
+    strategy, is_org_agent, mx_provider, record_state, process_trace
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+UPSERT_CHECKPOINT_SQL = """
+INSERT INTO checkpoints (key, value, updated_at)
+VALUES (?, ?, datetime('now'))
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+"""
+
+
+async def init_db(db_path: Path) -> aiosqlite.Connection:
+    # isolation_level=None = true autocommit; explicit BEGIN in insert_records_batch works correctly
+    conn = await aiosqlite.connect(str(db_path), isolation_level=None)
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("PRAGMA busy_timeout=10000")
+    await conn.execute("PRAGMA cache_size=-64000")
+    await conn.execute("PRAGMA mmap_size=268435456")
+    await conn.execute("PRAGMA wal_autocheckpoint=1000")
+    await conn.execute("PRAGMA temp_store=MEMORY")
+    await conn.executescript(SCHEMA_SQL)
+    await conn.commit()
+    conn.row_factory = aiosqlite.Row
+    return conn
+
+
+async def get_checkpoint(conn: aiosqlite.Connection, key: str) -> str | None:
+    async with conn.execute(
+        "SELECT value FROM checkpoints WHERE key = ?", (key,)
+    ) as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def upsert_checkpoint(conn: aiosqlite.Connection, key: str, value: str) -> None:
+    await conn.execute(UPSERT_CHECKPOINT_SQL, (key, value))
+
+
+async def insert_records_batch(
+    conn: aiosqlite.Connection,
+    records: list[dict],
+    new_offset: int,
+) -> None:
+    """Atomically insert a batch of records and advance the producer checkpoint."""
+    async with conn.cursor() as cur:
+        await cur.execute("BEGIN")
+        try:
+            for r in records:
+                await cur.execute(INSERT_RECORD_SQL, (
+                    r["unique_id"],
+                    r.get("business_name", ""),
+                    r.get("agent_name", ""),
+                    r.get("state", ""),
+                    r.get("jurisdiction", ""),
+                    r.get("position_type", ""),
+                    r.get("name_entity_type", ""),
+                    r.get("candidate_email"),
+                    r.get("candidate_emails"),
+                    r.get("subdomain_emails"),
+                    r.get("candidate_domain"),
+                    r.get("discovery_source"),
+                    r.get("discovery_attempts", 0),
+                    r.get("strategy"),
+                    1 if r.get("is_org_agent") else 0,
+                    r.get("mx_provider"),
+                    r.get("record_state", State.RAW),
+                    r.get("process_trace"),
+                ))
+            await cur.execute(UPSERT_CHECKPOINT_SQL, ("producer_offset", str(new_offset)))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+
+async def fetch_pending_validation(
+    conn: aiosqlite.Connection,
+    limit: int = 10,
+) -> list[aiosqlite.Row]:
+    """Atomically claim up to `limit` DISCOVERED rows by setting them to VALIDATING."""
+    async with conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'VALIDATING', updated_at = datetime('now')
+         WHERE id IN (
+             SELECT id FROM records WHERE record_state = 'DISCOVERED' LIMIT ?
+         )
+        RETURNING *
+        """,
+        (limit,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def has_pending_validation(conn: aiosqlite.Connection) -> bool:
+    """Non-claiming check: True if any DISCOVERED rows exist."""
+    async with conn.execute(
+        "SELECT 1 FROM records WHERE record_state = 'DISCOVERED' LIMIT 1"
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def fetch_pending_discovery(
+    conn: aiosqlite.Connection,
+    limit: int = 100,
+) -> list[aiosqlite.Row]:
+    async with conn.execute(
+        "SELECT * FROM records WHERE record_state = 'DISCOVERING' LIMIT ?",
+        (limit,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> None:
+    """UPDATE discovery fields on an existing record (used by the retry loop)."""
+    await conn.execute(
+        """UPDATE records SET
+               record_state = ?, candidate_email = ?, candidate_emails = ?,
+               subdomain_emails = ?, candidate_domain = ?,
+               discovery_source = ?, discovery_attempts = ?,
+               mx_provider = ?,
+               updated_at = datetime('now')
+           WHERE unique_id = ?""",
+        (
+            result.get("record_state", State.DISCOVERING),
+            result.get("candidate_email"),
+            result.get("candidate_emails"),
+            result.get("subdomain_emails"),
+            result.get("candidate_domain"),
+            result.get("discovery_source"),
+            result.get("discovery_attempts", 1),
+            result.get("mx_provider"),
+            result["unique_id"],
+        ),
+    )
+    await conn.commit()
+
+
+async def update_record_status(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    record_state: str,
+    **extra_fields: object,
+) -> None:
+    sets = ["record_state = ?", "updated_at = datetime('now')"]
+    values: list[object] = [record_state]
+
+    for col, val in extra_fields.items():
+        sets.append(f"{col} = ?")
+        values.append(val)
+
+    values.append(unique_id)
+
+    sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
+    await conn.execute(sql, values)
+    await conn.commit()
+
+
+async def recover_stale_validating(
+    conn: aiosqlite.Connection,
+    timeout_minutes: int = 5,
+) -> int:
+    """Reset rows orphaned in VALIDATING by a crashed consumer back to DISCOVERED."""
+    cursor = await conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'DISCOVERED',
+               validation_attempts = validation_attempts + 1,
+               updated_at = datetime('now')
+         WHERE record_state = 'VALIDATING'
+           AND updated_at < datetime('now', ?)
+        """,
+        (f"-{timeout_minutes} minutes",),
+    )
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def append_process_trace(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    entry: dict,
+) -> None:
+    """Append a stage-outcome entry to the record's process_trace JSON array."""
+    await conn.execute(
+        """
+        UPDATE records
+           SET process_trace = json_insert(COALESCE(process_trace, '[]'), '$[#]', json(?))
+         WHERE unique_id = ?
+        """,
+        (json.dumps(entry), unique_id),
+    )
+    await conn.commit()
+
+
+async def insert_failure(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    phase: str,
+    attempt: int,
+    error_type: str,
+    error_detail: str,
+) -> None:
+    await conn.execute(
+        "INSERT INTO failures (unique_id, phase, attempt, error_type, error_detail) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (unique_id, phase, attempt, error_type, error_detail),
+    )
+    await conn.commit()
+
+
+async def upsert_stats(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    **fields: object,
+) -> None:
+    cols = ["run_id"]
+    vals: list[object] = [run_id]
+    updates = ["updated_at = datetime('now')"]
+
+    for col, val in fields.items():
+        cols.append(col)
+        vals.append(val)
+        updates.append(f"{col} = excluded.{col}")
+
+    placeholders = ", ".join(["?"] * len(cols))
+    col_str = ", ".join(cols)
+    update_str = ", ".join(updates)
+
+    sql = (
+        f"INSERT INTO stats ({col_str}) VALUES ({placeholders}) "
+        f"ON CONFLICT(run_id) DO UPDATE SET {update_str}"
+    )
+    await conn.execute(sql, vals)
+    await conn.commit()
+
+
+async def upsert_producer_heartbeat(conn: aiosqlite.Connection) -> None:
+    await conn.execute(
+        """
+        UPDATE stats SET last_producer_heartbeat = datetime('now'), updated_at = datetime('now')
+        WHERE rowid = (SELECT MAX(rowid) FROM stats)
+        """
+    )
+    await conn.commit()
+
+
+async def upsert_consumer_heartbeat(conn: aiosqlite.Connection) -> None:
+    await conn.execute(
+        """
+        UPDATE stats SET last_consumer_heartbeat = datetime('now'), updated_at = datetime('now')
+        WHERE rowid = (SELECT MAX(rowid) FROM stats)
+        """
+    )
+    await conn.commit()
+
+
+async def get_status_summary(conn: aiosqlite.Connection) -> dict:
+    summary: dict = {}
+
+    async with conn.execute(
+        "SELECT record_state, COUNT(*) FROM records GROUP BY record_state"
+    ) as cursor:
+        summary["records_by_state"] = {row[0]: row[1] async for row in cursor}
+
+    async with conn.execute("SELECT COUNT(*) FROM records") as cursor:
+        row = await cursor.fetchone()
+        summary["total_records"] = row[0] if row else 0
+
+    offset = await get_checkpoint(conn, "producer_offset")
+    summary["producer_offset"] = int(offset) if offset else 0
+
+    done = await get_checkpoint(conn, "producer_done")
+    summary["producer_done"] = done == "true"
+
+    async with conn.execute("SELECT * FROM stats LIMIT 1") as cursor:
+        row = await cursor.fetchone()
+        if row:
+            summary["stats"] = dict(row)
+
+    async with conn.execute(
+        "SELECT phase, COUNT(*) FROM failures GROUP BY phase"
+    ) as cursor:
+        summary["failures_by_phase"] = {row[0]: row[1] async for row in cursor}
+
+    return summary
+
+
+async def reset_failed_records(
+    conn: aiosqlite.Connection,
+    record_state: str = State.DISCOVERY_FAILED,
+    phase: str | None = None,
+) -> int:
+    if phase:
+        sql = """
+            UPDATE records SET record_state = 'RAW', discovery_attempts = 0, updated_at = datetime('now')
+            WHERE record_state = ? AND unique_id IN (
+                SELECT DISTINCT unique_id FROM failures WHERE phase = ?
+            )
+        """
+        cursor = await conn.execute(sql, (record_state, phase))
+    else:
+        if record_state == State.VALIDATION_FAILED:
+            sql = """
+                UPDATE records SET record_state = 'DISCOVERED', validation_attempts = 0,
+                updated_at = datetime('now')
+                WHERE record_state = ?
+            """
+        else:
+            sql = """
+                UPDATE records SET record_state = 'RAW', discovery_attempts = 0,
+                updated_at = datetime('now')
+                WHERE record_state = ?
+            """
+        cursor = await conn.execute(sql, (record_state,))
+
+    await conn.commit()
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# pattern_stats helpers
+# ---------------------------------------------------------------------------
+
+async def get_pattern_rankings(
+    conn: aiosqlite.Connection,
+    mx_provider: str,
+) -> list[dict]:
+    """Return templates ordered by success rate for this MX provider."""
+    async with conn.execute(
+        """
+        SELECT template, success_count, total_count
+          FROM pattern_stats
+         WHERE mx_provider = ? AND total_count > 0
+         ORDER BY CAST(success_count AS REAL) / total_count DESC
+        """,
+        (mx_provider,),
+    ) as cursor:
+        return [
+            {"template": row[0], "success_count": row[1], "total_count": row[2]}
+            async for row in cursor
+        ]
+
+
+async def record_pattern_result(
+    conn: aiosqlite.Connection,
+    mx_provider: str,
+    template: str,
+    success: bool,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO pattern_stats (mx_provider, template, success_count, total_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(mx_provider, template) DO UPDATE SET
+            success_count = success_count + ?,
+            total_count = total_count + 1
+        """,
+        (mx_provider, template, 1 if success else 0, 1 if success else 0),
+    )
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# enrichment_cache helpers
+# ---------------------------------------------------------------------------
+
+async def get_enrichment_cache(
+    conn: aiosqlite.Connection,
+    business_name: str,
+    agent_name: str,
+    state: str,
+    provider: str,
+    ttl_days: int = 30,
+) -> str | None:
+    """Return cached response JSON if within TTL, else None."""
+    async with conn.execute(
+        """
+        SELECT response_json FROM enrichment_cache
+         WHERE business_name_norm = ?
+           AND agent_name_norm = ?
+           AND state = ?
+           AND provider = ?
+           AND cached_at > datetime('now', ?)
+        """,
+        (
+            business_name.lower().strip(),
+            agent_name.lower().strip(),
+            state,
+            provider,
+            f"-{ttl_days} days",
+        ),
+    ) as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_enrichment_cache(
+    conn: aiosqlite.Connection,
+    business_name: str,
+    agent_name: str,
+    state: str,
+    provider: str,
+    response_json: str,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO enrichment_cache
+            (business_name_norm, agent_name_norm, state, provider, response_json, cached_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(business_name_norm, agent_name_norm, state, provider) DO UPDATE SET
+            response_json = excluded.response_json,
+            cached_at = datetime('now')
+        """,
+        (
+            business_name.lower().strip(),
+            agent_name.lower().strip(),
+            state,
+            provider,
+            response_json,
+        ),
+    )
+    await conn.commit()
