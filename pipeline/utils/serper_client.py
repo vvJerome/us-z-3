@@ -56,6 +56,7 @@ class SerperClient:
         self.max_attempts = max_attempts
         self.jitter = jitter
         self._base, self._max_delay = SERVICE_BACKOFF["serper"]
+        self._fallback_calls = 0  # extra API calls made by site: fallback retries
 
     async def enrich(
         self,
@@ -80,9 +81,12 @@ class SerperClient:
 
         biz_norm = business_name.lower().strip()
         agent_norm = (agent_name or "").lower().strip()
+        # Cache key includes strategy and domain_hint so different query types
+        # for the same business don't return each other's cached results.
+        cache_provider = f"serper:{strategy}:{(domain_hint or '').lower()}"
 
         if conn is not None:
-            cached = await db.get_enrichment_cache(conn, biz_norm, agent_norm, state, "serper")
+            cached = await db.get_enrichment_cache(conn, biz_norm, agent_norm, state, cache_provider)
             if cached is not None:
                 logger.debug("Serper cache hit for %s/%s/%s", biz_norm, agent_norm, state)
                 return self._extract(json.loads(cached), business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
@@ -102,7 +106,7 @@ class SerperClient:
         )
 
         if conn is not None:
-            await db.set_enrichment_cache(conn, biz_norm, agent_norm, state, "serper", json.dumps(data))
+            await db.set_enrichment_cache(conn, biz_norm, agent_norm, state, cache_provider, json.dumps(data))
 
         result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
 
@@ -124,6 +128,7 @@ class SerperClient:
                     "Serper fallback retry %d: %s (wait %.1fs)", attempt, exc, delay,
                 ),
             )
+            self._fallback_calls += 1
             fallback = self._extract(data2, business_name, fallback_query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
             if fallback.candidate_emails:
                 result = EnrichmentResult(

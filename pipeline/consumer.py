@@ -114,7 +114,9 @@ class ConsumerWorker:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for res in results:
-                if isinstance(res, BaseException) and not isinstance(res, PipelineHaltError):
+                if isinstance(res, PipelineHaltError):
+                    raise res
+                if isinstance(res, BaseException):
                     logger.error("Unexpected error in validation task", exc_info=res)
 
         _hb.cancel()
@@ -139,6 +141,8 @@ class ConsumerWorker:
 
             # Row already claimed as VALIDATING via atomic fetch_pending_validation
             last_verdict: str | None = None
+            # Accumulate trace entries in memory; flush once at end (reduces DB commits)
+            pending_trace: list[dict] = []
 
             mx_provider = row["mx_provider"] if "mx_provider" in row.keys() else None
             use_ms_probe = is_microsoft_mx(mx_provider)
@@ -161,7 +165,7 @@ class ConsumerWorker:
                     _ms_ms = int((time.monotonic() - _ms_t0) * 1000)
                     ms_status = ms_result.get("status", "error")
 
-                    await db.append_process_trace(self.conn, unique_id, {
+                    pending_trace.append({
                         "stage": "ms_api", "outcome": ms_status, "ms": _ms_ms, "email": email,
                     })
 
@@ -182,6 +186,7 @@ class ConsumerWorker:
                             verdict="valid",
                             zuhal_score=score,
                         )
+                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
                         logger.info("MS-validated (no Zuhal): %s -> %s", unique_id, email)
                         return
 
@@ -225,6 +230,9 @@ class ConsumerWorker:
                 # Successful API response — reset the error streak
                 self._consecutive_api_errors = 0
                 last_verdict = result.verdict
+                pending_trace.append({
+                    "stage": "zuhal", "outcome": result.verdict, "ms": _zuhal_ms, "email": email,
+                })
 
                 if result.verdict in ("valid", "accept-all"):
                     score = compute_confidence_score(
@@ -243,19 +251,13 @@ class ConsumerWorker:
                         verdict=result.verdict,
                         zuhal_score=score,
                     )
-                    await db.append_process_trace(self.conn, unique_id, {
-                        "stage": "zuhal", "outcome": result.verdict, "ms": _zuhal_ms, "email": email,
-                    })
+                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     if mx_provider:
                         tmpl = email_to_template(email, _first, _last, candidate_domain)
                         if tmpl:
                             await db.record_pattern_result(self.conn, mx_provider, tmpl, success=True)
                     logger.info("Validated: %s -> %s (%s)", unique_id, email, result.verdict)
                     return
-
-                await db.append_process_trace(self.conn, unique_id, {
-                    "stage": "zuhal", "outcome": result.verdict, "ms": _zuhal_ms, "email": email,
-                })
 
                 if mx_provider:
                     tmpl = email_to_template(email, _first, _last, candidate_domain)
@@ -278,6 +280,7 @@ class ConsumerWorker:
                 zuhal_status=last_verdict,
                 verdict=last_verdict,
             )
+            await db.flush_process_trace(self.conn, unique_id, pending_trace)
             logger.debug("All candidates failed for %s (last verdict: %s)", unique_id, last_verdict)
 
 

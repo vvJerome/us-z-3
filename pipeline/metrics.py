@@ -38,7 +38,7 @@ async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
         row = await cur.fetchone()
         if row:
             lines.append(f"pipeline_cost_usd {row[0] or 0:.6f}")
-            for svc, n in (("serper", row[1]), ("brave", row[2]), ("zuhal", row[3])):
+            for svc, n in (("serper", row[1]), ("zuhal", row[3])):
                 lines.append(f'pipeline_api_calls_total{{service="{svc}"}} {n or 0}')
 
     body = "\n".join(lines) + "\n"

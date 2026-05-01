@@ -297,6 +297,10 @@ class ProducerWorker:
                     conn=self.conn,
                 )
                 self.cost_tracker.record_call("serper")
+                # Record any extra cost from site: fallback retries
+                for _ in range(self._serper._fallback_calls):
+                    self.cost_tracker.record_call("serper")
+                self._serper._fallback_calls = 0
 
             _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
             enrichment_emails.extend(serper_result.candidate_emails)

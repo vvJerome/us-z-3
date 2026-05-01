@@ -81,9 +81,9 @@ async def _resolve_mx(resolver: aiodns.DNSResolver, domain: str) -> str | None:
         if records:
             best = min(records, key=lambda r: r.priority)
             return best.host
+        return None
     except aiodns.error.DNSError:
         return None
-    return None
 
 
 def _is_transient_dns_error(exc: Exception) -> bool:

@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser = subparsers.add_parser("reset", help="Re-queue failed records")
     reset_parser.add_argument("--db", default="output/pipeline.db", help="Database path")
     reset_parser.add_argument("--status", default="discovery_failed",
-                              choices=["discovery_failed", "validation_failed"],
+                              choices=["discovery_failed", "validation_failed", "cost_skipped"],
                               help="Which status to re-queue")
     reset_parser.add_argument("--phase", default=None,
                               choices=["dns", "serper", "zuhal"],
@@ -64,8 +64,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Email discovery strategy")
 
     # Concurrency
-    parser.add_argument("--dns-concurrency", type=int, default=20, help="DNS semaphore size")
-    parser.add_argument("--serper-concurrency", type=int, default=10, help="Serper semaphore size")
+    parser.add_argument("--dns-concurrency", type=int, default=100, help="DNS semaphore size")
+    parser.add_argument("--serper-concurrency", type=int, default=15, help="Serper semaphore size")
     parser.add_argument("--zuhal-concurrency", type=int, default=3, help="Zuhal semaphore size")
 
     # Rate limits

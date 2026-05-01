@@ -38,7 +38,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         logger.info("Shutdown signal received — stopping workers gracefully")
         stop_event.set()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _signal_handler)

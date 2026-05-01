@@ -44,7 +44,7 @@ class EnrichmentResult:
     subdomain_emails: list[str] = field(default_factory=list)
     candidate_domain: str | None = None
     is_fallback_domain: bool = False  # True when domain came from first-organic fallback, not fuzzy match
-    source: Literal["serper", "brave"] = "serper"
+    source: Literal["serper"] = "serper"
     query_used: str = ""
     raw_snippets: list[str] = field(default_factory=list)
 
