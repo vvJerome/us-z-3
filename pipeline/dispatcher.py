@@ -10,8 +10,8 @@ from rapidfuzz import fuzz
 
 from pipeline.config import PipelineConfig
 from pipeline.constants import (
-    CONSUMER_POLL_EMPTY_BACKOFF_THRESHOLD,
-    CONSUMER_POLL_MAX_INTERVAL_SECONDS,
+    DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
+    DISPATCH_POLL_MAX_INTERVAL_S,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
@@ -82,7 +82,7 @@ def reconcile(
 
 
 # ---------------------------------------------------------------------------
-# Confidence scoring (ported from consumer.py)
+# Confidence scoring
 # ---------------------------------------------------------------------------
 
 def _name_matches_email(local: str, agent_name: str) -> bool:
@@ -210,13 +210,13 @@ class Dispatcher:
 
             if not rows:
                 consecutive_empty += 1
-                if consecutive_empty >= CONSUMER_POLL_EMPTY_BACKOFF_THRESHOLD:
-                    poll_interval = min(poll_interval * 2, CONSUMER_POLL_MAX_INTERVAL_SECONDS)
+                if consecutive_empty >= DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD:
+                    poll_interval = min(poll_interval * 2, DISPATCH_POLL_MAX_INTERVAL_S)
 
                 producer_done = await db.get_checkpoint(self.conn, "producer_done")
                 if producer_done == "true":
                     if not await db.has_pending_validation(self.conn):
-                        if consecutive_empty >= CONSUMER_POLL_EMPTY_BACKOFF_THRESHOLD:
+                        if consecutive_empty >= DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD:
                             logger.info("Dispatcher: queue drained and producer done — exiting")
                             break
                     else:
@@ -560,7 +560,7 @@ class Dispatcher:
         except Exception as exc:
             return BackendVerdict(status="error", message=str(exc), verified_at="")
 
-    async def _safe_zuhal(self, email: str):
+    async def _safe_zuhal(self, email: str) -> "ValidationResult":
         """Run Zuhal validation; returns ValidationResult or a stub on error."""
         from pipeline.models import ValidationResult
         try:

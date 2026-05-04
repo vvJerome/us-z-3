@@ -86,7 +86,6 @@ CREATE TABLE IF NOT EXISTS stats (
     validated                INTEGER DEFAULT 0,
     validation_failed        INTEGER DEFAULT 0,
     serper_calls             INTEGER DEFAULT 0,
-    brave_calls              INTEGER DEFAULT 0,
     zuhal_calls              INTEGER DEFAULT 0,
     racknerd_probes          INTEGER DEFAULT 0,
     bbops_probes             INTEGER DEFAULT 0,

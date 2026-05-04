@@ -16,6 +16,7 @@ SERVICE_BACKOFF: dict[str, tuple[float, float]] = {
     "serper": (1.0, 32.0),
     "zuhal": (1.0, 64.0),
     "bbops": (1.0, 60.0),
+    "racknerd": (1.0, 32.0),
 }
 
 # --- DNS ---
@@ -63,6 +64,3 @@ FALLBACK_DOMAIN_BLOCKLIST: frozenset[str] = frozenset({
     "google.com", "mapquest.com",
 })
 
-# --- Consumer/dispatcher polling ---
-CONSUMER_POLL_MAX_INTERVAL_SECONDS: int = 30
-CONSUMER_POLL_EMPTY_BACKOFF_THRESHOLD: int = 3

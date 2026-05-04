@@ -16,7 +16,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Fill in SERPER_API_KEY and ZUHAL_API_KEY
+# Fill in SERPER_API_KEY, ZUHAL_API_KEY, RACKNERD_HOST, RACKNERD_SSH_USER, RACKNERD_SSH_KEY
 ```
 
 ---
@@ -53,36 +53,40 @@ us-z-3/
 ├── pipeline/               # Core async pipeline package
 │   ├── __main__.py         # Entry point: cmd_run / cmd_status / cmd_reset
 │   ├── producer.py         # DNS probe + Serper enrichment → fills DISCOVERED queue
-│   ├── consumer.py         # MS probe + Zuhal validation → VALIDATED/VALIDATION_FAILED
-│   ├── bbops.py            # SMTP batch verification via bbops.io (runs between stages)
+│   ├── dispatcher.py       # Three-backend coordinator (Racknerd + bbops + Zuhal rescue)
 │   ├── db.py               # SQLite schema, State machine, all DB helpers
 │   ├── models.py           # InputRecord, EnrichmentResult, ValidationResult dataclasses
 │   ├── config.py           # PipelineConfig (pydantic-settings, reads .env)
 │   ├── cli.py              # argparse definitions
 │   ├── constants.py        # API costs, backoff params, DNS TLDs, fallback blocklist
 │   ├── metrics.py          # Prometheus /metrics endpoint (port 9090)
+│   ├── consumers/
+│   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
+│   │   └── bbops_async.py  # Async bbops.io batch verifier (Backend 2)
+│   ├── tunnels/
+│   │   └── ssh_socks.py    # SSH SOCKS5 tunnel supervisor with auto-restart
 │   └── utils/
 │       ├── dns_probe.py    # aiodns MX probe, shared resolver, parallel TLD gather
 │       ├── serper_client.py# Google search enrichment, enrichment_cache integration
-│       ├── zuhal_client.py # Zuhal SMTP validation, aiobreaker circuit breaker
-│       ├── ms_verify.py    # MS GetCredentialType probe (free, no Zuhal cost)
+│       ├── zuhal_client.py # Zuhal rescue backend (runs only when both SMTP backends reject)
+│       ├── ms_verify.py    # MS GetCredentialType probe (free, short-circuits Microsoft domains)
 │       ├── email_patterns.py # Pattern generation + per-MX ranking from pattern_stats
 │       ├── text.py         # Name parsing, domain stem generation, strategy assignment
 │       ├── cost_tracker.py # Per-service cost accumulator with ceiling check
 │       ├── rate_limiter.py # TokenBucket async rate limiter
 │       ├── backoff.py      # Generic exponential backoff with jitter
-│       ├── notify.py       # Named-pipe IPC (producer → consumer wake signal)
+│       ├── notify.py       # Named-pipe IPC (producer → dispatcher wake signal)
 │       └── logger.py       # Structured JSON logging setup
 │
 ├── orchestrator/           # Top-level run coordinator
 │   ├── __main__.py         # Stages: input prep → pipeline → merge
-│   ├── stage.py            # Calls pipeline producer, bbops, consumer as subprocesses
+│   ├── stage.py            # Calls pipeline producer and dispatcher as subprocesses
 │   ├── merge_outputs.py    # Deduplicates and merges validated records to merged_valid_emails.csv
 │   └── config.py           # RunPaths, Env dataclasses
 │
 ├── tests/
-│   ├── unit/               # Pure-logic tests (email patterns, scoring, rate limiter, MS verify)
-│   ├── integration/        # SQLite schema + pipeline flow tests
+│   ├── unit/               # Pure-logic tests (reconciliation, scoring, SMTP, ssh, bbops)
+│   ├── integration/        # SQLite schema + dispatcher + bbops flow tests
 │   └── e2e/                # Subprocess-level full pipeline tests
 │
 ├── input/                  # Source JSONL files
@@ -134,11 +138,13 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `agent_name` | Registered agent / officer name |
 | `state` | State abbreviation (e.g. `NC`) |
 | `email` | Confirmed deliverable email address |
-| `zuhal_status` | Raw API verdict: `valid`, `accept-all`, `ms_valid`, `bbops_valid` |
+| `final_verdict` | Reconciled verdict: `valid`, `catch_all`, `invalid` |
 | `confidence_tier` | `high` / `medium` / `low` (scoring details below) |
-| `verified` | `True` if individually confirmed (`valid`, `ms_valid`, `bbops_valid`); `False` for catch-all (`accept-all`, `catch_all`) |
+| `verified` | `True` if `valid` or `catch_all`; `False` otherwise |
 | `discovery_method` | How the email was found: `dns`, `serper`, `input` |
-| `validation_method` | Which service validated it: `zuhal`, `ms_probe`, `bbops` |
+| `validation_method` | Which backend validated it: `ms_probe`, `racknerd+bbops`, `zuhal_rescue` |
+| `racknerd_status` | Racknerd SMTP verdict: `valid`, `invalid`, `catch_all`, `error`, `not_run`, `ms_valid` |
+| `bbops_status` | bbops.io verdict: `valid`, `invalid`, `catch_all`, `error`, `not_run` |
 
 **Confidence scoring** (additive):
 
@@ -154,7 +160,10 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | Variable | Required | Default |
 |---|---|---|
 | `SERPER_API_KEY` | Yes | — |
-| `ZUHAL_API_KEY` | Yes | — |
+| `ZUHAL_API_KEY` | Yes (dispatcher) | — |
+| `RACKNERD_HOST` | Yes (dispatcher) | — |
+| `RACKNERD_SSH_USER` | No | `egress` |
+| `RACKNERD_SSH_KEY` | No | `~/.ssh/racknerd_egress` |
 | `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
 
 ---
@@ -167,19 +176,27 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--dry-run` | off | Mock all API calls; no cost |
 | `--max-cost USD` | none | Stop when cumulative cost reaches limit |
 | `--name NAME` | none | Output to `output/NAME/` |
-| `--producer-only` | off | Run discovery only |
-| `--consumer-only` | off | Run validation only |
-| `--chunk-size N` | 100 | Records per concurrent batch |
+| `--producer-only` | off | Run discovery only (no SSH tunnel, no Racknerd) |
+| `--consumer-only` | off | Run dispatcher only |
+| `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |
+| `--dispatch-concurrency N` | 20 | Parallel dispatcher workers |
+| `--dispatch-backend-timeout-s S` | 60.0 | Per-backend timeout for Racknerd + bbops |
+| `--dispatch-chunk-size N` | 50 | Records fetched per dispatcher poll cycle |
+| `--racknerd-host HOST` | — | VPS hostname for SSH tunnel (required for dispatcher) |
+| `--racknerd-concurrency N` | 10 | Parallel SMTP connections via tunnel |
+| `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
+| `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
+| `--max-consecutive-errors N` | 10 | Halt after N consecutive producer errors |
 
 ---
 
 ## Running tests
 
 ```bash
-pytest tests/ -q                    # all 119 tests
-pytest tests/unit/ -q               # fast unit tests only
-pytest tests/e2e/ -q                # end-to-end subprocess tests
+.venv/bin/python -m pytest tests/ -q    # all 194 tests
+.venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
+.venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```
 
 ---
@@ -188,9 +205,10 @@ pytest tests/e2e/ -q                # end-to-end subprocess tests
 
 | Service | Per call | Notes |
 |---|---|---|
-| Serper | $0.001 | 1 call per record, always |
-| Zuhal | $0.0005 | Only for DISCOVERED records; skipped by MS probe / bbops |
-| MS probe | $0 | Free; covers all Microsoft 365 / Exchange Online domains |
-| bbops | Per contract | SMTP batch; runs between producer and consumer |
+| Serper | $0.001 | 1 call per record (producer), always |
+| Racknerd SMTP | $0 | Fixed VPS cost; no per-probe fee |
+| bbops | Per contract | Async batch verifier; probes all non-MS records |
+| MS probe | $0 | Free; short-circuits all Microsoft 365 / Exchange Online domains |
+| Zuhal | $0.0005 | Rescue only — runs when both Racknerd + bbops return `invalid` |
 
-Typical: $0.00116/record, ~$348 for 300k records.
+Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record that fails both SMTP backends (typically 5–15% of records).

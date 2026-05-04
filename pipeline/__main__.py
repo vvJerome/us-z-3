@@ -277,17 +277,15 @@ def _print_status(summary: dict) -> None:
 
 
 def _is_verified(final_verdict: str | None) -> bool:
-    return final_verdict in ("valid",)
+    return final_verdict in ("valid", "catch_all")
 
 
 def _validation_method(zuhal_status: str | None, final_verdict: str | None) -> str:
-    if zuhal_status == "ms_valid" or (zuhal_status and "ms_valid" in zuhal_status):
+    if zuhal_status == "ms_valid":
         return "ms_probe"
-    if zuhal_status and zuhal_status.startswith("dual_"):
-        return "racknerd+bbops"
-    if final_verdict in ("valid", "catch_all", "invalid"):
-        return "racknerd+bbops"
-    return "unknown"
+    if zuhal_status and not zuhal_status.startswith("dual_"):
+        return "zuhal_rescue"
+    return "racknerd+bbops"
 
 
 async def _write_outputs(conn, config: PipelineConfig) -> None:

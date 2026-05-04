@@ -12,7 +12,7 @@ from pipeline.models import PipelineHaltError, ValidationResult
 from pipeline.utils.backoff import SERVICE_BACKOFF, with_backoff
 from pipeline.utils.rate_limiter import TokenBucket
 
-logger = logging.getLogger("pipeline.consumer")
+logger = logging.getLogger("pipeline.zuhal_client")
 
 
 class ZuhalClient:
