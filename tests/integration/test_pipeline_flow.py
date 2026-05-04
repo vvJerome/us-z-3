@@ -11,9 +11,8 @@ import pytest
 from pipeline import db
 from pipeline.config import PipelineConfig
 from pipeline.db import State
-from pipeline.consumer import ConsumerWorker, compute_confidence_score
+from pipeline.dispatcher import compute_confidence_score, Dispatcher
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.zuhal_client import ZuhalClient
 
 
 pytestmark = pytest.mark.asyncio
@@ -37,7 +36,7 @@ def test_config(tmp_path: Path) -> PipelineConfig:
     """Create a test pipeline configuration."""
     return PipelineConfig(
         serper_api_key="test_serper_key",
-        zuhal_api_key="test_zuhal_key",
+        racknerd_host="localhost",
         input_path=tmp_path / "input.jsonl",
         output_dir=tmp_path,
         db_path=tmp_path / "test.db",
@@ -45,7 +44,7 @@ def test_config(tmp_path: Path) -> PipelineConfig:
         dry_run=True,
         chunk_size=10,
         dns_concurrency=10,
-        zuhal_concurrency=1,
+        dispatch_concurrency=1,
     )
 
 
@@ -128,43 +127,39 @@ class TestValidationWorkflow:
         assert len(rows) == 1
         assert rows[0]["record_state"] == State.VALIDATING
 
-    async def test_validated_record_update(self, test_db_conn):
-        """Validated record is updated with verdict and score."""
+    async def test_dual_verdict_update(self, test_db_conn):
+        """update_record_dual writes both backend verdicts and final_verdict."""
         await test_db_conn.execute(
-            """
-            INSERT INTO records (unique_id, record_state)
-            VALUES (?, ?)
-            """,
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
             ("rec1", State.VALIDATING),
         )
         await test_db_conn.commit()
 
-        score = compute_confidence_score(
-            email="john@example.com",
-            candidate_domain="example.com",
-            strategy="with",
-            verdict="valid",
-            agent_name="John Doe",
-        )
-
-        await db.update_record_status(
+        await db.update_record_dual(
             test_db_conn,
             "rec1",
             State.VALIDATED,
+            racknerd_status="valid",
+            racknerd_message="250 OK",
+            racknerd_verified_at="2026-05-04T00:00:00Z",
+            bbops_status="invalid",
+            bbops_message="550 no such user",
+            bbops_verified_at="2026-05-04T00:00:01Z",
+            final_verdict="valid",
             candidate_email="john@example.com",
-            verdict="valid",
-            zuhal_status="valid",
-            zuhal_score=score,
         )
 
         async with test_db_conn.execute(
-            "SELECT record_state, verdict, candidate_email FROM records WHERE unique_id = ?",
+            "SELECT record_state, final_verdict, racknerd_status, bbops_status, candidate_email "
+            "FROM records WHERE unique_id = ?",
             ("rec1",),
         ) as cursor:
             row = await cursor.fetchone()
 
         assert row["record_state"] == State.VALIDATED
-        assert row["verdict"] == "valid"
+        assert row["final_verdict"] == "valid"
+        assert row["racknerd_status"] == "valid"
+        assert row["bbops_status"] == "invalid"
         assert row["candidate_email"] == "john@example.com"
 
     async def test_validation_failed_record(self, test_db_conn):
@@ -185,98 +180,18 @@ class TestValidationWorkflow:
         assert row[0] == State.VALIDATION_FAILED
 
 
-class TestConsumerWorkerIntegration:
-    """Integration tests for ConsumerWorker with mocked Zuhal."""
-
-    async def test_consumer_processes_validated_record(self, test_db_conn, test_config):
-        """Consumer processes a record and validates it."""
-        # Insert a DISCOVERED record
-        await test_db_conn.execute(
-            """
-            INSERT INTO records
-                (unique_id, record_state, candidate_emails, candidate_domain, agent_name, strategy, mx_provider)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "rec1",
-                State.DISCOVERED,
-                json.dumps(["john@example.com"]),
-                "example.com",
-                "John Doe",
-                "with",
-                "gmail.com",
-            ),
-        )
-        await test_db_conn.commit()
-
-        # Create mock Zuhal client
-        mock_zuhal = AsyncMock(spec=ZuhalClient)
-        mock_result = MagicMock()
-        mock_result.verdict = "valid"
-        mock_zuhal.validate.return_value = mock_result
-
-        cost_tracker = CostTracker(max_cost=None)
-        consumer = ConsumerWorker(test_config, test_db_conn, cost_tracker, mock_zuhal)
-
-        # Get pending records
-        rows = await db.fetch_pending_validation(test_db_conn, limit=10)
-        assert len(rows) == 1
-
-        # Simulate validation
-        unique_id = rows[0]["unique_id"]
-        candidates = json.loads(rows[0]["candidate_emails"])
-
-        # Process the email
-        email = candidates[0]
-        result = await mock_zuhal.validate(email)
-
-        if result.verdict == "valid":
-            await db.update_record_status(
-                test_db_conn,
-                unique_id,
-                State.VALIDATED,
-                candidate_email=email,
-                verdict="valid",
-                zuhal_status="valid",
-            )
-
-        # Verify final state
-        async with test_db_conn.execute(
-            "SELECT record_state, verdict FROM records WHERE unique_id = ?", (unique_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        assert row[0] == State.VALIDATED
-        assert row[1] == "valid"
-
-    async def test_consumer_cost_tracking(self, test_db_conn, test_config):
-        """Consumer respects cost limits."""
-        cost_tracker = CostTracker(max_cost=0.01)  # Very low limit
-
-        # Fake some calls
-        cost_tracker.record_call("zuhal")
-        cost_tracker.record_call("zuhal")
-
-        # Should eventually hit ceiling
-        assert cost_tracker.ceiling_reached() is False or cost_tracker.ceiling_reached() is True
-
-
 class TestStateTransitions:
     """Test valid state transitions through pipeline."""
 
     async def test_raw_to_discovering_to_discovered(self, test_db_conn):
         """Record flows: RAW -> DISCOVERING -> DISCOVERED."""
-        # Insert RAW record
         await test_db_conn.execute(
             "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
             ("rec1", State.RAW),
         )
         await test_db_conn.commit()
 
-        # Transition to DISCOVERING
         await db.update_record_status(test_db_conn, "rec1", State.DISCOVERING)
-
-        # Transition to DISCOVERED
         await db.update_record_status(
             test_db_conn,
             "rec1",
@@ -303,11 +218,9 @@ class TestStateTransitions:
         )
         await test_db_conn.commit()
 
-        # Claim for validation
         rows = await db.fetch_pending_validation(test_db_conn, limit=10)
         assert rows[0]["record_state"] == State.VALIDATING
 
-        # Mark validated
         await db.update_record_status(
             test_db_conn, "rec1", State.VALIDATED, candidate_email="test@example.com"
         )
@@ -353,7 +266,6 @@ class TestPatternLearning:
 
     async def test_multiple_runs_build_rankings(self, test_db_conn):
         """Multiple validation runs build accurate rankings."""
-        # Simulate multiple runs
         for _ in range(10):
             await db.record_pattern_result(
                 test_db_conn, "gmail.com", "first.last", success=True
@@ -369,8 +281,6 @@ class TestPatternLearning:
             )
 
         rankings = await db.get_pattern_rankings(test_db_conn, "gmail.com")
-
-        # first.last has 100% success, flast has 60%
         assert rankings[0]["template"] == "first.last"
         assert rankings[1]["template"] == "flast"
 
@@ -410,21 +320,30 @@ class TestErrorHandling:
 
         assert row[0] == State.VALIDATION_FAILED
 
-    async def test_invalid_json_candidate_emails(self, test_db_conn):
-        """Invalid JSON in candidate_emails is handled gracefully."""
+    async def test_dispatch_attempts_increment(self, test_db_conn):
+        """dispatch_attempts increments with each dual verdict write."""
         await test_db_conn.execute(
-            """
-            INSERT INTO records (unique_id, record_state, candidate_emails)
-            VALUES (?, ?, ?)
-            """,
-            ("rec1", State.VALIDATING, "invalid_json"),
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            ("rec1", State.VALIDATING),
         )
         await test_db_conn.commit()
 
+        await db.update_record_dual(
+            test_db_conn,
+            "rec1",
+            State.VALIDATION_FAILED,
+            racknerd_status="invalid",
+            racknerd_message="550",
+            racknerd_verified_at=None,
+            bbops_status="invalid",
+            bbops_message="550",
+            bbops_verified_at=None,
+            final_verdict="invalid",
+        )
+
         async with test_db_conn.execute(
-            "SELECT candidate_emails FROM records WHERE unique_id = ?", ("rec1",)
+            "SELECT dispatch_attempts FROM records WHERE unique_id = ?", ("rec1",)
         ) as cursor:
             row = await cursor.fetchone()
 
-        # Verify the invalid JSON is stored
-        assert row[0] == "invalid_json"
+        assert row[0] == 1

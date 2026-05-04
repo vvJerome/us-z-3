@@ -21,6 +21,7 @@ def _make_config(**kwargs) -> PipelineConfig:
         strategy="auto",
         dry_run=False,
         max_attempts=1,
+        racknerd_enabled=False,
     )
     defaults.update(kwargs)
     return PipelineConfig(**defaults)
