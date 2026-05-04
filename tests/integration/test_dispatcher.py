@@ -29,6 +29,7 @@ async def test_db(tmp_path: Path) -> aiosqlite.Connection:
 def config(tmp_path: Path) -> PipelineConfig:
     return PipelineConfig(
         serper_api_key="test",
+        zuhal_api_key="test",
         racknerd_host="localhost",
         input_path=tmp_path / "input.jsonl",
         output_dir=tmp_path,

@@ -18,7 +18,7 @@ class PipelineConfig(BaseSettings):
 
     # --- API Keys (from .env only) ---
     serper_api_key: str = ""
-    zuhal_api_key: str = ""  # kept for optional third-backend use
+    zuhal_api_key: str = ""
 
     # --- I/O ---
     input_path: Path = Path("input/records.jsonl")
@@ -106,6 +106,13 @@ class PipelineConfig(BaseSettings):
             raise ValueError(
                 "RACKNERD_HOST must be set when racknerd_enabled=True. "
                 "Set RACKNERD_HOST in .env or pass --racknerd-host."
+            )
+
+        needs_dispatcher = not self.producer_only and not self.dry_run
+        if needs_dispatcher and not self.zuhal_api_key:
+            raise ValueError(
+                "ZUHAL_API_KEY must be set — Zuhal is required as the rescue backend. "
+                "Set ZUHAL_API_KEY in .env or use --dry-run / --producer-only."
             )
 
         if self.ignore_checkpoint and self.start_offset == 0:

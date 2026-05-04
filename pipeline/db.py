@@ -386,6 +386,7 @@ async def update_record_dual(
     bbops_verified_at: str | None,
     final_verdict: str,
     candidate_email: str | None = None,
+    zuhal_status: str | None = None,
     zuhal_score: float | None = None,
     dispatch_attempts_delta: int = 1,
 ) -> None:
@@ -420,7 +421,8 @@ async def update_record_dual(
         sets.append("candidate_email = ?")
         values.append(candidate_email)
         sets.append("zuhal_status = ?")
-        values.append(f"dual_{final_verdict}")  # tag so outputs can detect source
+        # Use explicit Zuhal verdict when available; otherwise tag as dual-backend source
+        values.append(zuhal_status if zuhal_status is not None else f"dual_{final_verdict}")
 
     if zuhal_score is not None:
         sets.append("zuhal_score = ?")

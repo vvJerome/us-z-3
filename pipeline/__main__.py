@@ -21,6 +21,8 @@ from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.logger import setup_logging, get_logger
+from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
 from pipeline.metrics import serve_metrics
 
@@ -108,6 +110,15 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             await bbops_consumer.recover_inflight()
             logger.info("bbops async consumer started and recovered")
 
+            # --- Zuhal rescue backend ---
+            zuhal_client = ZuhalClient(
+                api_key=config.zuhal_api_key,
+                session=session,
+                rate_limiter=TokenBucket(rate=config.serper_rate_limit / 3600, capacity=10),
+                dry_run=config.dry_run,
+                max_attempts=config.max_attempts,
+            )
+
             # --- Dispatcher ---
             dispatcher = Dispatcher(
                 config=config,
@@ -116,6 +127,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 bbops=bbops_consumer,
                 cost_tracker=cost_tracker,
                 stop_event=stop_event,
+                zuhal=zuhal_client,
             )
             tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
             logger.info("Dispatcher started (concurrency=%d)", config.dispatch_concurrency)

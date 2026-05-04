@@ -7,8 +7,7 @@
 # --- API cost per call (USD) ---
 API_COSTS: dict[str, float] = {
     "serper": 0.001,
-    # zuhal kept for opt-in third-backend use
-    "zuhal": 0.0005,
+    "zuhal": 0.0005,  # rescue backend — runs after both SMTP backends return invalid
 }
 
 # --- Exponential backoff parameters (base_seconds, max_seconds) per service ---
