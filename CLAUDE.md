@@ -106,6 +106,103 @@ us-z-3/
 
 ---
 
+## Record processing flow
+
+### Stage 1 — Producer
+
+```
+InputRecord (RAW)
+    ├─ DNS probe (aiodns, shared resolver, TLD variants)
+    │     hit  → candidate_emails ranked by pattern_stats win rate
+    │     miss → Serper enrichment (cached by business+agent+state+provider)
+    │               hit  → candidate_emails
+    │               miss → DISCOVERY_FAILED
+    └─ DISCOVERED (candidate_emails, candidate_domain, mx_provider written to DB)
+```
+
+### Stage 2 — Dispatcher (per candidate_email, in rank order)
+
+```
+[1] MS probe (free, Microsoft MX only)
+        valid   → VALIDATED  ✓
+        invalid → skip candidate
+        unknown → continue
+
+[2] Racknerd SMTP + bbops.io  (asyncio.gather, concurrent)
+        reconcile():
+          valid / catch_all (either backend) → VALIDATED  ✓
+          both invalid                        → [3]
+          mixed error / tunnel down           → re-queue (no attempt burned)
+
+[3] Zuhal rescue  (sequential, only when both SMTP → invalid)
+        valid / accept-all → VALIDATED  ✓
+        else               → try next candidate
+
+All candidates exhausted → VALIDATION_FAILED
+Cost ceiling before Zuhal → COST_SKIPPED
+```
+
+### OR-of-valids reconciliation conditions
+
+| Racknerd | bbops | Outcome | Note |
+|---|---|---|---|
+| `valid` | any | VALIDATED `valid` | |
+| any | `valid` | VALIDATED `valid` | |
+| `catch_all` | any | VALIDATED `catch_all` | |
+| any | `catch_all` | VALIDATED `catch_all` | |
+| `invalid` | `invalid` | Zuhal rescue | |
+| `invalid` | `error`/`not_run` | re-queue | Can't trust single invalid |
+| `error`/`not_run` | `invalid` | re-queue | Can't trust single invalid |
+| `error` | `error` | re-queue | Both inconclusive |
+| tunnel down | any | re-queue | `"tunnel not up"` in Racknerd message |
+
+**Re-queue** = record returns to `DISCOVERED`. `dispatch_attempts` only increments on terminal verdicts; transient failures do not count against the attempt budget.
+
+---
+
+## Status fields reference
+
+### `racknerd_status`
+
+| Value | Meaning |
+|---|---|
+| `valid` | RCPT accepted (250) |
+| `invalid` | RCPT rejected (5xx) |
+| `catch_all` | Domain accepts all addresses |
+| `error` | Network error, timeout, or SMTP protocol failure |
+| `blocked` | Spamhaus / reputation block detected |
+| `not_run` | Skipped — MS probe short-circuited |
+| `ms_valid` | Confirmed via MS probe (not direct SMTP) |
+
+### `bbops_status`
+
+| Value | Meaning |
+|---|---|
+| `valid` | bbops confirmed deliverable |
+| `invalid` | bbops rejected |
+| `catch_all` | Domain accepts all (bbops signal) |
+| `error` | API error, timeout, or poll failure |
+| `not_run` | Skipped — MS probe short-circuited |
+
+### `final_verdict`
+
+| Value | Written when |
+|---|---|
+| `valid` | Either backend (or Zuhal) confirmed valid |
+| `catch_all` | Either backend returned catch_all (none returned valid) |
+| `invalid` | All backends rejected; only set on VALIDATION_FAILED records |
+
+### `zuhal_status`
+
+| Value | Meaning |
+|---|---|
+| `valid` / `accept-all` | Zuhal rescue succeeded |
+| `invalid` / `error` | Zuhal also rejected or errored |
+| `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal did NOT run; encodes the SMTP reconciliation result |
+| `ms_valid` | MS probe short-circuited; Zuhal not called |
+
+---
+
 ## Record state machine
 
 ```
