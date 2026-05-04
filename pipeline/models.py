@@ -25,14 +25,20 @@ class InputRecord:
 
     @classmethod
     def from_dict(cls, d: dict) -> InputRecord:
+        uid = str(d.get("unique_id", "") or "").strip()
+        biz = str(d.get("business_name", "") or "").strip()
+        if not uid:
+            raise ValueError("unique_id is required and must be non-empty")
+        if not biz:
+            raise ValueError("business_name is required and must be non-empty")
         return cls(
-            unique_id=str(d.get("unique_id", "")),
-            business_name=str(d.get("business_name", "")),
-            agent_name=str(d.get("agent_name", "")),
-            state=str(d.get("state", "")),
-            jurisdiction=str(d.get("jurisdiction", "")),
-            position_type=str(d.get("position_type", "")),
-            name_entity_type=str(d.get("name_entity_type", "")),
+            unique_id=uid,
+            business_name=biz,
+            agent_name=str(d.get("agent_name", "") or ""),
+            state=str(d.get("state", "") or ""),
+            jurisdiction=str(d.get("jurisdiction", "") or ""),
+            position_type=str(d.get("position_type", "") or ""),
+            name_entity_type=str(d.get("name_entity_type", "") or ""),
             email_biz=str(d.get("email_biz", "") or ""),
             email_agent=str(d.get("email_agent", "") or ""),
         )

@@ -214,6 +214,11 @@ def _validation_method(zuhal_status: str | None) -> str:
     return "unknown"
 
 
+def _is_verified(zuhal_status: str | None) -> bool:
+    """True only for individually confirmed addresses; False for catch-all verdicts."""
+    return zuhal_status in ("valid", "ms_valid", "bbops_valid")
+
+
 async def _write_outputs(conn, config: PipelineConfig) -> None:
     """Write three output artefacts: pipeline.db (already on disk), results.json, valid_emails.csv."""
     logger = get_logger("pipeline")
@@ -232,7 +237,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "unique_id", "business_name", "agent_name", "state",
-            "email", "zuhal_status", "confidence_tier",
+            "email", "zuhal_status", "confidence_tier", "verified",
             "discovery_method", "validation_method",
         ])
         for row in rows:
@@ -240,6 +245,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
                 row["unique_id"], row["business_name"], row["agent_name"],
                 row["state"], row["candidate_email"], row["zuhal_status"],
                 confidence_tier(int(row["zuhal_score"] or 0)),
+                _is_verified(row["zuhal_status"]),
                 row["discovery_source"] or "unknown",
                 _validation_method(row["zuhal_status"]),
             ])

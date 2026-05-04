@@ -136,6 +136,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `email` | Confirmed deliverable email address |
 | `zuhal_status` | Raw API verdict: `valid`, `accept-all`, `ms_valid`, `bbops_valid` |
 | `confidence_tier` | `high` / `medium` / `low` (scoring details below) |
+| `verified` | `True` if individually confirmed (`valid`, `ms_valid`, `bbops_valid`); `False` for catch-all (`accept-all`, `catch_all`) |
 | `discovery_method` | How the email was found: `dns`, `serper`, `input` |
 | `validation_method` | Which service validated it: `zuhal`, `ms_probe`, `bbops` |
 

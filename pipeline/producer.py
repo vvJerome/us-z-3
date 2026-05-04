@@ -138,8 +138,8 @@ class ProducerWorker:
                     try:
                         record = InputRecord.from_dict(json.loads(line))
                         chunk.append(record)
-                    except (json.JSONDecodeError, KeyError) as exc:
-                        logger.warning("Skipping malformed line at offset %d: %s", offset, exc)
+                    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                        logger.warning("Skipping invalid record at offset %d: %s", offset + total_processed, exc)
 
                 if not chunk:
                     logger.info("Producer exhausted input file at offset %d", offset)
