@@ -208,6 +208,9 @@ class RacknerdConsumer:
                 except Exception:
                     pass
 
+                if not isinstance(code, int):
+                    return "error", "malformed SMTP response (no code)"
+
                 msg_lower = msg.lower()
                 if 200 <= code <= 399:
                     return "valid", f"{code} {msg}"

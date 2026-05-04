@@ -156,7 +156,10 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         validated_n = status_counts.get("VALIDATED", 0)
         failed_n = status_counts.get("VALIDATION_FAILED", 0)
         disc_failed_n = status_counts.get("DISCOVERY_FAILED", 0)
-        disc_hits_n = max(total - disc_failed_n - status_counts.get("RAW", 0), 0)
+        disc_hits_n = sum(
+            status_counts.get(s, 0)
+            for s in ("DISCOVERED", "VALIDATING", "VALIDATED", "VALIDATION_FAILED", "COST_SKIPPED")
+        )
 
         if total > 0 or cost_tracker.total_cost > 0:
             await db.upsert_stats(
@@ -342,14 +345,15 @@ async def main() -> None:
         "dns_concurrency", "serper_concurrency",
         "dispatch_concurrency", "dispatch_backend_timeout_s",
         "dispatch_poll_interval_s", "dispatch_chunk_size",
-        "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
+        "racknerd_enabled", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s",
         "bbops_base_url", "bbops_batch_size", "bbops_max_inflight",
         "serper_rate_limit",
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
-        "max_cost", "dry_run", "enrichment_source", "run_id", "notify_pipe",
+        "max_cost", "max_consecutive_errors", "dry_run",
+        "enrichment_source", "run_id", "notify_pipe",
     ]:
         val = getattr(args, field_name, None)
         if val is not None:

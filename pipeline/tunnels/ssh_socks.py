@@ -117,11 +117,16 @@ class SshSocksTunnel:
     async def _spawn(self) -> None:
         cmd = self._ssh_cmd()
         _log.info("SSH tunnel spawning: %s", " ".join(cmd))
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ssh binary not found in PATH — install OpenSSH or add it to PATH"
+            )
         # Drain stderr in background so the pipe never fills and blocks ssh
         asyncio.create_task(self._drain_stderr(), name="ssh-stderr-drain")
 

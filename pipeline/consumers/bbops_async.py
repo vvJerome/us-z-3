@@ -196,7 +196,16 @@ class BbopsAsyncConsumer:
             try:
                 await _db.insert_bbops_jobs(self._conn, job_rows)
             except Exception as exc:
-                _log.warning("Failed to persist bbops_jobs (crash recovery impaired): %s", exc)
+                _log.error(
+                    "Failed to persist bbops_jobs — crash recovery broken for batch %s: %s",
+                    batch_id, exc,
+                )
+                self._mark_failure()
+                verdict = BackendVerdict(status="error", message=str(exc), verified_at=_ISO_NOW())
+                for item in items:
+                    if not item.future.done():
+                        item.future.set_result(verdict)
+                return
 
             # Poll
             results = await self._poll_batch(batch_id)
@@ -215,8 +224,12 @@ class BbopsAsyncConsumer:
                             job_result.get("status", "error"),
                             job_result.get("message", ""),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.error(
+                            "Failed to mark bbops job %s done — may resubmit on restart: %s",
+                            jid, exc,
+                        )
+                        self._mark_failure()
 
     async def _poll_and_resolve_recovery(
         self,

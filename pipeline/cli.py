@@ -77,6 +77,10 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Records claimed per poll cycle")
 
     # Racknerd
+    parser.add_argument("--racknerd-enabled", action="store_true", default=None,
+                        help="Enable Racknerd SMTP backend (default: True unless --producer-only)")
+    parser.add_argument("--no-racknerd", dest="racknerd_enabled", action="store_false",
+                        help="Disable Racknerd SMTP backend")
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
     parser.add_argument("--racknerd-ssh-user", default="egress", help="SSH username")
     parser.add_argument("--racknerd-ssh-key", default=None, help="SSH private key path")
@@ -107,6 +111,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
 
     # Cost / safety
     parser.add_argument("--max-cost", type=float, default=None, help="USD cost ceiling")
+    parser.add_argument("--max-consecutive-errors", type=int, default=10,
+                        help="Halt pipeline after this many consecutive errors")
     parser.add_argument("--dry-run", action="store_true", help="Mock all API calls")
 
     # Enrichment

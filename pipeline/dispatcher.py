@@ -289,6 +289,7 @@ class Dispatcher:
 
         for email in candidates:
             if self.cost_tracker.ceiling_reached():
+                logger.info("Cost ceiling reached — skipping %s", unique_id)
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
                 cost_skipped = True
                 break
