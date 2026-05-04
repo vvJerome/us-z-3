@@ -41,7 +41,7 @@ class PipelineConfig(BaseSettings):
 
     # --- Concurrency ---
     dns_concurrency: int = Field(default=100, le=200)
-    serper_concurrency: int = 10
+    serper_concurrency: int = 15
     zuhal_concurrency: int = Field(default=3)
 
     # --- Rate limits (calls per hour) ---
@@ -66,7 +66,7 @@ class PipelineConfig(BaseSettings):
     max_discovery_retries: int = Field(default=3, ge=0)
 
     # --- Enrichment ---
-    enrichment_source: Literal["serper"] = "serper"
+    enrichment_source: Literal["serper"] = "serper"  # brave support removed — not implemented
 
     # --- Run identity ---
     run_id: str = ""

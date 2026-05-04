@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import aiosqlite
+
+_log = logging.getLogger("pipeline.producer")
 
 # ---------------------------------------------------------------------------
 # Status taxonomy constants — single source of truth
@@ -17,7 +20,6 @@ class State:
     VALIDATION_FAILED = "VALIDATION_FAILED"
     DISCOVERY_FAILED  = "DISCOVERY_FAILED"
     COST_SKIPPED      = "COST_SKIPPED"
-    ERROR             = "ERROR"
 
 
 SCHEMA_SQL = """
@@ -167,6 +169,7 @@ async def insert_records_batch(
     async with conn.cursor() as cur:
         await cur.execute("BEGIN")
         try:
+            inserted = 0
             for r in records:
                 await cur.execute(INSERT_RECORD_SQL, (
                     r["unique_id"],
@@ -188,6 +191,13 @@ async def insert_records_batch(
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
                 ))
+                inserted += cur.rowcount
+            if inserted < len(records):
+                dropped = len(records) - inserted
+                _log.warning(
+                    "insert_records_batch: %d record(s) dropped — duplicate unique_id in input",
+                    dropped,
+                )
             await cur.execute(UPSERT_CHECKPOINT_SQL, ("producer_offset", str(new_offset)))
             await conn.commit()
         except Exception:
@@ -296,6 +306,34 @@ async def recover_stale_validating(
     )
     await conn.commit()
     return cursor.rowcount
+
+
+async def flush_process_trace(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    entries: list[dict],
+) -> None:
+    """Append all accumulated trace entries in a single UPDATE (one commit per record)."""
+    if not entries:
+        return
+    await conn.execute(
+        """
+        UPDATE records
+           SET process_trace = (
+               SELECT json_group_array(value)
+               FROM (
+                   SELECT value FROM json_each(COALESCE(
+                       (SELECT process_trace FROM records WHERE unique_id = ?), '[]'
+                   ))
+                   UNION ALL
+                   SELECT value FROM json_each(?)
+               )
+           )
+         WHERE unique_id = ?
+        """,
+        (unique_id, json.dumps(entries), unique_id),
+    )
+    await conn.commit()
 
 
 async def append_process_trace(
@@ -423,6 +461,12 @@ async def reset_failed_records(
         cursor = await conn.execute(sql, (record_state, phase))
     else:
         if record_state == State.VALIDATION_FAILED:
+            sql = """
+                UPDATE records SET record_state = 'DISCOVERED', validation_attempts = 0,
+                updated_at = datetime('now')
+                WHERE record_state = ?
+            """
+        elif record_state == State.COST_SKIPPED:
             sql = """
                 UPDATE records SET record_state = 'DISCOVERED', validation_attempts = 0,
                 updated_at = datetime('now')
