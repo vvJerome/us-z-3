@@ -467,64 +467,7 @@ class Dispatcher:
                 )
                 return
 
-            # Zuhal rescue: both SMTP backends said invalid — give Zuhal a shot
-            if result.final_verdict == "invalid" and self.zuhal is not None:
-                if self.cost_tracker.ceiling_reached():
-                    logger.info("Cost ceiling reached — skipping %s", unique_id)
-                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
-                    cost_skipped = True
-                    break
-
-                zuhal_verdict = await self._safe_zuhal(email)
-                self.cost_tracker.record_call("zuhal")
-
-                zuhal_final: str | None = None
-                if zuhal_verdict.verdict == "valid":
-                    zuhal_final = "valid"
-                elif zuhal_verdict.verdict == "accept-all":
-                    zuhal_final = "catch_all"
-
-                if zuhal_final is not None:
-                    score = compute_confidence_score(
-                        email, candidate_domain, strategy, zuhal_final, agent_name
-                    )
-                    async with self._write_lock:
-                        await db.update_record_dual(
-                            self.conn,
-                            unique_id,
-                            State.VALIDATED,
-                            racknerd_status=rk_verdict.status if rk_verdict else "not_run",
-                            racknerd_message=rk_verdict.message if rk_verdict else "",
-                            racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
-                            bbops_status=bb_verdict.status if bb_verdict else "not_run",
-                            bbops_message=bb_verdict.message if bb_verdict else "",
-                            bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
-                            final_verdict=zuhal_final,
-                            candidate_email=email,
-                            zuhal_status=zuhal_verdict.verdict,
-                            zuhal_score=float(score),
-                        )
-                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    if mx_provider:
-                        tmpl = email_to_template(email, _first, _last, candidate_domain)
-                        if tmpl:
-                            await db.record_pattern_result(self.conn, mx_provider, tmpl, success=True)
-                    self.stats["validated"] += 1
-                    logger.info(
-                        "Zuhal-rescued %s → %s [rk=%s bb=%s zuhal=%s]",
-                        unique_id, email,
-                        rk_verdict.status if rk_verdict else "n/a",
-                        bb_verdict.status if bb_verdict else "n/a",
-                        zuhal_verdict.verdict,
-                    )
-                    return
-                else:
-                    logger.debug(
-                        "Zuhal also negative for %s/%s: %s",
-                        unique_id, email, zuhal_verdict.verdict,
-                    )
-
-            # Both SMTP and Zuhal (if run) said no — record pattern miss, try next candidate
+            # invalid — record pattern miss and try next candidate
             if mx_provider:
                 tmpl = email_to_template(email, _first, _last, candidate_domain)
                 if tmpl:
@@ -635,22 +578,6 @@ class Dispatcher:
             return await self.racknerd.verify(email)
         except Exception as exc:
             return BackendVerdict(status="error", message=str(exc), verified_at="")
-
-    async def _safe_zuhal(self, email: str) -> "ValidationResult":
-        """Run Zuhal validation; returns ValidationResult or a stub on error."""
-        from pipeline.models import ValidationResult
-        try:
-            return await self.zuhal.validate(email)
-        except Exception as exc:
-            logger.warning("Zuhal error for %s: %s", email, exc)
-            return ValidationResult(
-                email=email,
-                verdict="error",
-                score=0.0,
-                is_disposable=False,
-                raw_status=str(exc),
-                http_status=0,
-            )
 
     async def _safe_bbops(self, record_id: int, email: str) -> BackendVerdict:
         try:
