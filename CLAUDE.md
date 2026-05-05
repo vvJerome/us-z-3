@@ -218,7 +218,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `RAW` | Loaded from input, not yet processed |
 | `DISCOVERING` | Transient error during discovery; eligible for retry |
 | `DISCOVERED` | Domain/email candidates found; ready for validation |
-| `VALIDATING` | Claimed by consumer; in-flight |
+| `VALIDATING` | Claimed by dispatcher; in-flight |
 | `VALIDATED` | Confirmed deliverable email found |
 | `VALIDATION_FAILED` | All candidates exhausted without a valid result |
 | `DISCOVERY_FAILED` | Neither DNS nor Serper found a domain |

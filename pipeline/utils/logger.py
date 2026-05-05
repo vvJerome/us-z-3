@@ -50,7 +50,7 @@ def setup_logging(config: PipelineConfig) -> None:
     console.setFormatter(console_fmt)
     root.addHandler(console)
 
-    for name in ("producer", "consumer"):
+    for name in ("producer", "dispatcher"):
         logger = logging.getLogger(f"pipeline.{name}")
         fh = logging.FileHandler(log_dir / f"{name}.log", encoding="utf-8")
         fh.setLevel(logging.DEBUG)

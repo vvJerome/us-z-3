@@ -16,7 +16,7 @@ from pipeline.constants import (
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
 from pipeline.utils.zuhal_client import ZuhalClient
-from pipeline.models import BackendVerdict, FinalVerdict, PipelineHaltError, ReconcileResult
+from pipeline.models import BackendVerdict, PipelineHaltError, ReconcileResult
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.email_patterns import email_to_template
 from pipeline.utils.ms_verify import check_microsoft_email_async, is_microsoft_mx
@@ -107,6 +107,18 @@ def compute_confidence_score(
     verdict: str,
     agent_name: str = "",
 ) -> int:
+    """Return an additive confidence score 0–4 for a validated email.
+
+    +1 domain match (email domain fuzzy-matches candidate_domain, ≥85 ratio)
+    strategy="with" (name-targeted search):
+        +1 name match (local part resembles agent_name)
+        +1 not a generic prefix (info/contact/admin/…)
+        +1 verdict == "valid" (not catch_all)
+    strategy="without" (generic/org search):
+        +1 IS a generic prefix
+        +1 verdict == "valid"
+    High ≥ 3, medium = 2, low ≤ 1 — see confidence_tier().
+    """
     local, _, domain = email.partition("@")
     score = 0
 

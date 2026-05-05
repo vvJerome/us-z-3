@@ -26,8 +26,8 @@ case "$WHICH" in
   v2)
     vps_ssh "bash -c 'LATEST=\$(ls -1dt /root/us-z-3/runs/*/ 2>/dev/null | head -1); \
       if [[ -z \"\$LATEST\" ]]; then echo \"(no runs)\"; exit 0; fi; \
-      F1=\"\${LATEST}v2/stderr.log\"; F2=/root/us-z-3/scraper/verify.log; \
-      echo \"[logs] tailing \$F1 and \$F2\"; tail -n 100 -F \$F1 \$F2 2>/dev/null'"
+      F1=\"\${LATEST}v2/stderr.log\"; \
+      echo \"[logs] tailing \$F1\"; tail -n 100 -F \$F1 2>/dev/null'"
     ;;
   tmux-orch)
     echo "[logs] attaching to orchestrator tmux. Detach: Ctrl-b d"
