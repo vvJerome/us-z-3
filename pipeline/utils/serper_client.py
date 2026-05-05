@@ -56,7 +56,8 @@ class SerperClient:
         self.max_attempts = max_attempts
         self.jitter = jitter
         self._base, self._max_delay = SERVICE_BACKOFF["serper"]
-        self._fallback_calls = 0  # extra API calls made by site: fallback retries
+        self._fallback_calls = 0   # extra API calls made by site: fallback retries
+        self.last_was_cache_hit = False  # set after each enrich() call
 
     async def enrich(
         self,
@@ -83,14 +84,19 @@ class SerperClient:
         agent_norm = (agent_name or "").lower().strip()
         # Cache key includes strategy and domain_hint so different query types
         # for the same business don't return each other's cached results.
+        # For "without" strategy the query never includes agent_name, so all
+        # officers of the same business share one cache entry (agent_norm="").
         cache_provider = f"serper:{strategy}:{(domain_hint or '').lower()}"
+        cache_agent_norm = agent_norm if strategy == "with" else ""
 
         if conn is not None:
-            cached = await db.get_enrichment_cache(conn, biz_norm, agent_norm, state, cache_provider)
+            cached = await db.get_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider)
             if cached is not None:
-                logger.debug("Serper cache hit for %s/%s/%s", biz_norm, agent_norm, state)
+                logger.debug("Serper cache hit for %s/%s/%s", biz_norm, cache_agent_norm, state)
+                self.last_was_cache_hit = True
                 return self._extract(json.loads(cached), business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
 
+        self.last_was_cache_hit = False
         await self.rate_limiter.acquire()
 
         data = await with_backoff(
@@ -106,7 +112,7 @@ class SerperClient:
         )
 
         if conn is not None:
-            await db.set_enrichment_cache(conn, biz_norm, agent_norm, state, cache_provider, json.dumps(data))
+            await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
 
         result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
 

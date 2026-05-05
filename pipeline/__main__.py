@@ -22,6 +22,7 @@ from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.logger import setup_logging, get_logger
 from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
 from pipeline.metrics import serve_metrics
@@ -134,6 +135,18 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             else:
                 logger.info("Zuhal fallback disabled (ZUHAL_API_KEY not set)")
 
+            # --- Serper fallback (dispatcher calls this after patterns exhausted) ---
+            dispatcher_serper = SerperClient(
+                api_key=config.serper_api_key,
+                session=session,
+                rate_limiter=TokenBucket(
+                    capacity=config.serper_rate_limit,
+                    refill_rate=config.serper_rate_limit / 3600,
+                ),
+                dry_run=config.dry_run,
+                max_attempts=config.max_attempts,
+            )
+
             # --- Dispatcher ---
             dispatcher = Dispatcher(
                 config=config,
@@ -143,6 +156,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 cost_tracker=cost_tracker,
                 stop_event=stop_event,
                 zuhal=zuhal_client,
+                serper=dispatcher_serper,
             )
             tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
             logger.info("Dispatcher started (concurrency=%d)", config.dispatch_concurrency)

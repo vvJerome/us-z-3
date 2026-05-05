@@ -6,8 +6,9 @@
 
 # --- API cost per call (USD) ---
 API_COSTS: dict[str, float] = {
-    "serper": 0.001,
-    "zuhal": 0.0005,  # rescue backend — runs after both SMTP backends return invalid
+    "serper_producer": 0.001,     # DNS-miss path: Serper called in producer
+    "serper_dispatcher": 0.001,   # fallback: Serper called in dispatcher after patterns exhausted
+    "zuhal": 0.0005,              # rescue backend — runs after both SMTP backends return invalid
 }
 
 # --- Exponential backoff parameters (base_seconds, max_seconds) per service ---

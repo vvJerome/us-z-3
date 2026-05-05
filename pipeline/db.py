@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS records (
     final_verdict       TEXT,
     dispatch_attempts   INTEGER DEFAULT 0,
 
+    -- Enrichment tracking
+    serper_enriched     INTEGER DEFAULT 0,
+
     -- State machine (lifecycle + verdict)
     record_state        TEXT NOT NULL DEFAULT 'RAW',
     verdict             TEXT,
@@ -85,7 +88,8 @@ CREATE TABLE IF NOT EXISTS stats (
     discovery_misses         INTEGER DEFAULT 0,
     validated                INTEGER DEFAULT 0,
     validation_failed        INTEGER DEFAULT 0,
-    serper_calls             INTEGER DEFAULT 0,
+    serper_producer_calls    INTEGER DEFAULT 0,
+    serper_dispatcher_calls  INTEGER DEFAULT 0,
     zuhal_calls              INTEGER DEFAULT 0,
     racknerd_probes          INTEGER DEFAULT 0,
     bbops_probes             INTEGER DEFAULT 0,
@@ -149,6 +153,10 @@ CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
 
 # Migration statements from schema v3 → v4
 _V4_MIGRATIONS: list[str] = [
+    # v5
+    "ALTER TABLE records ADD COLUMN serper_enriched INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN serper_producer_calls INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN serper_dispatcher_calls INTEGER DEFAULT 0",
     "ALTER TABLE records ADD COLUMN racknerd_status TEXT",
     "ALTER TABLE records ADD COLUMN racknerd_message TEXT",
     "ALTER TABLE records ADD COLUMN racknerd_verified_at TEXT",
@@ -184,8 +192,8 @@ INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
     position_type, name_entity_type, candidate_email, candidate_emails,
     subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
-    strategy, is_org_agent, mx_provider, record_state, process_trace
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    strategy, is_org_agent, mx_provider, record_state, process_trace, serper_enriched
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_CHECKPOINT_SQL = """
@@ -274,6 +282,7 @@ async def insert_records_batch(
                     r.get("mx_provider"),
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
+                    1 if r.get("serper_enriched") else 0,
                 ))
                 inserted += cur.rowcount
             if inserted < len(records):
@@ -666,6 +675,15 @@ async def record_pattern_result(
             total_count = total_count + 1
         """,
         (mx_provider, template, 1 if success else 0, 1 if success else 0),
+    )
+    await conn.commit()
+
+
+async def mark_serper_enriched(conn: aiosqlite.Connection, unique_id: str) -> None:
+    """Mark a record as having been enriched by Serper (prevents duplicate calls)."""
+    await conn.execute(
+        "UPDATE records SET serper_enriched = 1, updated_at = datetime('now') WHERE unique_id = ?",
+        (unique_id,),
     )
     await conn.commit()
 

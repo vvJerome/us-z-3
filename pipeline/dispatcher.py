@@ -16,6 +16,7 @@ from pipeline.constants import (
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
 from pipeline.utils.zuhal_client import ZuhalClient
+from pipeline.utils.serper_client import SerperClient
 from pipeline.models import BackendVerdict, PipelineHaltError, ReconcileResult
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.email_patterns import email_to_template
@@ -178,15 +179,16 @@ class Dispatcher:
         cost_tracker: CostTracker,
         stop_event: asyncio.Event | None = None,
         zuhal: ZuhalClient | None = None,
+        serper: SerperClient | None = None,
     ) -> None:
         self.config = config
         self.conn = conn
         self.racknerd = racknerd
         self.bbops = bbops
-        self.zuhal = zuhal
         self.cost_tracker = cost_tracker
         self.stop_event = stop_event or asyncio.Event()
         self.zuhal = zuhal
+        self.serper = serper
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
         self._notify_reader = None
@@ -300,11 +302,16 @@ class Dispatcher:
         agent_name = row["agent_name"] or ""
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
+        serper_enriched = bool(row["serper_enriched"]) if "serper_enriched" in row.keys() else True
 
         pending_trace: list[dict] = []
         cost_skipped = False
+        original_count = len(candidates)
+        i = 0
 
-        for email in candidates:
+        while i < len(candidates):
+            email = candidates[i]
+            i += 1
             if self.cost_tracker.ceiling_reached():
                 logger.info("Cost ceiling reached — skipping %s", unique_id)
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
@@ -476,12 +483,29 @@ class Dispatcher:
                 "Candidate %s for %s: %s — trying next",
                 email, unique_id, result.final_verdict,
             )
-            continue
+
+            # After exhausting original pattern candidates, inject Serper enrichment.
+            # Serper was skipped in the producer (DNS hit) — call it now as a fallback
+            # so we only pay $0.001 when patterns actually fail, not upfront.
+            if i == original_count and not serper_enriched and self.serper and candidate_domain:
+                serper_enriched = True  # prevent re-injection on subsequent loops
+                new_emails = await self._serper_enrich(unique_id, row)
+                await db.mark_serper_enriched(self.conn, unique_id)
+                if not self.serper.last_was_cache_hit:
+                    self.cost_tracker.record_call("serper_dispatcher")
+                if new_emails:
+                    candidates.extend(new_emails)
+                    logger.info(
+                        "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
+                        unique_id, len(new_emails), self.serper.last_was_cache_hit,
+                    )
+                else:
+                    logger.debug("Serper fallback for %s: no candidates found", unique_id)
 
         if cost_skipped:
             return
 
-        # All candidates exhausted
+        # All candidates exhausted (patterns + any Serper enrichment)
         async with self._write_lock:
             await db.update_record_dual(
                 self.conn,
@@ -511,6 +535,23 @@ class Dispatcher:
             status = "error"
         ms = int((time.monotonic() - t0) * 1000)
         return status, {"stage": "zuhal_fallback", "outcome": status, "ms": ms, "email": email}
+
+    async def _serper_enrich(self, unique_id: str, row: aiosqlite.Row) -> list[str]:
+        """Call Serper for a DNS-hit record whose patterns all failed. Returns snippet emails."""
+        assert self.serper is not None
+        try:
+            result = await self.serper.enrich(
+                business_name=row["business_name"] or "",
+                agent_name=row["agent_name"] if (row["strategy"] or "without") == "with" else None,
+                state=row["state"] or "",
+                domain_hint=row["candidate_domain"] or None,
+                strategy=row["strategy"] or "without",
+                conn=self.conn,
+            )
+            return result.candidate_emails
+        except Exception as exc:
+            logger.warning("Serper fallback error for %s: %s", unique_id, exc)
+            return []
 
     async def _ms_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()

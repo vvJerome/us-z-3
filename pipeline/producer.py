@@ -280,52 +280,60 @@ class ProducerWorker:
             candidate_emails.extend(patterns)
             result["_trace"].append({"stage": "patterns", "outcome": "gen", "n": len(patterns)})
 
-        # Phase 2: Serper enrichment (find emails in snippets; find domain if DNS missed)
+        # Phase 2: Serper enrichment — only when DNS missed.
+        # When DNS found the domain, all we need are the generated patterns; the dispatcher
+        # will call Serper as a fallback only if every pattern fails SMTP validation.
+        # This avoids paying $0.001 upfront on records that validate on the first pattern guess.
         enrichment_emails: list[str] = []
         enrichment_domain: str | None = None
         all_subdomain_emails: list[str] = []
 
-        try:
-            async with self._enrichment_sem:
-                serper_result = await self._serper.enrich(
-                    record.business_name,
-                    parsed_agent if strategy == "with" else None,
-                    record.state,
-                    domain,
-                    strategy,
-                    fallback_blocklist=self._fallback_blocklist,
-                    conn=self.conn,
-                )
-                self.cost_tracker.record_call("serper")
-                # Record any extra cost from site: fallback retries
-                for _ in range(self._serper._fallback_calls):
-                    self.cost_tracker.record_call("serper")
-                self._serper._fallback_calls = 0
+        if domain:
+            result["serper_enriched"] = 0
+            result["_trace"].append({"stage": "serper", "outcome": "skipped", "reason": "dns_hit"})
+        else:
+            try:
+                async with self._enrichment_sem:
+                    serper_result = await self._serper.enrich(
+                        record.business_name,
+                        parsed_agent if strategy == "with" else None,
+                        record.state,
+                        domain,
+                        strategy,
+                        fallback_blocklist=self._fallback_blocklist,
+                        conn=self.conn,
+                    )
+                    if not self._serper.last_was_cache_hit:
+                        self.cost_tracker.record_call("serper_producer")
+                    # Record any extra cost from site: fallback retries
+                    for _ in range(self._serper._fallback_calls):
+                        self.cost_tracker.record_call("serper_producer")
+                    self._serper._fallback_calls = 0
 
-            _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
-            enrichment_emails.extend(serper_result.candidate_emails)
-            all_subdomain_emails.extend(serper_result.subdomain_emails)
-            result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
-            if not domain and serper_result.candidate_domain:
-                enrichment_domain = serper_result.candidate_domain
-                result["discovery_source"] = "serper"
-                if serper_result.is_fallback_domain:
-                    self._record_fallback_domain(serper_result.candidate_domain)
-            elif not domain and serper_result.candidate_emails:
-                # Email found in snippet with no domain — still came from Serper
-                result["discovery_source"] = "serper"
+                result["serper_enriched"] = 1
+                _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
+                enrichment_emails.extend(serper_result.candidate_emails)
+                all_subdomain_emails.extend(serper_result.subdomain_emails)
+                result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
+                if serper_result.candidate_domain:
+                    enrichment_domain = serper_result.candidate_domain
+                    result["discovery_source"] = "serper"
+                    if serper_result.is_fallback_domain:
+                        self._record_fallback_domain(serper_result.candidate_domain)
+                elif serper_result.candidate_emails:
+                    result["discovery_source"] = "serper"
 
-        except PipelineHaltError:
-            raise
-        except Exception as exc:
-            if _is_transient_enrichment_error(exc):
-                had_transient_error = True
-                transient_error_source = "serper"
-                result["_trace"].append({"stage": "serper", "outcome": "error"})
-                logger.warning("Serper transient error for %s: %s", record.unique_id, exc)
-            else:
-                result["_trace"].append({"stage": "serper", "outcome": "error"})
-                logger.warning("Serper error for %s: %s", record.unique_id, exc)
+            except PipelineHaltError:
+                raise
+            except Exception as exc:
+                if _is_transient_enrichment_error(exc):
+                    had_transient_error = True
+                    transient_error_source = "serper"
+                    result["_trace"].append({"stage": "serper", "outcome": "error"})
+                    logger.warning("Serper transient error for %s: %s", record.unique_id, exc)
+                else:
+                    result["_trace"].append({"stage": "serper", "outcome": "error"})
+                    logger.warning("Serper error for %s: %s", record.unique_id, exc)
 
         # If enrichment found a domain but DNS didn't, generate patterns from it
         if not domain and enrichment_domain:
