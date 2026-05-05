@@ -71,7 +71,11 @@ class PipelineConfig(BaseSettings):
 
     # --- Rate limits (calls per hour) ---
     serper_rate_limit: int = 500
+    zuhal_rate_limit: int = 100
     consumer_poll_interval: int = 5  # kept for backwards-compat with status cmd
+
+    # --- Zuhal fallback backend ---
+    zuhal_concurrency: int = Field(default=5, ge=1)
 
     # --- Backoff ---
     max_attempts: int = 3

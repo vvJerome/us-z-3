@@ -100,6 +100,10 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     # Rate limits
     parser.add_argument("--serper-rate-limit", type=int, default=500,
                         help="Serper calls/hour ceiling")
+    parser.add_argument("--zuhal-rate-limit", type=int, default=100,
+                        help="Zuhal calls/hour ceiling")
+    parser.add_argument("--zuhal-concurrency", type=int, default=5,
+                        help="Concurrent Zuhal fallback probes")
 
     # Backoff
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")

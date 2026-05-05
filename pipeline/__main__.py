@@ -110,14 +110,29 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             await bbops_consumer.recover_inflight()
             logger.info("bbops async consumer started and recovered")
 
-            # --- Zuhal rescue backend ---
-            zuhal_client = ZuhalClient(
-                api_key=config.zuhal_api_key,
-                session=session,
-                rate_limiter=TokenBucket(rate=config.serper_rate_limit / 3600, capacity=10),
-                dry_run=config.dry_run,
-                max_attempts=config.max_attempts,
-            )
+            # --- Zuhal fallback (optional — only if api key is set) ---
+            zuhal_client: ZuhalClient | None = None
+            if config.zuhal_api_key:
+                _zuhal_bucket = TokenBucket(
+                    capacity=config.zuhal_rate_limit,
+                    refill_rate=config.zuhal_rate_limit / 3600,
+                )
+                zuhal_client = ZuhalClient(
+                    config.zuhal_api_key,
+                    session,
+                    _zuhal_bucket,
+                    concurrency=config.zuhal_concurrency,
+                    dry_run=config.dry_run,
+                    max_attempts=config.max_attempts,
+                    jitter=config.backoff_jitter,
+                )
+                logger.info(
+                    "Zuhal fallback enabled (concurrency=%d, rate_limit=%d/hr)",
+                    config.zuhal_concurrency,
+                    config.zuhal_rate_limit,
+                )
+            else:
+                logger.info("Zuhal fallback disabled (ZUHAL_API_KEY not set)")
 
             # --- Dispatcher ---
             dispatcher = Dispatcher(
@@ -283,9 +298,11 @@ def _is_verified(final_verdict: str | None) -> bool:
 def _validation_method(zuhal_status: str | None, final_verdict: str | None) -> str:
     if zuhal_status == "ms_valid":
         return "ms_probe"
+    if zuhal_status and zuhal_status.startswith("dual_"):
+        return "racknerd+bbops"
     if zuhal_status and not zuhal_status.startswith("dual_"):
-        return "zuhal_rescue"
-    return "racknerd+bbops"
+        return "zuhal_fallback"
+    return "unknown"
 
 
 async def _write_outputs(conn, config: PipelineConfig) -> None:
@@ -364,6 +381,7 @@ async def main() -> None:
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
         "max_cost", "max_consecutive_errors", "dry_run",
         "enrichment_source", "run_id", "notify_pipe",
+        "zuhal_concurrency", "zuhal_rate_limit",
     ]:
         val = getattr(args, field_name, None)
         if val is not None:

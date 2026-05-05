@@ -22,6 +22,7 @@ from pipeline.utils.email_patterns import email_to_template
 from pipeline.utils.ms_verify import check_microsoft_email_async, is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.text import parse_name
+from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
 from pipeline.db import State
 
@@ -182,6 +183,7 @@ class Dispatcher:
         self.conn = conn
         self.racknerd = racknerd
         self.bbops = bbops
+        self.zuhal = zuhal
         self.cost_tracker = cost_tracker
         self.stop_event = stop_event or asyncio.Event()
         self.zuhal = zuhal
@@ -376,12 +378,61 @@ class Dispatcher:
                 )
 
             if not result.should_write:
-                # Tunnel down or both inconclusive — re-queue without burning attempt
-                async with self._write_lock:
-                    await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
-                self.stats["requeued"] += 1
-                logger.debug("Re-queued %s (inconclusive verdict)", unique_id)
-                return
+                if self.zuhal is not None:
+                    zuhal_status, zuhal_trace = await self._zuhal_probe(email)
+                    pending_trace.append(zuhal_trace)
+                    # normalize accept-all to catch_all for consistency
+                    if zuhal_status == "accept-all":
+                        zuhal_status = "catch_all"
+                    terminal = zuhal_status in ("valid", "catch_all")
+                    state = State.VALIDATED if terminal else State.VALIDATION_FAILED
+                    score = compute_confidence_score(
+                        email, candidate_domain, strategy, zuhal_status, agent_name
+                    )
+                    async with self._write_lock:
+                        await db.update_record_dual(
+                            self.conn,
+                            unique_id,
+                            state,
+                            racknerd_status=rk_verdict.status if rk_verdict else "not_run",
+                            racknerd_message=rk_verdict.message if rk_verdict else "",
+                            racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
+                            bbops_status=bb_verdict.status if bb_verdict else "not_run",
+                            bbops_message=bb_verdict.message if bb_verdict else "",
+                            bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
+                            final_verdict=zuhal_status,
+                            candidate_email=email,
+                            zuhal_score=float(score),
+                            zuhal_status_override=zuhal_status,
+                        )
+                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
+                    self.cost_tracker.record_call("zuhal")
+                    if terminal:
+                        if mx_provider:
+                            tmpl = email_to_template(email, _first, _last, candidate_domain)
+                            if tmpl:
+                                await db.record_pattern_result(
+                                    self.conn, mx_provider, tmpl, success=True
+                                )
+                        self.stats["validated"] += 1
+                        logger.info(
+                            "Zuhal-validated: %s → %s [zuhal=%s]",
+                            unique_id, email, zuhal_status,
+                        )
+                    else:
+                        self.stats["validation_failed"] += 1
+                        logger.debug(
+                            "Zuhal fallback terminal: %s → %s (%s)",
+                            unique_id, email, zuhal_status,
+                        )
+                    return
+                else:
+                    # No Zuhal configured — re-queue as before
+                    async with self._write_lock:
+                        await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
+                    return
 
             if result.final_verdict in ("valid", "catch_all"):
                 score = compute_confidence_score(
@@ -504,6 +555,19 @@ class Dispatcher:
             await db.flush_process_trace(self.conn, unique_id, pending_trace)
         self.stats["validation_failed"] += 1
         logger.debug("All candidates failed for %s", unique_id)
+
+    async def _zuhal_probe(self, email: str) -> tuple[str, dict]:
+        t0 = time.monotonic()
+        try:
+            result = await self.zuhal.validate(email)  # type: ignore[union-attr]
+            status = result.verdict
+        except PipelineHaltError:
+            raise
+        except Exception as exc:
+            logger.debug("Zuhal probe error for %s: %s", email, exc)
+            status = "error"
+        ms = int((time.monotonic() - t0) * 1000)
+        return status, {"stage": "zuhal_fallback", "outcome": status, "ms": ms, "email": email}
 
     async def _ms_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()
