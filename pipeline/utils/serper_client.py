@@ -15,6 +15,7 @@ from pipeline.constants import SERVICE_BACKOFF
 from pipeline.models import EnrichmentResult, PipelineHaltError
 from pipeline.utils.backoff import with_backoff
 from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.text import normalize_business_name, parse_name
 from pipeline import db
 
 logger = logging.getLogger("pipeline.producer")
@@ -157,7 +158,9 @@ class SerperClient:
             and not result.candidate_domain
         ):
             state_name = _STATE_NAMES.get((state or "").upper(), state or "")
-            agent_query = f'"{agent_name}" {state_name} email'
+            first, _, last = parse_name(agent_name)
+            agent_q = f"{first} {last}".strip() if first and last else normalize_business_name(agent_name)
+            agent_query = f"{agent_q} {state_name} email"
             logger.debug("Serper agent-name fallback for %s → %s", agent_name, agent_query)
             await self.rate_limiter.acquire()
             data3 = await with_backoff(
@@ -183,6 +186,45 @@ class SerperClient:
                     source="serper",
                     query_used=agent_query,
                     raw_snippets=agent_result.raw_snippets,
+                )
+
+        # 4th fallback: for long business names (4+ significant words), retry with
+        # first 3 words only. Full legal names like "BREWER-LOWDER-MCCUISTON POST 9010
+        # VETERANS OF FOREIGN WARS" rarely appear verbatim; a shorter prefix often works.
+        words = normalize_business_name(business_name).split()
+        if (
+            len(words) >= 4
+            and not result.candidate_domain
+            and not result.candidate_emails
+        ):
+            state_name = _STATE_NAMES.get((state or "").upper(), state or "")
+            short_query = f"{' '.join(words[:3])} {state_name} email contact"
+            logger.debug("Serper short-name fallback for %s → %s", business_name, short_query)
+            await self.rate_limiter.acquire()
+            data4 = await with_backoff(
+                lambda: self._call_api(short_query),
+                max_attempts=self.max_attempts,
+                base_delay=self._base,
+                max_delay=self._max_delay,
+                jitter=self.jitter,
+                retryable=_is_retryable,
+                on_retry=lambda attempt, exc, delay: logger.debug(
+                    "Serper short-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                ),
+            )
+            self._fallback_calls += 1
+            short_result = self._extract(
+                data4, business_name, short_query,
+                domain_hint=None, strategy=strategy,
+                agent_name=agent_name, fallback_blocklist=fallback_blocklist,
+            )
+            if short_result.candidate_emails or short_result.candidate_domain:
+                result = EnrichmentResult(
+                    candidate_emails=short_result.candidate_emails,
+                    candidate_domain=short_result.candidate_domain,
+                    source="serper",
+                    query_used=short_query,
+                    raw_snippets=short_result.raw_snippets,
                 )
 
         return result
@@ -256,7 +298,7 @@ class SerperClient:
                     continue
                 netloc_base = netloc.rsplit(".", 1)[0] if "." in netloc else netloc
                 netloc_norm = netloc_base.replace("-", "")
-                if fuzz.ratio(norm_biz.replace(" ", ""), netloc_norm) >= 85:
+                if fuzz.ratio(norm_biz.replace(" ", ""), netloc_norm) >= 75:
                     domain = netloc
                     break
                 # Track first non-blocked organic domain for with-strategy fallback
@@ -336,15 +378,18 @@ class SerperClient:
         domain_hint: str | None,
         strategy: Literal["with", "without"],
     ) -> str:
+        norm_biz = normalize_business_name(business_name)
         loc = _STATE_NAMES.get((state or "").upper(), state or "")
         if strategy == "with" and agent_name:
+            first, _, last = parse_name(agent_name)
+            agent_q = f"{first} {last}".strip() if first and last else normalize_business_name(agent_name)
             if domain_hint:
-                return f'"{agent_name}" "{business_name}" email contact site:{domain_hint}'
-            return f'"{agent_name}" "{business_name}" {loc} email contact'.strip()
+                return f"{agent_q} {norm_biz} email site:{domain_hint}"
+            return f"{agent_q} {norm_biz} {loc} email contact".strip()
         else:
             if domain_hint:
-                return f"site:{domain_hint} contact"
-            return f'"{business_name}" {loc} contact email'.strip()
+                return f"site:{domain_hint} contact email"
+            return f"{norm_biz} {loc} contact email".strip()
 
 
 class _RetryableHTTPError(Exception):

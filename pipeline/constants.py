@@ -21,7 +21,7 @@ SERVICE_BACKOFF: dict[str, tuple[float, float]] = {
 }
 
 # --- DNS ---
-DNS_TLDS: tuple[str, ...] = (".com", ".net", ".org")
+DNS_TLDS: tuple[str, ...] = (".com", ".net", ".org", ".us", ".info")
 DNS_CONCURRENCY_DEFAULT: int = 100
 DOMAIN_STEM_MIN_LENGTH: int = 5
 MAX_WITHOUT_CANDIDATES: int = 3
