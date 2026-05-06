@@ -268,6 +268,54 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.COST_SKIPPED
         zuhal.validate.assert_not_called()
 
+    async def test_racknerd_blocked_requeues_without_burning_attempt(self, test_db, config):
+        """Racknerd 'blocked' verdict (IP-level Spamhaus rejection) re-queues the record
+        as DISCOVERED without incrementing dispatch_attempts or calling Zuhal."""
+        from unittest.mock import AsyncMock as AM
+        from pipeline.utils.zuhal_client import ZuhalClient
+
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("blocked", "Spamhaus block")
+        bb = _mock_bbops("invalid", "550")
+
+        zuhal = MagicMock(spec=ZuhalClient)
+        zuhal.validate = AM()
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=zuhal)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, dispatch_attempts FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.DISCOVERED
+        assert row["dispatch_attempts"] == 0  # not burned — blocked is not a validation attempt
+        zuhal.validate.assert_not_called()    # Zuhal must not be called on IP-level block
+
+    async def test_racknerd_blocked_bbops_valid_validates_on_bbops(self, test_db, config):
+        """When Racknerd is blocked but bbops returns valid, the OR-of-valids reconciliation
+        short-circuits: bbops valid wins and the record is VALIDATED. The blocked re-queue
+        path only fires when no backend produced a definitive valid verdict."""
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("blocked", "Spamhaus block")
+        bb = _mock_bbops("valid", "250 OK")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, final_verdict FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.VALIDATED
+        assert row["final_verdict"] == "valid"  # bbops verdict surfaces as final
+
     async def test_cost_ceiling_before_serper_fallback_marks_cost_skipped(self, test_db, config):
         """Cost ceiling hit after all patterns fail but before Serper fallback → COST_SKIPPED."""
         from pipeline.utils.serper_client import SerperClient
