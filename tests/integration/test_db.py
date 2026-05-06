@@ -291,11 +291,11 @@ class TestUpdateRecordStatus:
             "id1",
             State.VALIDATED,
             candidate_email="test@example.com",
-            zuhal_score=3,
+            confidence_score=3,
         )
 
         async with test_db.execute(
-            "SELECT record_state, candidate_email, zuhal_score FROM records WHERE unique_id = ?",
+            "SELECT record_state, candidate_email, confidence_score FROM records WHERE unique_id = ?",
             ("id1",),
         ) as cursor:
             row = await cursor.fetchone()

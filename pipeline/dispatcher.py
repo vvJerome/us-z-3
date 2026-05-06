@@ -15,7 +15,7 @@ from pipeline.constants import (
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
-from pipeline.utils.zuhal_client import ZuhalClient
+from pipeline.utils.zuhal_client import ZuhalClient, ZuhalCircuitOpenError
 from pipeline.utils.serper_client import SerperClient
 from pipeline.models import BackendVerdict, PipelineHaltError, ReconcileResult
 from pipeline.utils.cost_tracker import CostTracker
@@ -322,6 +322,8 @@ class Dispatcher:
         cost_skipped = False
         original_count = len(candidates)
         i = 0
+        last_rk: BackendVerdict | None = None
+        last_bb: BackendVerdict | None = None
 
         while i < len(candidates):
             email = candidates[i]
@@ -352,7 +354,7 @@ class Dispatcher:
                             bbops_verified_at=None,
                             final_verdict="valid",
                             candidate_email=email,
-                            zuhal_score=float(score),
+                            confidence_score=float(score),
                             dispatch_attempts_delta=0,  # MS probe is free, don't count
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
@@ -373,6 +375,7 @@ class Dispatcher:
                 unique_id, email, row["id"]
             )
             pending_trace.extend(trace_entries)
+            last_rk, last_bb = rk_verdict, bb_verdict
 
             result = reconcile(rk_verdict, bb_verdict)
 
@@ -401,6 +404,15 @@ class Dispatcher:
                         break
                     zuhal_status, zuhal_trace = await self._zuhal_probe(email)
                     pending_trace.append(zuhal_trace)
+
+                    if zuhal_status == "circuit_open":
+                        # Zuhal unavailable — re-queue without burning attempt; retries when circuit heals
+                        async with self._write_lock:
+                            await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                        self.stats["requeued"] += 1
+                        logger.warning("Zuhal circuit open — re-queued %s for later retry", unique_id)
+                        return
+
                     # normalize accept-all to catch_all for consistency
                     if zuhal_status == "accept-all":
                         zuhal_status = "catch_all"
@@ -422,7 +434,7 @@ class Dispatcher:
                             bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
                             final_verdict=zuhal_status,
                             candidate_email=email,
-                            zuhal_score=float(score),
+                            confidence_score=float(score),
                             zuhal_status_override=zuhal_status,
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
@@ -466,7 +478,7 @@ class Dispatcher:
                         bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
                         final_verdict=result.final_verdict,
                         candidate_email=email,
-                        zuhal_score=float(score),
+                        confidence_score=float(score),
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
                 await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
@@ -517,18 +529,18 @@ class Dispatcher:
         if cost_skipped:
             return
 
-        # All candidates exhausted (patterns + any Serper enrichment)
+        # All candidates exhausted — write last SMTP verdicts so we know what ran
         async with self._write_lock:
             await db.update_record_dual(
                 self.conn,
                 unique_id,
                 State.VALIDATION_FAILED,
-                racknerd_status=None,
-                racknerd_message=None,
-                racknerd_verified_at=None,
-                bbops_status=None,
-                bbops_message=None,
-                bbops_verified_at=None,
+                racknerd_status=last_rk.status if last_rk else None,
+                racknerd_message=last_rk.message if last_rk else None,
+                racknerd_verified_at=last_rk.verified_at if last_rk else None,
+                bbops_status=last_bb.status if last_bb else None,
+                bbops_message=last_bb.message if last_bb else None,
+                bbops_verified_at=last_bb.verified_at if last_bb else None,
                 final_verdict="invalid",
             )
             await db.flush_process_trace(self.conn, unique_id, pending_trace)
@@ -542,6 +554,8 @@ class Dispatcher:
             status = result.verdict
         except PipelineHaltError:
             raise
+        except ZuhalCircuitOpenError:
+            status = "circuit_open"
         except Exception as exc:
             logger.debug("Zuhal probe error for %s: %s", email, exc)
             status = "error"

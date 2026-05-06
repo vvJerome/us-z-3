@@ -331,14 +331,34 @@ def _is_verified(final_verdict: str | None) -> bool:
     return final_verdict in ("valid", "catch_all")
 
 
-def _validation_method(zuhal_status: str | None, final_verdict: str | None) -> str:
+def _validation_method(
+    racknerd_status: str | None,
+    bbops_status: str | None,
+    zuhal_status: str | None,
+) -> str:
     if zuhal_status == "ms_valid":
         return "ms_probe"
     if zuhal_status and zuhal_status.startswith("dual_"):
-        return "racknerd+bbops"
-    if zuhal_status and not zuhal_status.startswith("dual_"):
-        return "zuhal_fallback"
+        rk_ok = racknerd_status in ("valid", "catch_all")
+        bb_ok = bbops_status in ("valid", "catch_all")
+        if rk_ok and bb_ok:
+            return "smtp_both"
+        if rk_ok:
+            return "smtp_racknerd"
+        if bb_ok:
+            return "smtp_bbops"
+        return "smtp_both"
+    if zuhal_status in ("valid", "catch_all", "accept-all"):
+        return "zuhal_rescue"
     return "unknown"
+
+
+def _zuhal_verdict(zuhal_status: str | None) -> str:
+    if not zuhal_status:
+        return "not_run"
+    if zuhal_status == "ms_valid" or zuhal_status.startswith("dual_"):
+        return "not_run"
+    return zuhal_status
 
 
 async def _write_outputs(conn, config: PipelineConfig) -> None:
@@ -351,7 +371,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
     async with conn.execute(
         """
         SELECT unique_id, business_name, agent_name, state,
-               candidate_email, zuhal_status, zuhal_score,
+               candidate_email, zuhal_status, confidence_score,
                discovery_source, final_verdict,
                racknerd_status, bbops_status
           FROM records WHERE record_state = 'VALIDATED'
@@ -363,21 +383,26 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "unique_id", "business_name", "agent_name", "state",
-            "email", "final_verdict", "confidence_tier", "verified",
+            "email", "final_verdict", "confidence_tier", "confidence_score", "verified",
             "discovery_method", "validation_method",
-            "racknerd_status", "bbops_status",
+            "racknerd_verdict", "bbops_verdict", "zuhal_verdict",
         ])
         for row in rows:
             fv = row["final_verdict"] or row["zuhal_status"]
+            rk = row["racknerd_status"] or ""
+            bb = row["bbops_status"] or ""
+            zs = row["zuhal_status"]
             writer.writerow([
                 row["unique_id"], row["business_name"], row["agent_name"],
                 row["state"], row["candidate_email"], fv,
-                confidence_tier(int(row["zuhal_score"] or 0)),
+                confidence_tier(int(row["confidence_score"] or 0)),
+                int(row["confidence_score"] or 0),
                 _is_verified(fv),
                 row["discovery_source"] or "unknown",
-                _validation_method(row["zuhal_status"], fv),
-                row["racknerd_status"] or "",
-                row["bbops_status"] or "",
+                _validation_method(rk, bb, zs),
+                rk,
+                bb,
+                _zuhal_verdict(zs),
             ])
     logger.info("Wrote %d validated emails to %s", len(rows), csv_path)
 

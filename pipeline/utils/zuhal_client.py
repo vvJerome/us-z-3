@@ -75,8 +75,8 @@ class ZuhalClient:
                 ),
             )
         except aiobreaker.CircuitBreakerError:
-            logger.warning("Zuhal circuit breaker open — pausing 600s before next canary probe")
-            raise _RetryableHTTPError(429)
+            logger.warning("Zuhal circuit breaker open — records will be re-queued for retry")
+            raise ZuhalCircuitOpenError()
 
     async def _call_api(self, email: str) -> ValidationResult:
         headers = {
@@ -133,6 +133,10 @@ class ZuhalClient:
             raw_status=data.get("status", ""),
             http_status=status,
         )
+
+
+class ZuhalCircuitOpenError(Exception):
+    """Raised when Zuhal's circuit breaker is open — service is temporarily unavailable."""
 
 
 class _RetryableHTTPError(Exception):

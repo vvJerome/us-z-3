@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +47,11 @@ CREATE TABLE IF NOT EXISTS records (
     is_org_agent        INTEGER DEFAULT 0,
     mx_provider         TEXT,
 
-    -- Legacy single-backend validation (kept for backwards-compat)
+    -- Reconciliation path (encodes which backends ran and what Zuhal did)
     zuhal_status        TEXT,
-    zuhal_score         REAL,
-    validation_attempts INTEGER DEFAULT 0,
+    confidence_score    REAL,
 
-    -- Dual-backend verdicts (v4)
+    -- Per-backend verdicts
     racknerd_status     TEXT,
     racknerd_message    TEXT,
     racknerd_verified_at TEXT,
@@ -65,9 +64,8 @@ CREATE TABLE IF NOT EXISTS records (
     -- Enrichment tracking
     serper_enriched     INTEGER DEFAULT 0,
 
-    -- State machine (lifecycle + verdict)
+    -- State machine
     record_state        TEXT NOT NULL DEFAULT 'RAW',
-    verdict             TEXT,
     process_trace       TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
@@ -394,7 +392,7 @@ async def update_record_dual(
     bbops_verified_at: str | None,
     final_verdict: str,
     candidate_email: str | None = None,
-    zuhal_score: float | None = None,
+    confidence_score: float | None = None,
     dispatch_attempts_delta: int = 1,
     zuhal_status_override: str | None = None,
 ) -> None:
@@ -408,7 +406,6 @@ async def update_record_dual(
         "bbops_message = ?",
         "bbops_verified_at = ?",
         "final_verdict = ?",
-        "verdict = ?",
         "dispatch_attempts = dispatch_attempts + ?",
         "updated_at = datetime('now')",
     ]
@@ -421,7 +418,6 @@ async def update_record_dual(
         bbops_message,
         bbops_verified_at,
         final_verdict,
-        final_verdict,   # also mirror into legacy verdict column
         dispatch_attempts_delta,
     ]
 
@@ -431,9 +427,9 @@ async def update_record_dual(
         sets.append("zuhal_status = ?")
         values.append(zuhal_status_override if zuhal_status_override is not None else f"dual_{final_verdict}")
 
-    if zuhal_score is not None:
-        sets.append("zuhal_score = ?")
-        values.append(zuhal_score)
+    if confidence_score is not None:
+        sets.append("confidence_score = ?")
+        values.append(confidence_score)
 
     values.append(unique_id)
     sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
