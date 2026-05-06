@@ -79,8 +79,8 @@ class ProducerWorker:
         while not self.stop_event.is_set():
             try:
                 await db.upsert_producer_heartbeat(self.conn)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Producer heartbeat failed: %s", exc)
             try:
                 await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
             except asyncio.TimeoutError:

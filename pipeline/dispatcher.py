@@ -23,7 +23,6 @@ from pipeline.utils.email_patterns import email_to_template
 from pipeline.utils.ms_verify import check_microsoft_email_async, is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.text import parse_name
-from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
 from pipeline.db import State
 
@@ -199,6 +198,21 @@ class Dispatcher:
             "requeued": 0,
         }
 
+    async def _record_pattern(
+        self,
+        email: str,
+        first: str,
+        last: str,
+        candidate_domain: str,
+        mx_provider: str | None,
+        success: bool,
+    ) -> None:
+        if not mx_provider:
+            return
+        tmpl = email_to_template(email, first, last, candidate_domain)
+        if tmpl:
+            await db.record_pattern_result(self.conn, mx_provider, tmpl, success=success)
+
     async def run(self) -> None:
         base_interval = self.config.dispatch_poll_interval_s
         poll_interval = base_interval
@@ -296,13 +310,13 @@ class Dispatcher:
             self.stats["validation_failed"] += 1
             return
 
-        mx_provider = row["mx_provider"] if "mx_provider" in row.keys() else None
+        mx_provider = row["mx_provider"]
         candidate_domain = row["candidate_domain"] or ""
         strategy = row["strategy"] or "without"
         agent_name = row["agent_name"] or ""
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
-        serper_enriched = bool(row["serper_enriched"]) if "serper_enriched" in row.keys() else False
+        serper_enriched = bool(row["serper_enriched"])
 
         pending_trace: list[dict] = []
         cost_skipped = False
@@ -342,20 +356,14 @@ class Dispatcher:
                             dispatch_attempts_delta=0,  # MS probe is free, don't count
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    if mx_provider:
-                        tmpl = email_to_template(email, _first, _last, candidate_domain)
-                        if tmpl:
-                            await db.record_pattern_result(self.conn, mx_provider, tmpl, success=True)
+                    await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
                     self.stats["validated"] += 1
                     logger.info("MS-validated (no SMTP): %s → %s", unique_id, email)
                     return
 
                 if ms_status == "invalid":
                     pending_trace.append({"stage": "ms_skip", "outcome": "invalid", "email": email})
-                    if mx_provider:
-                        tmpl = email_to_template(email, _first, _last, candidate_domain)
-                        if tmpl:
-                            await db.record_pattern_result(self.conn, mx_provider, tmpl, success=False)
+                    await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=False)
                     continue  # try next candidate
 
                 # unknown/error → fall through to SMTP backends
@@ -415,12 +423,7 @@ class Dispatcher:
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
                     if terminal:
-                        if mx_provider:
-                            tmpl = email_to_template(email, _first, _last, candidate_domain)
-                            if tmpl:
-                                await db.record_pattern_result(
-                                    self.conn, mx_provider, tmpl, success=True
-                                )
+                        await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
                         self.stats["validated"] += 1
                         logger.info(
                             "Zuhal-validated: %s → %s [zuhal=%s]",
@@ -461,10 +464,7 @@ class Dispatcher:
                         zuhal_score=float(score),
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                if mx_provider:
-                    tmpl = email_to_template(email, _first, _last, candidate_domain)
-                    if tmpl:
-                        await db.record_pattern_result(self.conn, mx_provider, tmpl, success=True)
+                await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
                 self.stats["validated"] += 1
                 logger.info(
                     "Validated %s → %s [rk=%s bb=%s]",
@@ -475,10 +475,7 @@ class Dispatcher:
                 return
 
             # invalid — record pattern miss and try next candidate
-            if mx_provider:
-                tmpl = email_to_template(email, _first, _last, candidate_domain)
-                if tmpl:
-                    await db.record_pattern_result(self.conn, mx_provider, tmpl, success=False)
+            await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=False)
             logger.debug(
                 "Candidate %s for %s: %s — trying next",
                 email, unique_id, result.final_verdict,
@@ -634,8 +631,8 @@ class Dispatcher:
         while not self.stop_event.is_set():
             try:
                 await db.upsert_dispatcher_heartbeat(self.conn)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Dispatcher heartbeat failed: %s", exc)
             try:
                 await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
             except asyncio.TimeoutError:
