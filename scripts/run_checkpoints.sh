@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# scripts/run_checkpoints.sh — Run pipeline in 100-record batches with checkpoint reviews
+# scripts/run_checkpoints.sh — Run pipeline in batches with checkpoint reviews
 #
 # Usage:
-#   scripts/run_checkpoints.sh [--dry-run] [--max-batches N]
+#   scripts/run_checkpoints.sh --input FILE --name NAME [OPTIONS]
 #
-# Runs up to 1,000 records (10 × 100) against nc_1k with a $1.00 cost ceiling.
-# After each batch: prints a metrics report, appends it to checkpoints.log,
-# and prompts whether to continue.
+# Required:
+#   --input FILE        Input JSONL file path (relative to project root)
+#   --name NAME         Run name; outputs go to output/NAME/
+#
+# Optional:
+#   --batch-size N      Records per batch (default: 100)
+#   --max-batches N     Number of batches (default: 10)
+#   --max-cost USD      Cost ceiling per batch (default: 1.00)
+#   --dry-run           No real API calls
+#   --no-racknerd       Disable Racknerd backend (bbops + Zuhal only)
+#   --racknerd-direct   Skip SSH tunnel; probe MX servers directly (use on the egress VPS)
 
 set -euo pipefail
 
@@ -22,27 +30,26 @@ _on_error() {
   echo "" >&2
   echo "══════════════════════════════════════════════════════" >&2
   echo "PIPELINE FAILURE — ${ts}  (line ${lineno})" >&2
-  echo "  Database:  ${DB_PATH}" >&2
-  echo "  Log:       ${LOG_FILE}" >&2
+  echo "  Database:  ${DB_PATH:-unknown}" >&2
+  echo "  Log:       ${LOG_FILE:-unknown}" >&2
   echo "══════════════════════════════════════════════════════" >&2
-  mkdir -p "$(dirname "$LOG_FILE")"
-  {
-    echo ""
-    echo "FAILURE — ${ts}  (line ${lineno})"
-    echo "  Run 'python -m pipeline status --db ${DB_PATH}' for current state."
-  } >> "$LOG_FILE" 2>/dev/null || true
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    {
+      echo ""
+      echo "FAILURE — ${ts}  (line ${lineno})"
+      echo "  Run 'python -m pipeline status --db ${DB_PATH:-unknown}' for current state."
+    } >> "$LOG_FILE" 2>/dev/null || true
+  fi
 }
 trap '_on_error $LINENO' ERR
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Defaults ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=100
 MAX_BATCHES=10
-PIPELINE_NAME="nc_1k"
-INPUT_FILE="input/nc_retry_300k.jsonl"
-OUTPUT_DIR="output/${PIPELINE_NAME}"
-DB_PATH="${OUTPUT_DIR}/pipeline.db"
-LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 MAX_COST="1.00"
+PIPELINE_NAME=""
+INPUT_FILE=""
 DRY_RUN=false
 NO_RACKNERD=false
 RACKNERD_DIRECT=false
@@ -50,17 +57,36 @@ RACKNERD_DIRECT=false
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)          DRY_RUN=true; shift ;;
-    --no-racknerd)      NO_RACKNERD=true; shift ;;
-    --racknerd-direct)  RACKNERD_DIRECT=true; shift ;;
-    --max-batches)      MAX_BATCHES="$2"; shift 2 ;;
+    --input)           INPUT_FILE="$2";     shift 2 ;;
+    --name)            PIPELINE_NAME="$2";  shift 2 ;;
+    --batch-size)      BATCH_SIZE="$2";     shift 2 ;;
+    --max-batches)     MAX_BATCHES="$2";    shift 2 ;;
+    --max-cost)        MAX_COST="$2";       shift 2 ;;
+    --dry-run)         DRY_RUN=true;        shift ;;
+    --no-racknerd)     NO_RACKNERD=true;    shift ;;
+    --racknerd-direct) RACKNERD_DIRECT=true; shift ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--dry-run] [--no-racknerd] [--racknerd-direct] [--max-batches N]"
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+# ── Required argument validation ──────────────────────────────────────────────
+if [[ -z "$INPUT_FILE" ]]; then
+  echo "ERROR: --input FILE is required." >&2
+  exit 1
+fi
+if [[ -z "$PIPELINE_NAME" ]]; then
+  echo "ERROR: --name NAME is required." >&2
+  exit 1
+fi
+
+# ── Derived paths (depend on PIPELINE_NAME) ───────────────────────────────────
+OUTPUT_DIR="output/${PIPELINE_NAME}"
+DB_PATH="${OUTPUT_DIR}/pipeline.db"
+LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -183,7 +209,9 @@ REPORT
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Checkpoint runner starting"
-echo "  Batches:   ${MAX_BATCHES} × ${BATCH_SIZE} = $(( MAX_BATCHES * BATCH_SIZE )) records max"
+echo "  Input:     ${INPUT_FILE}"
+echo "  Name:      ${PIPELINE_NAME}"
+echo "  Batches:   ${MAX_BATCHES} x ${BATCH_SIZE} = $(( MAX_BATCHES * BATCH_SIZE )) records max"
 echo "  Cost cap:  \$${MAX_COST}"
 echo "  Dry-run:   ${DRY_RUN}"
 echo "  Output:    ${OUTPUT_DIR}"
@@ -198,6 +226,9 @@ if [[ ! -f "$LOG_FILE" ]]; then
   } > "$LOG_FILE"
 fi
 
+PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+[[ ! -x "$PYTHON" ]] && PYTHON="python3"
+
 for batch_num in $(seq 1 "$MAX_BATCHES"); do
   start_record=$(( (batch_num - 1) * BATCH_SIZE + 1 ))
   end_record=$(( batch_num * BATCH_SIZE ))
@@ -205,11 +236,8 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   _check_disk_space
 
   echo "──────────────────────────────────────────────────────"
-  echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}–${end_record}"
+  echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}-${end_record}"
   echo "──────────────────────────────────────────────────────"
-
-  PYTHON="${PROJECT_ROOT}/.venv/bin/python"
-  [[ ! -x "$PYTHON" ]] && PYTHON="python3"
 
   pipeline_cmd=(
     "$PYTHON" -m pipeline run
@@ -241,7 +269,7 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   # Warn if any records were cost-skipped
   skipped=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM records WHERE record_state='COST_SKIPPED'" 2>/dev/null || echo 0)
   if [[ $skipped -gt 0 ]]; then
-    echo "⚠  WARNING: ${skipped} record(s) hit the cost ceiling — consider raising --max-cost."
+    echo "WARNING: ${skipped} record(s) hit the cost ceiling -- consider raising --max-cost."
   fi
 
   # Prompt to continue (skip after final batch)
