@@ -175,8 +175,11 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}–${end_record}"
   echo "──────────────────────────────────────────────────────"
 
+  PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+  [[ ! -x "$PYTHON" ]] && PYTHON="python3"
+
   pipeline_cmd=(
-    python -m pipeline run
+    "$PYTHON" -m pipeline run
     --input "${INPUT_FILE}"
     --limit "${BATCH_SIZE}"
     --name  "${PIPELINE_NAME}"
@@ -229,7 +232,7 @@ if [[ $discovered_remaining -gt 0 ]]; then
   echo "Drain pass: ${discovered_remaining} DISCOVERED record(s) still pending — running dispatcher-only pass"
   echo "──────────────────────────────────────────────────────"
   drain_cmd=(
-    python -m pipeline run
+    "$PYTHON" -m pipeline run
     --consumer-only
     --name  "${PIPELINE_NAME}"
     --max-cost "${MAX_COST}"
