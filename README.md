@@ -162,7 +162,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `DISCOVERY_FAILED` | producer | No domain or email found via DNS or Serper |
 | `COST_SKIPPED` | dispatcher | Cost ceiling hit before Zuhal rescue ran |
 
-### `racknerd_status` — direct SMTP backend verdict
+### `racknerd_verdict` — direct SMTP backend verdict
 
 | Value | Meaning |
 |---|---|
@@ -174,7 +174,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `not_run` | Backend skipped (MS probe short-circuited) |
 | `ms_valid` | Record confirmed via MS probe, not direct SMTP |
 
-### `bbops_status` — async batch SMTP verdict
+### `bbops_verdict` — async batch SMTP verdict
 
 | Value | Meaning |
 |---|---|
@@ -192,16 +192,19 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `catch_all` | Either backend returned catch_all (and none returned valid) |
 | `invalid` | All backends rejected and Zuhal rescue also failed |
 
-### `zuhal_status` — raw Zuhal API verdict
+### `zuhal_status` — Zuhal API response or SMTP encoding tag
 
 | Value | Meaning |
 |---|---|
-| `valid` | Zuhal confirmed deliverable (rescue succeeded) |
-| `accept-all` | Zuhal returned catch-all (rescue succeeded as catch_all) |
-| `invalid` | Zuhal also rejected |
+| `valid` | Zuhal rescue confirmed deliverable |
+| `accept-all` | Zuhal rescue returned catch-all |
+| `invalid` | Zuhal rescue also rejected |
 | `error` | Zuhal API call failed |
-| `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal did NOT run; tag encodes the SMTP reconciliation result |
+| `circuit_open` | Zuhal circuit breaker open — record re-queued without burning attempt |
+| `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal NOT called; tag encodes the SMTP reconciliation result |
 | `ms_valid` | Record confirmed by MS probe, Zuhal not called |
+
+`zuhal_verdict` in the CSV strips the `dual_*` / `ms_valid` tags and shows `not_run` when Zuhal was not invoked.
 
 ---
 
@@ -216,13 +219,15 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `agent_name` | Registered agent / officer name |
 | `state` | State abbreviation (e.g. `NC`) |
 | `email` | Confirmed deliverable email address |
-| `final_verdict` | `valid`, `catch_all`, or `invalid` |
-| `confidence_tier` | `high` / `medium` / `low` |
+| `final_verdict` | `valid` or `catch_all` |
+| `confidence_tier` | `high` / `medium` / `low` (from `confidence_score`) |
+| `confidence_score` | Raw additive pattern score 0–4 |
 | `verified` | `True` if `valid` or `catch_all` |
 | `discovery_method` | `dns`, `serper`, or `input` |
-| `validation_method` | `ms_probe`, `racknerd+bbops`, or `zuhal_rescue` |
-| `racknerd_status` | Racknerd SMTP verdict |
-| `bbops_status` | bbops.io verdict |
+| `validation_method` | Which backend validated: `ms_probe`, `smtp_both`, `smtp_racknerd`, `smtp_bbops`, or `zuhal_rescue` |
+| `racknerd_verdict` | Racknerd SMTP verdict for this email |
+| `bbops_verdict` | bbops.io verdict for this email |
+| `zuhal_verdict` | Zuhal rescue verdict, or `not_run` if Zuhal was not called |
 
 **Confidence scoring** (additive, determines `confidence_tier`):
 - Domain match (+1): email domain fuzzy-matches `candidate_domain`
@@ -269,6 +274,7 @@ Run summary: total records, state counts, verdict counts, cost, timestamps. Writ
 | `--racknerd-host HOST` | — | VPS hostname for SSH tunnel (required for dispatcher) |
 | `--racknerd-concurrency N` | 10 | Parallel SMTP connections via tunnel |
 | `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
+| `--racknerd-direct` | off | Skip SOCKS5 tunnel; connect to MX servers directly (use when running on the egress VPS) |
 | `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
 | `--max-consecutive-errors N` | 10 | Halt after N consecutive producer errors |
 
@@ -291,7 +297,7 @@ Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue a
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q            # all 194 tests
+.venv/bin/python -m pytest tests/ -q            # all 201 tests
 .venv/bin/python -m pytest tests/unit/ -q       # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q        # end-to-end subprocess tests
 ```
@@ -307,5 +313,6 @@ Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue a
 | bbops role | Standalone sync batch script | Async Dispatcher backend with crash recovery |
 | Failure handling | Stalled run on Zuhal outage | Re-queue without burning attempt on errors |
 | Zuhal role | Primary and only validator | Rescue only — after both SMTP say no |
-| DB verdict storage | Single `zuhal_status` column | `racknerd_*` + `bbops_*` + `zuhal_status` |
-| Schema version | v3 | v4 |
+| DB verdict storage | Single `zuhal_status` column | `racknerd_*` + `bbops_*` + `zuhal_status` + `confidence_score` |
+| Schema version | v3 | v6 |
+| Zuhal circuit failure | VALIDATION_FAILED written | Record re-queued as DISCOVERED (auto-heal) |

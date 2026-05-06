@@ -45,7 +45,7 @@ Shared fixtures live in `tests/conftest.py`. Don't define the same fixture in mu
 
 ## Passing bar
 
-119 tests, 0 failures, 0 errors. Any regression is a blocker. Run `pytest tests/ -q` before marking any task complete.
+201 tests, 0 failures, 0 errors. Any regression is a blocker. Run `pytest tests/ -q` before marking any task complete.
 
 ## E2e test isolation
 

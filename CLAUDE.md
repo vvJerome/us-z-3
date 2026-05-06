@@ -94,7 +94,8 @@ us-z-3/
 ├── runs/                   # Orchestrator run directories (managed automatically)
 ├── scripts/
 │   ├── clean.sh            # Delete stale output dirs (--force to actually delete)
-│   ├── deploy.sh           # Install deps on server
+│   ├── deploy.sh           # rsync project to VPS + install deps
+│   ├── run_checkpoints.sh  # 10×100-record batched run with interactive checkpoint reviews
 │   ├── start.sh            # Launch orchestrator in tmux
 │   ├── stop.sh             # Kill orchestrator session
 │   ├── logs.sh             # Tail pipeline logs
@@ -162,7 +163,7 @@ Cost ceiling before Zuhal → COST_SKIPPED
 
 ## Status fields reference
 
-### `racknerd_status`
+### `racknerd_verdict` (DB column: `racknerd_status`)
 
 | Value | Meaning |
 |---|---|
@@ -174,7 +175,7 @@ Cost ceiling before Zuhal → COST_SKIPPED
 | `not_run` | Skipped — MS probe short-circuited |
 | `ms_valid` | Confirmed via MS probe (not direct SMTP) |
 
-### `bbops_status`
+### `bbops_verdict` (DB column: `bbops_status`)
 
 | Value | Meaning |
 |---|---|
@@ -198,6 +199,7 @@ Cost ceiling before Zuhal → COST_SKIPPED
 |---|---|
 | `valid` / `accept-all` | Zuhal rescue succeeded |
 | `invalid` / `error` | Zuhal also rejected or errored |
+| `circuit_open` | Zuhal circuit breaker open; record re-queued as DISCOVERED (auto-heal, no attempt burned) |
 | `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal did NOT run; encodes the SMTP reconciliation result |
 | `ms_valid` | MS probe short-circuited; Zuhal not called |
 
@@ -235,19 +237,21 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `agent_name` | Registered agent / officer name |
 | `state` | State abbreviation (e.g. `NC`) |
 | `email` | Confirmed deliverable email address |
-| `final_verdict` | Reconciled verdict: `valid`, `catch_all`, `invalid` |
-| `confidence_tier` | `high` / `medium` / `low` (scoring details below) |
+| `final_verdict` | Reconciled verdict: `valid` or `catch_all` |
+| `confidence_tier` | `high` / `medium` / `low` (from `confidence_score`) |
+| `confidence_score` | Raw additive pattern score 0–4 |
 | `verified` | `True` if `valid` or `catch_all`; `False` otherwise |
 | `discovery_method` | How the email was found: `dns`, `serper`, `input` |
-| `validation_method` | Which backend validated it: `ms_probe`, `racknerd+bbops`, `zuhal_rescue` |
-| `racknerd_status` | Racknerd SMTP verdict: `valid`, `invalid`, `catch_all`, `error`, `not_run`, `ms_valid` |
-| `bbops_status` | bbops.io verdict: `valid`, `invalid`, `catch_all`, `error`, `not_run` |
+| `validation_method` | Which backend validated: `ms_probe`, `smtp_both`, `smtp_racknerd`, `smtp_bbops`, `zuhal_rescue` |
+| `racknerd_verdict` | Racknerd SMTP verdict for this email |
+| `bbops_verdict` | bbops.io verdict for this email |
+| `zuhal_verdict` | Zuhal rescue verdict, or `not_run` if Zuhal was not invoked |
 
 **Confidence scoring** (additive):
 
 - Domain match (+1): email domain fuzzy-matches the candidate domain
-- Strategy `with`: name match (+1), not a generic prefix (+1), not catch-all (+1)
-- Strategy `without`: IS a generic prefix (+1), not catch-all (+1)
+- Strategy `with`: name match (+1), not a generic prefix (+1), verdict=`valid` (+1)
+- Strategy `without`: IS a generic prefix (+1), verdict=`valid` (+1)
 - High ≥ 3, medium = 2, low ≤ 1
 
 ---
@@ -283,6 +287,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--racknerd-host HOST` | — | VPS hostname for SSH tunnel (required for dispatcher) |
 | `--racknerd-concurrency N` | 10 | Parallel SMTP connections via tunnel |
 | `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
+| `--racknerd-direct` | off | Skip SOCKS5 tunnel; connect directly to MX servers (use when running on the egress VPS) |
 | `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
 | `--max-consecutive-errors N` | 10 | Halt after N consecutive producer errors |
 
@@ -291,7 +296,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 194 tests
+.venv/bin/python -m pytest tests/ -q    # all 201 tests
 .venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```
