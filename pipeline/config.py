@@ -50,6 +50,7 @@ class PipelineConfig(BaseSettings):
 
     # --- Racknerd backend ---
     racknerd_enabled: bool = True
+    racknerd_direct: bool = False  # skip SSH tunnel, probe SMTP directly from this machine
     racknerd_host: str = ""
     racknerd_ssh_user: str = "egress"
     racknerd_ssh_key: str = "~/.ssh/racknerd_egress"
@@ -104,10 +105,10 @@ class PipelineConfig(BaseSettings):
         if self.producer_only and self.consumer_only:
             raise ValueError("--producer-only and --consumer-only are mutually exclusive")
 
-        if self.racknerd_enabled and not self.racknerd_host and not self.producer_only:
+        if self.racknerd_enabled and not self.racknerd_direct and not self.racknerd_host and not self.producer_only:
             raise ValueError(
-                "RACKNERD_HOST must be set when racknerd_enabled=True. "
-                "Set RACKNERD_HOST in .env or pass --racknerd-host."
+                "RACKNERD_HOST must be set when racknerd_enabled=True (not direct mode). "
+                "Set RACKNERD_HOST in .env, pass --racknerd-host, or use --racknerd-direct."
             )
 
         needs_dispatcher = not self.producer_only and not self.dry_run

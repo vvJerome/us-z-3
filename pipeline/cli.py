@@ -81,6 +81,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Enable Racknerd SMTP backend (default: True unless --producer-only)")
     parser.add_argument("--no-racknerd", dest="racknerd_enabled", action="store_false",
                         help="Disable Racknerd SMTP backend")
+    parser.add_argument("--racknerd-direct", action="store_true", default=None,
+                        help="Use Racknerd in direct TCP mode (no SOCKS5 tunnel — use when running on the egress VPS)")
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
     parser.add_argument("--racknerd-ssh-user", default="egress", help="SSH username")
     parser.add_argument("--racknerd-ssh-key", default=None, help="SSH private key path")

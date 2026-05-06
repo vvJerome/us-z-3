@@ -25,15 +25,17 @@ LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 MAX_COST="1.00"
 DRY_RUN=false
 NO_RACKNERD=false
+RACKNERD_DIRECT=false
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)      DRY_RUN=true; shift ;;
-    --no-racknerd)  NO_RACKNERD=true; shift ;;
-    --max-batches)  MAX_BATCHES="$2"; shift 2 ;;
+    --dry-run)          DRY_RUN=true; shift ;;
+    --no-racknerd)      NO_RACKNERD=true; shift ;;
+    --racknerd-direct)  RACKNERD_DIRECT=true; shift ;;
+    --max-batches)      MAX_BATCHES="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--dry-run] [--no-racknerd] [--max-batches N]"
+      echo "Usage: $(basename "$0") [--dry-run] [--no-racknerd] [--racknerd-direct] [--max-batches N]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -184,6 +186,8 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
     pipeline_cmd+=(--dry-run --no-racknerd)
   elif [[ "$NO_RACKNERD" == "true" ]]; then
     pipeline_cmd+=(--no-racknerd)
+  elif [[ "$RACKNERD_DIRECT" == "true" ]]; then
+    pipeline_cmd+=(--racknerd-direct)
   fi
 
   cd "$PROJECT_ROOT"
@@ -217,6 +221,30 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
 
   echo
 done
+
+# ── Drain pass: clear any DISCOVERED records left by the final batch ──────────
+discovered_remaining=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERED'" 2>/dev/null || echo 0)
+if [[ $discovered_remaining -gt 0 ]]; then
+  echo "──────────────────────────────────────────────────────"
+  echo "Drain pass: ${discovered_remaining} DISCOVERED record(s) still pending — running dispatcher-only pass"
+  echo "──────────────────────────────────────────────────────"
+  drain_cmd=(
+    python -m pipeline run
+    --consumer-only
+    --name  "${PIPELINE_NAME}"
+    --max-cost "${MAX_COST}"
+  )
+  if [[ "$DRY_RUN" == "true" ]]; then
+    drain_cmd+=(--dry-run --no-racknerd)
+  elif [[ "$NO_RACKNERD" == "true" ]]; then
+    drain_cmd+=(--no-racknerd)
+  elif [[ "$RACKNERD_DIRECT" == "true" ]]; then
+    drain_cmd+=(--racknerd-direct)
+  fi
+  cd "$PROJECT_ROOT"
+  "${drain_cmd[@]}"
+  echo
+fi
 
 echo "══════════════════════════════════════════════════════"
 echo "All ${MAX_BATCHES} batches complete."

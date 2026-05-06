@@ -145,6 +145,44 @@ class SerperClient:
                     raw_snippets=fallback.raw_snippets,
                 )
 
+        # Third fallback: agent-name-focused query when primary found neither emails nor domain.
+        # Registered agents are often individual lawyers whose contact appears under their name,
+        # not the filing entity — a simpler personal query can surface what the business query misses.
+        if (
+            strategy == "with"
+            and agent_name
+            and not result.candidate_emails
+            and not result.candidate_domain
+        ):
+            state_name = _STATE_NAMES.get((state or "").upper(), state or "")
+            agent_query = f'"{agent_name}" {state_name} email'
+            logger.debug("Serper agent-name fallback for %s → %s", agent_name, agent_query)
+            await self.rate_limiter.acquire()
+            data3 = await with_backoff(
+                lambda: self._call_api(agent_query),
+                max_attempts=self.max_attempts,
+                base_delay=self._base,
+                max_delay=self._max_delay,
+                jitter=self.jitter,
+                retryable=_is_retryable,
+                on_retry=lambda attempt, exc, delay: logger.debug(
+                    "Serper agent-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                ),
+            )
+            agent_result = self._extract(
+                data3, business_name, agent_query,
+                domain_hint=None, strategy="with",
+                agent_name=agent_name, fallback_blocklist=fallback_blocklist,
+            )
+            if agent_result.candidate_emails or agent_result.candidate_domain:
+                result = EnrichmentResult(
+                    candidate_emails=agent_result.candidate_emails,
+                    candidate_domain=agent_result.candidate_domain,
+                    source="serper",
+                    query_used=agent_query,
+                    raw_snippets=agent_result.raw_snippets,
+                )
+
         return result
 
     async def _call_api(self, query: str) -> dict:

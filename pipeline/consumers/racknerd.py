@@ -45,6 +45,7 @@ class RacknerdConfig:
     concurrency: int = 10
     smtp_timeout_s: float = RACKNERD_SMTP_TIMEOUT_S
     helo_hostname: str = "mail.verify.local"
+    direct: bool = False  # skip SOCKS5 tunnel, connect directly (use when running on the egress VPS)
 
 
 class _SpamhausGuard:
@@ -82,15 +83,15 @@ class _SpamhausGuard:
 
 
 class RacknerdConsumer:
-    """Verify emails via SOCKS5 tunnel → MX server SMTP RCPT TO probe."""
+    """Verify emails via SMTP RCPT TO probe, either through SOCKS5 tunnel or directly."""
 
     def __init__(
         self,
-        tunnel: SshSocksTunnel,
+        tunnel: SshSocksTunnel | None,
         config: RacknerdConfig | None = None,
         resolver: aiodns.DNSResolver | None = None,
     ) -> None:
-        self.tunnel = tunnel
+        self.tunnel = tunnel  # None = direct mode (no SOCKS5)
         self.config = config or RacknerdConfig()
         self._resolver = resolver or aiodns.DNSResolver(timeout=3, tries=1)
         self._sem = asyncio.Semaphore(self.config.concurrency)
@@ -104,7 +105,7 @@ class RacknerdConsumer:
             return await self._verify_inner(email)
 
     async def _verify_inner(self, email: str) -> BackendVerdict:
-        if not self.tunnel.is_up():
+        if self.tunnel is not None and not self.tunnel.is_up():
             return BackendVerdict(status="error", message="tunnel not up", verified_at=_ISO_NOW())
 
         await self._guard.wait_if_cooling()
@@ -172,7 +173,26 @@ class RacknerdConsumer:
         return hosts
 
     async def _probe_mx(self, email: str, mx_host: str) -> tuple[str, str]:
-        """Open SOCKS5 connection to mx_host:25 and run EHLO/MAIL/RCPT."""
+        if self.config.direct:
+            return await self._probe_direct(email, mx_host)
+        return await self._probe_socks5(email, mx_host)
+
+    async def _probe_direct(self, email: str, mx_host: str) -> tuple[str, str]:
+        """Direct TCP connection to mx_host:25 — no SOCKS5 (use when already on the egress IP)."""
+        cfg = self.config
+        try:
+            smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=cfg.smtp_timeout_s)
+            await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
+            return await self._run_smtp_probe(smtp, email, mx_host)
+        except aiosmtplib.SMTPException as exc:
+            return "error", f"SMTP error: {exc}"
+        except asyncio.TimeoutError:
+            return "error", f"SMTP timeout probing {mx_host}"
+        except Exception as exc:
+            return "error", f"probe error: {exc}"
+
+    async def _probe_socks5(self, email: str, mx_host: str) -> tuple[str, str]:
+        """SOCKS5-proxied connection to mx_host:25 via the SSH tunnel."""
         cfg = self.config
         try:
             from python_socks.async_.asyncio import Proxy  # type: ignore[import]
@@ -180,6 +200,7 @@ class RacknerdConsumer:
             _log.error("python-socks not installed — cannot probe via SOCKS5")
             return "error", "python-socks not installed"
 
+        sock = None
         try:
             proxy = Proxy.from_url(f"socks5://{cfg.socks_host}:{cfg.socks_port}")
             sock = await asyncio.wait_for(
@@ -193,49 +214,10 @@ class RacknerdConsumer:
 
         try:
             smtp = aiosmtplib.SMTP(
-                hostname=mx_host,
-                port=25,
-                timeout=cfg.smtp_timeout_s,
-                sock=sock,
+                hostname=mx_host, port=25, timeout=cfg.smtp_timeout_s, sock=sock,
             )
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
-
-            try:
-                await asyncio.wait_for(smtp.ehlo(cfg.helo_hostname), timeout=cfg.smtp_timeout_s)
-                await asyncio.wait_for(
-                    smtp.mail(f"verify@{cfg.helo_hostname}"),
-                    timeout=cfg.smtp_timeout_s,
-                )
-                code, msg = await asyncio.wait_for(
-                    smtp.rcpt(email),
-                    timeout=cfg.smtp_timeout_s,
-                )
-                try:
-                    await asyncio.wait_for(smtp.rset(), timeout=cfg.smtp_timeout_s)
-                except Exception:
-                    pass
-
-                if not isinstance(code, int):
-                    return "error", "malformed SMTP response (no code)"
-
-                msg_lower = msg.lower()
-                if 200 <= code <= 399:
-                    return "valid", f"{code} {msg}"
-                if code >= 500:
-                    if any(kw in msg_lower for kw in _SPAMHAUS_KEYWORDS):
-                        return "blocked", f"{code} {msg}"
-                    if any(kw in msg_lower for kw in _INVALID_KEYWORDS):
-                        return "invalid", f"{code} {msg}"
-                    return "error", f"{code} {msg}"
-                # 4xx — temporary failure, try next MX
-                return "error", f"{code} {msg} (4xx temporary)"
-
-            finally:
-                try:
-                    await asyncio.wait_for(smtp.quit(), timeout=3.0)
-                except Exception:
-                    pass
-
+            return await self._run_smtp_probe(smtp, email, mx_host)
         except aiosmtplib.SMTPException as exc:
             return "error", f"SMTP error: {exc}"
         except asyncio.TimeoutError:
@@ -245,5 +227,41 @@ class RacknerdConsumer:
         finally:
             try:
                 sock.close()
+            except Exception:
+                pass
+
+    async def _run_smtp_probe(
+        self, smtp: aiosmtplib.SMTP, email: str, mx_host: str
+    ) -> tuple[str, str]:
+        """Run EHLO/MAIL/RCPT sequence on an already-connected SMTP client."""
+        cfg = self.config
+        try:
+            await asyncio.wait_for(smtp.ehlo(cfg.helo_hostname), timeout=cfg.smtp_timeout_s)
+            await asyncio.wait_for(
+                smtp.mail(f"verify@{cfg.helo_hostname}"), timeout=cfg.smtp_timeout_s
+            )
+            code, msg = await asyncio.wait_for(smtp.rcpt(email), timeout=cfg.smtp_timeout_s)
+            try:
+                await asyncio.wait_for(smtp.rset(), timeout=cfg.smtp_timeout_s)
+            except Exception:
+                pass
+
+            if not isinstance(code, int):
+                return "error", "malformed SMTP response (no code)"
+
+            msg_lower = msg.lower()
+            if 200 <= code <= 399:
+                return "valid", f"{code} {msg}"
+            if code >= 500:
+                if any(kw in msg_lower for kw in _SPAMHAUS_KEYWORDS):
+                    return "blocked", f"{code} {msg}"
+                if any(kw in msg_lower for kw in _INVALID_KEYWORDS):
+                    return "invalid", f"{code} {msg}"
+                return "error", f"{code} {msg}"
+            # 4xx — temporary failure, try next MX
+            return "error", f"{code} {msg} (4xx temporary)"
+        finally:
+            try:
+                await asyncio.wait_for(smtp.quit(), timeout=3.0)
             except Exception:
                 pass

@@ -80,8 +80,18 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             logger.info("Producer worker started")
 
         if not config.producer_only:
-            # --- SSH SOCKS5 tunnel + Racknerd consumer (skipped when --no-racknerd) ---
-            if config.racknerd_enabled:
+            # --- Racknerd consumer setup ---
+            shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+            if config.racknerd_enabled and config.racknerd_direct:
+                logger.info("Racknerd in direct mode (no SOCKS5 tunnel)")
+                tunnel = None
+                rk_config = RacknerdConfig(
+                    concurrency=config.racknerd_concurrency,
+                    smtp_timeout_s=config.racknerd_smtp_timeout_s,
+                    direct=True,
+                )
+                racknerd = RacknerdConsumer(None, rk_config, resolver=shared_resolver)
+            elif config.racknerd_enabled:
                 tunnel_cfg = TunnelConfig(
                     host=config.racknerd_host,
                     user=config.racknerd_ssh_user,
@@ -94,8 +104,6 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 logger.info("Starting SSH SOCKS5 tunnel to %s", config.racknerd_host)
                 await tunnel.start(ready_timeout_s=30.0)
                 logger.info("SSH tunnel ready")
-
-                shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
                 rk_config = RacknerdConfig(
                     socks_port=config.racknerd_socks_port,
                     concurrency=config.racknerd_concurrency,
@@ -400,7 +408,7 @@ async def main() -> None:
         "dns_concurrency", "serper_concurrency",
         "dispatch_concurrency", "dispatch_backend_timeout_s",
         "dispatch_poll_interval_s", "dispatch_chunk_size",
-        "racknerd_enabled", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
+        "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s",
         "bbops_base_url", "bbops_batch_size", "bbops_max_inflight",
