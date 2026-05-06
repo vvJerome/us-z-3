@@ -63,15 +63,17 @@ class ProducerWorker:
         self._fallback_seen: Counter[str] = Counter()
         self._notify_pipe: Path | None = None
 
+        # 2 calls/second sustained, burst cap 5, starts empty to prevent startup burst.
         _serper_bucket = TokenBucket(
-            capacity=config.serper_rate_limit,
-            refill_rate=config.serper_rate_limit / 3600,
+            capacity=5,
+            refill_rate=2.0,
+            initial_tokens=0,
         )
 
         self._serper = SerperClient(
             config.serper_api_key, session, _serper_bucket,
             dry_run=config.dry_run,
-            max_attempts=config.max_attempts,
+            max_attempts=5,
             jitter=config.backoff_jitter,
         )
 

@@ -162,11 +162,12 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 api_key=config.serper_api_key,
                 session=session,
                 rate_limiter=TokenBucket(
-                    capacity=config.serper_rate_limit,
-                    refill_rate=config.serper_rate_limit / 3600,
+                    capacity=5,
+                    refill_rate=2.0,
+                    initial_tokens=0,
                 ),
                 dry_run=config.dry_run,
-                max_attempts=config.max_attempts,
+                max_attempts=5,
             )
 
             # --- Dispatcher ---

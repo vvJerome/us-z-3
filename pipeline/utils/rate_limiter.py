@@ -11,10 +11,18 @@ class TokenBucket:
     Tokens refill continuously at `refill_rate` tokens/second.
     """
 
-    def __init__(self, capacity: int, refill_rate: float) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        refill_rate: float,
+        *,
+        initial_tokens: float | None = None,
+    ) -> None:
         self.capacity = capacity
         self.refill_rate = refill_rate  # tokens per second
-        self._tokens = float(capacity)
+        # Default: start full (backward compatible).
+        # Pass initial_tokens=0 to prevent startup burst for high-concurrency callers.
+        self._tokens = float(capacity) if initial_tokens is None else initial_tokens
         self._last_refill = time.monotonic()
         self._lock = asyncio.Lock()
 
