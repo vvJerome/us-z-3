@@ -527,6 +527,9 @@ class Dispatcher:
                     logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
                 if not self.serper.last_was_cache_hit:
                     self.cost_tracker.record_call("serper_dispatcher")
+                for _ in range(self.serper._fallback_calls):
+                    self.cost_tracker.record_call("serper_dispatcher")
+                self.serper._fallback_calls = 0
                 if new_emails:
                     candidates.extend(new_emails)
                     logger.info(

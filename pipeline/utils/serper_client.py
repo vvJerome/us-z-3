@@ -61,6 +61,7 @@ class SerperClient:
         self._base, self._max_delay = SERVICE_BACKOFF["serper"]
         self._fallback_calls = 0   # extra API calls made by site: fallback retries
         self.last_was_cache_hit = False  # set after each enrich() call
+        self._credits_exhausted = False  # set on first 400 "not enough credits"
 
     async def enrich(
         self,
@@ -73,6 +74,10 @@ class SerperClient:
         conn: aiosqlite.Connection | None = None,
     ) -> EnrichmentResult:
         query = self._build_query(business_name, agent_name, state, domain_hint, strategy)
+
+        if self._credits_exhausted:
+            self.last_was_cache_hit = False
+            return EnrichmentResult(source="serper", query_used=query)
 
         if self.dry_run:
             return EnrichmentResult(
@@ -102,17 +107,22 @@ class SerperClient:
         self.last_was_cache_hit = False
         await self.rate_limiter.acquire()
 
-        data = await with_backoff(
-            lambda: self._call_api(query),
-            max_attempts=self.max_attempts,
-            base_delay=self._base,
-            max_delay=self._max_delay,
-            jitter=self.jitter,
-            retryable=_is_retryable,
-            on_retry=lambda attempt, exc, delay: logger.debug(
-                "Serper retry %d: %s (wait %.1fs)", attempt, exc, delay,
-            ),
-        )
+        try:
+            data = await with_backoff(
+                lambda: self._call_api(query),
+                max_attempts=self.max_attempts,
+                base_delay=self._base,
+                max_delay=self._max_delay,
+                jitter=self.jitter,
+                retryable=_is_retryable,
+                on_retry=lambda attempt, exc, delay: logger.debug(
+                    "Serper retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                ),
+            )
+        except _SerperCreditsError as exc:
+            logger.error("Serper credits exhausted — enrichment disabled for remaining records: %s", exc)
+            self._credits_exhausted = True
+            return EnrichmentResult(source="serper", query_used=query)
 
         if conn is not None:
             await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
@@ -245,6 +255,8 @@ class SerperClient:
                 raise PipelineHaltError("Serper API key invalid or missing (401)")
             if resp.status == 400:
                 body = await resp.text()
+                if "not enough credits" in body.lower():
+                    raise _SerperCreditsError(body)
                 raise PipelineHaltError(f"Serper bad request (400): {body}")
             if resp.status in (429, 500, 503):
                 raise _RetryableHTTPError(resp.status)
@@ -396,6 +408,10 @@ class _RetryableHTTPError(Exception):
     def __init__(self, status: int) -> None:
         self.status = status
         super().__init__(f"HTTP {status}")
+
+
+class _SerperCreditsError(Exception):
+    """Raised when Serper returns 400 'Not enough credits'. Not a pipeline halt."""
 
 
 def _is_retryable(exc: Exception) -> bool:

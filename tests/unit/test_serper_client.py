@@ -251,3 +251,54 @@ async def test_short_name_fallback_increments_fallback_calls():
 
     # 2 calls: primary + 4th fallback; fallback_calls should reflect the extra call
     assert client._fallback_calls == 1
+
+
+# ── Serper credits exhaustion ─────────────────────────────────────────────────
+
+async def test_credits_exhausted_returns_empty_result_not_pipeline_halt():
+    """HTTP 400 'Not enough credits' returns empty EnrichmentResult — run continues."""
+    from unittest.mock import MagicMock
+
+    client = _client()
+
+    mock_resp = MagicMock()
+    mock_resp.status = 400
+    mock_resp.text = AsyncMock(return_value='{"message":"Not enough credits","statusCode":400}')
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(client.session, "post", return_value=mock_resp):
+        result = await client.enrich("Acme LLC", None, "NC", None, "without")
+
+    assert result.candidate_domain is None
+    assert result.candidate_emails == []
+    assert client._credits_exhausted is True
+
+
+async def test_credits_exhausted_flag_skips_subsequent_api_calls():
+    """Once _credits_exhausted is set, subsequent enrich() calls skip the API entirely."""
+    client = _client()
+    client._credits_exhausted = True
+
+    with patch.object(client, "_call_api", new_callable=AsyncMock) as mock_api:
+        result = await client.enrich("Acme LLC", None, "NC", None, "without")
+
+    mock_api.assert_not_called()
+    assert result.candidate_domain is None
+
+
+async def test_invalid_api_key_still_raises_pipeline_halt():
+    """HTTP 401 (invalid key) still raises PipelineHaltError — that is always fatal."""
+    from unittest.mock import MagicMock
+    from pipeline.models import PipelineHaltError as PHE
+
+    client = _client()
+
+    mock_resp = MagicMock()
+    mock_resp.status = 401
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(client.session, "post", return_value=mock_resp):
+        with pytest.raises(PHE):
+            await client.enrich("Acme LLC", None, "NC", None, "without")

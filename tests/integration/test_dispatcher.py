@@ -316,6 +316,49 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"  # bbops verdict surfaces as final
 
+    async def test_dispatcher_serper_fallback_calls_reset_and_costed(self, test_db, config):
+        """When the Serper 4th fallback fires inside the dispatcher, _fallback_calls is
+        reset after each record and the extra API call is charged to cost_tracker."""
+        from pipeline.utils.serper_client import SerperClient
+        from pipeline.models import EnrichmentResult
+
+        await test_db.execute(
+            """
+            INSERT INTO records
+                (unique_id, business_name, agent_name, record_state,
+                 candidate_emails, candidate_email, candidate_domain,
+                 strategy, mx_provider, serper_enriched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                "rec1", "Norwood Rural Volunteer Fire Department", "John Doe",
+                State.DISCOVERED,
+                json.dumps(["test@nrvfd.org"]), "test@nrvfd.org",
+                "nrvfd.org", "without", "gmail.com",
+            ),
+        )
+        await test_db.commit()
+
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("invalid", "550")
+
+        serper = MagicMock(spec=SerperClient)
+        serper.enrich = AsyncMock(return_value=EnrichmentResult(
+            candidate_emails=[], candidate_domain=None,
+        ))
+        serper.last_was_cache_hit = False
+        serper._fallback_calls = 1  # simulate 4th fallback having fired
+
+        cost_tracker = CostTracker(max_cost=10.0)
+        dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, serper=serper)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        # 1 primary call + 1 fallback call = 2 serper_dispatcher charges
+        assert cost_tracker.counts.get("serper_dispatcher", 0) == 2
+        # _fallback_calls must be reset so subsequent records start clean
+        assert serper._fallback_calls == 0
+
     async def test_cost_ceiling_before_serper_fallback_marks_cost_skipped(self, test_db, config):
         """Cost ceiling hit after all patterns fail but before Serper fallback → COST_SKIPPED."""
         from pipeline.utils.serper_client import SerperClient

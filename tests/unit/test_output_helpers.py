@@ -97,3 +97,38 @@ class TestDnsTlds:
 
     def test_includes_info(self):
         assert ".info" in DNS_TLDS
+
+
+# ── DB migration — no warnings on fresh installs ──────────────────────────────
+
+class TestMigrationWarnings:
+    async def test_fresh_db_emits_no_warning_for_zuhal_score_backfill(
+        self, tmp_path, caplog
+    ):
+        """A fresh DB install must not emit a WARNING for the zuhal_score backfill
+        migration — that column never existed on new installs and the failure is expected."""
+        import logging
+        from pipeline import db
+
+        with caplog.at_level(logging.WARNING, logger="pipeline.db"):
+            conn = await db.init_db(tmp_path / "fresh.db")
+            await conn.close()
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("zuhal_score" in m for m in warning_msgs)
+
+    async def test_existing_column_migration_no_warning(self, tmp_path, caplog):
+        """Running init_db twice (simulating an upgrade) must not emit spurious warnings
+        for the duplicate-column-add attempts."""
+        import logging
+        from pipeline import db
+
+        conn = await db.init_db(tmp_path / "existing.db")
+        await conn.close()
+
+        with caplog.at_level(logging.WARNING, logger="pipeline.db"):
+            conn2 = await db.init_db(tmp_path / "existing.db")
+            await conn2.close()
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("migration statement skipped" in m.lower() for m in warning_msgs)

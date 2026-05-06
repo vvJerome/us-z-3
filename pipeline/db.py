@@ -248,7 +248,15 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
             try:
                 await conn.execute(stmt)
             except Exception as exc:
-                if "duplicate column name" not in str(exc).lower() and "already exists" not in str(exc).lower():
+                exc_lower = str(exc).lower()
+                # Suppress expected non-fatal migration failures:
+                # - "duplicate column name" / "already exists": column was already added
+                # - "no such column": best-effort backfill targeting a column from an
+                #   older schema that never existed on this install (e.g. zuhal_score)
+                expected = any(p in exc_lower for p in (
+                    "duplicate column name", "already exists", "no such column",
+                ))
+                if not expected:
                     _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
 
     await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
