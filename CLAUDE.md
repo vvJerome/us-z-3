@@ -95,7 +95,9 @@ us-z-3/
 ├── scripts/
 │   ├── clean.sh            # Delete stale output dirs (--force to actually delete)
 │   ├── deploy.sh           # rsync project to VPS + install deps
+│   ├── reset.sh            # Re-queue failed records helper
 │   ├── run_checkpoints.sh  # 10×100-record batched run with interactive checkpoint reviews
+│   ├── smoke-test.sh       # Quick wiring check (dry-run 10 records)
 │   ├── start.sh            # Launch orchestrator in tmux
 │   ├── stop.sh             # Kill orchestrator session
 │   ├── logs.sh             # Tail pipeline logs
@@ -113,13 +115,18 @@ us-z-3/
 
 ```
 InputRecord (RAW)
-    ├─ DNS probe (aiodns, shared resolver, TLD variants)
+    ├─ DNS probe (aiodns, shared resolver, TLD variants: .com .net .org .us .info)
     │     hit  → candidate_emails ranked by pattern_stats win rate
-    │     miss → Serper enrichment (cached by business+agent+state+provider)
+    │     miss → Serper enrichment (normalize_business_name — no quoted legal names)
+    │               primary → site: scoped → agent-name → short-name (4+ words)
     │               hit  → candidate_emails
     │               miss → DISCOVERY_FAILED
     └─ DISCOVERED (candidate_emails, candidate_domain, mx_provider written to DB)
 ```
+
+- Serper starts empty (`initial_tokens=0`) — no startup 429 bursts.
+- Serper credit exhaustion degrades to `DISCOVERY_FAILED`; run continues.
+- Use `--ignore-cache` to bypass enrichment_cache on re-runs against fresh data.
 
 ### Stage 2 — Dispatcher (per candidate_email, in rank order)
 
@@ -132,11 +139,13 @@ InputRecord (RAW)
 [2] Racknerd SMTP + bbops.io  (asyncio.gather, concurrent)
         reconcile():
           valid / catch_all (either backend) → VALIDATED  ✓
+          blocked (Racknerd)                 → re-queue, no burn (IP block, not email verdict)
           both invalid                        → [3]
           mixed error / tunnel down           → re-queue (no attempt burned)
 
 [3] Zuhal rescue  (sequential, only when both SMTP → invalid)
         valid / accept-all → VALIDATED  ✓
+        circuit_open       → re-queue, no burn (auto-heal)
         else               → try next candidate
 
 All candidates exhausted → VALIDATION_FAILED
@@ -151,6 +160,7 @@ Cost ceiling before Zuhal → COST_SKIPPED
 | any | `valid` | VALIDATED `valid` | |
 | `catch_all` | any | VALIDATED `catch_all` | |
 | any | `catch_all` | VALIDATED `catch_all` | |
+| `blocked` | any | re-queue | IP-level block; skip Zuhal |
 | `invalid` | `invalid` | Zuhal rescue | |
 | `invalid` | `error`/`not_run` | re-queue | Can't trust single invalid |
 | `error`/`not_run` | `invalid` | re-queue | Can't trust single invalid |
@@ -279,6 +289,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--name NAME` | none | Output to `output/NAME/` |
 | `--producer-only` | off | Run discovery only (no SSH tunnel, no Racknerd) |
 | `--consumer-only` | off | Run dispatcher only |
+| `--ignore-cache` | off | Bypass Serper enrichment cache (forces live API call) |
 | `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |
 | `--dispatch-concurrency N` | 20 | Parallel dispatcher workers |
@@ -296,7 +307,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 201 tests
+.venv/bin/python -m pytest tests/ -q    # all 250 tests
 .venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```
