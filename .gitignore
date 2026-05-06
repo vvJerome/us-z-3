@@ -38,8 +38,9 @@ verify.log
 # Claude session snapshots
 .claude/snapshots/
 
-# Context archives (PDFs / exports committed intentionally go in docs/)
+# Context archives and documentation
 context/
+docs/
 
 # Data
 input/
