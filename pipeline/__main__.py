@@ -28,6 +28,16 @@ from pipeline import db
 from pipeline.metrics import serve_metrics
 
 
+class _NullRacknerd:
+    """Stub used when --no-racknerd is set; always returns not_run so bbops handles validation."""
+    async def verify(self, email: str):
+        from pipeline.models import BackendVerdict
+        return BackendVerdict(status="not_run", message="racknerd disabled", verified_at="")
+
+    def is_up(self) -> bool:
+        return False
+
+
 async def cmd_run(args, config: PipelineConfig) -> None:
     """Execute the pipeline (producer + dispatcher or one of them)."""
     setup_logging(config)
@@ -70,28 +80,32 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             logger.info("Producer worker started")
 
         if not config.producer_only:
-            # --- SSH SOCKS5 tunnel ---
-            tunnel_cfg = TunnelConfig(
-                host=config.racknerd_host,
-                user=config.racknerd_ssh_user,
-                port=config.racknerd_ssh_port,
-                socks_port=config.racknerd_socks_port,
-                ssh_key=config.racknerd_ssh_key,
-                autorestart=True,
-            )
-            tunnel = SshSocksTunnel(tunnel_cfg)
-            logger.info("Starting SSH SOCKS5 tunnel to %s", config.racknerd_host)
-            await tunnel.start(ready_timeout_s=30.0)
-            logger.info("SSH tunnel ready")
+            # --- SSH SOCKS5 tunnel + Racknerd consumer (skipped when --no-racknerd) ---
+            if config.racknerd_enabled:
+                tunnel_cfg = TunnelConfig(
+                    host=config.racknerd_host,
+                    user=config.racknerd_ssh_user,
+                    port=config.racknerd_ssh_port,
+                    socks_port=config.racknerd_socks_port,
+                    ssh_key=config.racknerd_ssh_key,
+                    autorestart=True,
+                )
+                tunnel = SshSocksTunnel(tunnel_cfg)
+                logger.info("Starting SSH SOCKS5 tunnel to %s", config.racknerd_host)
+                await tunnel.start(ready_timeout_s=30.0)
+                logger.info("SSH tunnel ready")
 
-            # --- Racknerd consumer ---
-            shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
-            rk_config = RacknerdConfig(
-                socks_port=config.racknerd_socks_port,
-                concurrency=config.racknerd_concurrency,
-                smtp_timeout_s=config.racknerd_smtp_timeout_s,
-            )
-            racknerd = RacknerdConsumer(tunnel, rk_config, resolver=shared_resolver)
+                shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+                rk_config = RacknerdConfig(
+                    socks_port=config.racknerd_socks_port,
+                    concurrency=config.racknerd_concurrency,
+                    smtp_timeout_s=config.racknerd_smtp_timeout_s,
+                )
+                racknerd = RacknerdConsumer(tunnel, rk_config, resolver=shared_resolver)
+            else:
+                logger.info("Racknerd disabled (--no-racknerd) — bbops + Zuhal only")
+                tunnel = None
+                racknerd = _NullRacknerd()
 
             # --- bbops async consumer ---
             bbops_consumer = BbopsAsyncConsumer(
