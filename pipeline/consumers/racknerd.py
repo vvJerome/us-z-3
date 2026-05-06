@@ -41,6 +41,21 @@ _INVALID_KEYWORDS: tuple[str, ...] = (
 _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
 
 
+def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
+    """Map a SMTPRecipientRefused exception string to (status, message).
+
+    aiosmtplib raises instead of returning (code, msg) for 5xx RCPT TO responses,
+    so _INVALID_KEYWORDS and _SPAMHAUS_KEYWORDS checks must happen on the exception
+    string rather than in _run_smtp_probe's tuple-return path.
+    """
+    lower = exc_str.lower()
+    if any(kw in lower for kw in _SPAMHAUS_KEYWORDS):
+        return "blocked", f"SMTP error: {exc_str}"
+    if any(kw in lower for kw in _INVALID_KEYWORDS):
+        return "invalid", f"SMTP error: {exc_str}"
+    return "error", f"SMTP error: {exc_str}"
+
+
 @dataclass
 class RacknerdConfig:
     socks_host: str = "127.0.0.1"
@@ -187,6 +202,10 @@ class RacknerdConsumer:
             smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=cfg.smtp_timeout_s)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
             return await self._run_smtp_probe(smtp, email, mx_host)
+        except aiosmtplib.SMTPRecipientRefused as exc:
+            # aiosmtplib raises SMTPRecipientRefused for 5xx RCPT TO responses instead of
+            # returning (code, msg) — so keyword checks must happen here, not in _run_smtp_probe.
+            return _classify_smtp_rejection(str(exc))
         except aiosmtplib.SMTPException as exc:
             return "error", f"SMTP error: {exc}"
         except asyncio.TimeoutError:
@@ -221,6 +240,8 @@ class RacknerdConsumer:
             )
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
             return await self._run_smtp_probe(smtp, email, mx_host)
+        except aiosmtplib.SMTPRecipientRefused as exc:
+            return _classify_smtp_rejection(str(exc))
         except aiosmtplib.SMTPException as exc:
             return "error", f"SMTP error: {exc}"
         except asyncio.TimeoutError:

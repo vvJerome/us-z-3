@@ -108,16 +108,36 @@ class TestRacknerdSmtpResponseParsing:
         # → "error" (temporary failure)
 
     def test_recipient_not_found_is_invalid(self):
-        """Google Workspace 550 'recipient not found' must classify as invalid, not error."""
-        from pipeline.consumers.racknerd import _INVALID_KEYWORDS
-        msg = "5.1.0 <user@example.com> Recipient not found."
-        assert any(kw in msg.lower() for kw in _INVALID_KEYWORDS)
+        """GoDaddy 550 'Recipient not found' must classify as invalid via SMTPRecipientRefused path."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.1.0 <user@example.com> Recipient not found."
+        )
+        assert status == "invalid"
 
     def test_nosuchuser_gmail_is_invalid(self):
-        """Gmail 550 NoSuchUser bounce must classify as invalid."""
-        from pipeline.consumers.racknerd import _INVALID_KEYWORDS
-        msg = "5.1.1 The email account does not exist. NoSuchUser"
-        assert any(kw in msg.lower() for kw in _INVALID_KEYWORDS)
+        """Gmail 550 NoSuchUser bounce must classify as invalid via SMTPRecipientRefused path."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.1.1 The email account that you tried to reach does not exist. NoSuchUser"
+        )
+        assert status == "invalid"
+
+    def test_spamhaus_rejection_is_blocked(self):
+        """Spamhaus PBL rejection via SMTPRecipientRefused must classify as blocked."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.7.1 Connection refused - blocked by Spamhaus PBL"
+        )
+        assert status == "blocked"
+
+    def test_generic_5xx_rejection_stays_error(self):
+        """Unknown 5xx must stay as error, not promoted to invalid or blocked."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.7.1 Service unavailable for unknown reason"
+        )
+        assert status == "error"
 
     def test_helo_hostname_is_not_private(self):
         """Default helo_hostname must not be the placeholder private hostname."""
