@@ -24,14 +24,16 @@ DB_PATH="${OUTPUT_DIR}/pipeline.db"
 LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 MAX_COST="1.00"
 DRY_RUN=false
+NO_RACKNERD=false
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)      DRY_RUN=true; shift ;;
+    --no-racknerd)  NO_RACKNERD=true; shift ;;
     --max-batches)  MAX_BATCHES="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--dry-run] [--max-batches N]"
+      echo "Usage: $(basename "$0") [--dry-run] [--no-racknerd] [--max-batches N]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -179,8 +181,9 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
     --max-cost "${MAX_COST}"
   )
   if [[ "$DRY_RUN" == "true" ]]; then
-    # --dry-run mocks all API calls; skip the SSH tunnel so it works locally
     pipeline_cmd+=(--dry-run --no-racknerd)
+  elif [[ "$NO_RACKNERD" == "true" ]]; then
+    pipeline_cmd+=(--no-racknerd)
   fi
 
   cd "$PROJECT_ROOT"
