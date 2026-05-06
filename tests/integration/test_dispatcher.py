@@ -220,7 +220,7 @@ class TestDispatcherReconciliation:
         bb = _mock_bbops("valid")
         cost_tracker = CostTracker(max_cost=0.0)
         # Trigger ceiling immediately
-        cost_tracker.record_call("serper")
+        cost_tracker.record_call("serper_producer")
 
         dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker)
         rows = await db.fetch_pending_validation(test_db, limit=10)
@@ -232,3 +232,86 @@ class TestDispatcherReconciliation:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.COST_SKIPPED
+
+    async def test_cost_ceiling_before_zuhal_marks_cost_skipped(self, test_db, config):
+        """Cost ceiling hit mid-loop before Zuhal rescue → COST_SKIPPED not VALIDATED/FAILED."""
+        from unittest.mock import AsyncMock as AM
+        from pipeline.utils.zuhal_client import ZuhalClient
+        from pipeline.models import ValidationResult
+
+        await _insert_discovered(test_db, "rec1")
+
+        # Both backends error → reconcile returns unknown → Zuhal rescue path
+        rk = _mock_racknerd("error", "timeout")
+        bb = _mock_bbops("error", "timeout")
+
+        zuhal = MagicMock(spec=ZuhalClient)
+        zuhal.validate = AM(return_value=ValidationResult(
+            email="test@example.com", verdict="valid", score=0.0,
+            is_disposable=False, raw_status="", http_status=200,
+        ))
+
+        # Ceiling already reached before the loop processes anything
+        cost_tracker = CostTracker(max_cost=0.0)
+        cost_tracker.record_call("zuhal")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, zuhal=zuhal)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        # Record must not be VALIDATED — ceiling was hit before Zuhal could run
+        assert row["record_state"] == State.COST_SKIPPED
+        zuhal.validate.assert_not_called()
+
+    async def test_cost_ceiling_before_serper_fallback_marks_cost_skipped(self, test_db, config):
+        """Cost ceiling hit after all patterns fail but before Serper fallback → COST_SKIPPED."""
+        from pipeline.utils.serper_client import SerperClient
+        from pipeline.models import EnrichmentResult
+
+        # Insert with serper_enriched=0 so dispatcher considers Serper fallback
+        await test_db.execute(
+            """
+            INSERT INTO records
+                (unique_id, business_name, agent_name, record_state,
+                 candidate_emails, candidate_email, candidate_domain,
+                 strategy, mx_provider, serper_enriched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                "rec1", "Test Corp", "John Doe",
+                State.DISCOVERED,
+                json.dumps(["test@example.com"]), "test@example.com",
+                "example.com", "without", "gmail.com",
+            ),
+        )
+        await test_db.commit()
+
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("invalid", "550")
+
+        serper = MagicMock(spec=SerperClient)
+        serper.enrich = AsyncMock(return_value=EnrichmentResult(
+            candidate_emails=["alt@example.com"], candidate_domain="example.com",
+        ))
+        serper.last_was_cache_hit = False
+
+        # Ceiling reached before Serper fallback fires
+        cost_tracker = CostTracker(max_cost=0.0)
+        cost_tracker.record_call("zuhal")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, serper=serper)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.COST_SKIPPED
+        serper.enrich.assert_not_called()

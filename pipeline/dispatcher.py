@@ -394,6 +394,11 @@ class Dispatcher:
 
             if not result.should_write:
                 if self.zuhal is not None:
+                    if self.cost_tracker.ceiling_reached():
+                        logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
+                        await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+                        cost_skipped = True
+                        break
                     zuhal_status, zuhal_trace = await self._zuhal_probe(email)
                     pending_trace.append(zuhal_trace)
                     # normalize accept-all to catch_all for consistency
@@ -485,11 +490,19 @@ class Dispatcher:
             # Serper was skipped in the producer (DNS hit) — call it now as a fallback
             # so we only pay $0.001 when patterns actually fail, not upfront.
             if i == original_count and not serper_enriched and self.serper and candidate_domain:
+                if self.cost_tracker.ceiling_reached():
+                    logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
+                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+                    cost_skipped = True
+                    break
                 serper_enriched = True  # prevent re-injection on subsequent loops
                 existing = set(candidates[:original_count])
                 raw_emails = await self._serper_enrich(unique_id, row)
                 new_emails = [e for e in raw_emails if e not in existing]
-                await db.mark_serper_enriched(self.conn, unique_id)
+                try:
+                    await db.mark_serper_enriched(self.conn, unique_id)
+                except Exception as exc:
+                    logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
                 if not self.serper.last_was_cache_hit:
                     self.cost_tracker.record_call("serper_dispatcher")
                 if new_emails:
