@@ -128,10 +128,12 @@ class ProducerWorker:
                 remaining = config.limit - total_processed if config.limit else config.chunk_size
                 read_size = min(config.chunk_size, remaining)
 
+                lines_read = 0
                 for _ in range(read_size):
                     line = f.readline()
                     if not line:
                         break
+                    lines_read += 1
                     line = line.strip()
                     if not line:
                         continue
@@ -139,17 +141,18 @@ class ProducerWorker:
                         record = InputRecord.from_dict(json.loads(line))
                         chunk.append(record)
                     except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                        logger.warning("Skipping invalid record at offset %d: %s", offset + total_processed, exc)
+                        logger.warning("Skipping invalid record at offset %d: %s", offset + lines_read, exc)
 
-                if not chunk:
+                if not chunk and lines_read == 0:
                     logger.info("Producer exhausted input file at offset %d", offset)
                     break
 
                 # Process chunk concurrently
                 results = await self._process_chunk(chunk)
 
-                # Atomic write + checkpoint advance
-                new_offset = offset + len(chunk)
+                # Atomic write + checkpoint advance (advance by lines read, not parsed count,
+                # so bad-JSON lines are skipped on resume rather than retried indefinitely)
+                new_offset = offset + lines_read
                 await db.insert_records_batch(self.conn, results, new_offset)
                 if self._notify_pipe:
                     await signal_consumer(self._notify_pipe)

@@ -116,7 +116,9 @@ class RacknerdConsumer:
 
         mx_hosts = await self._resolve_mx(domain)
         if not mx_hosts:
-            return BackendVerdict(status="invalid", message="no MX/A record", verified_at=_ISO_NOW())
+            # DNS failure is transient (SERVFAIL) — treat as error so reconciliation
+            # can re-queue rather than permanently invalidating the address.
+            return BackendVerdict(status="error", message="no MX/A record", verified_at=_ISO_NOW())
 
         last_status = "error"
         last_msg = "no hosts probed"
@@ -161,6 +163,11 @@ class RacknerdConsumer:
             except aiodns.error.DNSError:
                 pass
 
+        if len(self._mx_cache) >= 10_000:
+            # Drop the oldest quarter to bound memory on large runs
+            evict = list(self._mx_cache)[: len(self._mx_cache) // 4]
+            for k in evict:
+                del self._mx_cache[k]
         self._mx_cache[domain] = (hosts, now + RACKNERD_MX_CACHE_TTL_S)
         return hosts
 

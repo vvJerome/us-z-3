@@ -74,7 +74,7 @@ class TestRacknerdConsumerTunnelCheck:
         consumer._resolver = mock_resolver
 
         result = await consumer.verify("test@nonexistentdomain12345.com")
-        assert result.status == "invalid"
+        assert result.status == "error"
         assert "no MX" in result.message
 
 

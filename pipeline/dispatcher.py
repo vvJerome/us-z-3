@@ -302,7 +302,7 @@ class Dispatcher:
         agent_name = row["agent_name"] or ""
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
-        serper_enriched = bool(row["serper_enriched"]) if "serper_enriched" in row.keys() else True
+        serper_enriched = bool(row["serper_enriched"]) if "serper_enriched" in row.keys() else False
 
         pending_trace: list[dict] = []
         cost_skipped = False
@@ -489,7 +489,9 @@ class Dispatcher:
             # so we only pay $0.001 when patterns actually fail, not upfront.
             if i == original_count and not serper_enriched and self.serper and candidate_domain:
                 serper_enriched = True  # prevent re-injection on subsequent loops
-                new_emails = await self._serper_enrich(unique_id, row)
+                existing = set(candidates[:original_count])
+                raw_emails = await self._serper_enrich(unique_id, row)
+                new_emails = [e for e in raw_emails if e not in existing]
                 await db.mark_serper_enriched(self.conn, unique_id)
                 if not self.serper.last_was_cache_hit:
                     self.cost_tracker.record_call("serper_dispatcher")
