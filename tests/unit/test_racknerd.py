@@ -106,3 +106,21 @@ class TestRacknerdSmtpResponseParsing:
         code, msg = 421, "4.2.1 try again later"
         assert 400 <= code < 500
         # → "error" (temporary failure)
+
+    def test_recipient_not_found_is_invalid(self):
+        """Google Workspace 550 'recipient not found' must classify as invalid, not error."""
+        from pipeline.consumers.racknerd import _INVALID_KEYWORDS
+        msg = "5.1.0 <user@example.com> Recipient not found."
+        assert any(kw in msg.lower() for kw in _INVALID_KEYWORDS)
+
+    def test_nosuchuser_gmail_is_invalid(self):
+        """Gmail 550 NoSuchUser bounce must classify as invalid."""
+        from pipeline.consumers.racknerd import _INVALID_KEYWORDS
+        msg = "5.1.1 The email account does not exist. NoSuchUser"
+        assert any(kw in msg.lower() for kw in _INVALID_KEYWORDS)
+
+    def test_helo_hostname_is_not_private(self):
+        """Default helo_hostname must not be the placeholder private hostname."""
+        config = RacknerdConfig()
+        assert config.helo_hostname != "mail.verify.local"
+        assert config.helo_hostname  # not empty

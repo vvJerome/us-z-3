@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ _SPAMHAUS_KEYWORDS: tuple[str, ...] = (
 _INVALID_KEYWORDS: tuple[str, ...] = (
     "no such", "doesn't exist", "does not exist", "user unknown",
     "invalid mailbox", "invalid recipient", "address rejected",
+    "recipient not found", "nosuchuser", "account does not exist",
+    "account not found", "no mailbox",
 )
 
 _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
@@ -44,7 +47,7 @@ class RacknerdConfig:
     socks_port: int = 1080
     concurrency: int = 10
     smtp_timeout_s: float = RACKNERD_SMTP_TIMEOUT_S
-    helo_hostname: str = "mail.verify.local"
+    helo_hostname: str = field(default_factory=socket.getfqdn)
     direct: bool = False  # skip SOCKS5 tunnel, connect directly (use when running on the egress VPS)
 
 
