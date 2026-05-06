@@ -236,7 +236,7 @@ class RacknerdConsumer:
         """Run EHLO/MAIL/RCPT sequence on an already-connected SMTP client."""
         cfg = self.config
         try:
-            await asyncio.wait_for(smtp.ehlo(cfg.helo_hostname), timeout=cfg.smtp_timeout_s)
+            await asyncio.wait_for(smtp.ehlo(), timeout=cfg.smtp_timeout_s)
             await asyncio.wait_for(
                 smtp.mail(f"verify@{cfg.helo_hostname}"), timeout=cfg.smtp_timeout_s
             )
