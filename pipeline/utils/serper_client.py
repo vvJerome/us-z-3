@@ -107,6 +107,9 @@ class SerperClient:
         self.last_was_cache_hit = False
         await self.rate_limiter.acquire()
 
+        # Single credits-exhaustion guard for the primary call and all fallbacks.
+        # Any _SerperCreditsError from any with_backoff call sets the flag and
+        # returns empty so future enrich() calls short-circuit at the top.
         try:
             data = await with_backoff(
                 lambda: self._call_api(query),
@@ -119,125 +122,126 @@ class SerperClient:
                     "Serper retry %d: %s (wait %.1fs)", attempt, exc, delay,
                 ),
             )
+
+            if conn is not None:
+                await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
+
+            result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
+
+            # Fallback: if site:-scoped query returned no emails, retry without site: filter
+            if domain_hint and not result.candidate_emails and "site:" in query:
+                fallback_query = self._build_query(
+                    business_name, agent_name, state, None, strategy
+                )
+                logger.debug("Serper site: miss for %s — retrying without site: filter", domain_hint)
+                await self.rate_limiter.acquire()
+                data2 = await with_backoff(
+                    lambda: self._call_api(fallback_query),
+                    max_attempts=self.max_attempts,
+                    base_delay=self._base,
+                    max_delay=self._max_delay,
+                    jitter=self.jitter,
+                    retryable=_is_retryable,
+                    on_retry=lambda attempt, exc, delay: logger.debug(
+                        "Serper fallback retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                    ),
+                )
+                self._fallback_calls += 1
+                fallback = self._extract(data2, business_name, fallback_query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
+                if fallback.candidate_emails:
+                    result = EnrichmentResult(
+                        candidate_emails=fallback.candidate_emails,
+                        candidate_domain=result.candidate_domain or fallback.candidate_domain,
+                        source="serper",
+                        query_used=fallback_query,
+                        raw_snippets=fallback.raw_snippets,
+                    )
+
+            # Third fallback: agent-name-focused query when primary found neither emails nor domain.
+            # Registered agents are often individual lawyers whose contact appears under their name,
+            # not the filing entity — a simpler personal query can surface what the business query misses.
+            if (
+                strategy == "with"
+                and agent_name
+                and not result.candidate_emails
+                and not result.candidate_domain
+            ):
+                state_name = _STATE_NAMES.get((state or "").upper(), state or "")
+                first, _, last = parse_name(agent_name)
+                agent_q = f"{first} {last}".strip() if first and last else normalize_business_name(agent_name)
+                agent_query = f"{agent_q} {state_name} email"
+                logger.debug("Serper agent-name fallback for %s → %s", agent_name, agent_query)
+                await self.rate_limiter.acquire()
+                data3 = await with_backoff(
+                    lambda: self._call_api(agent_query),
+                    max_attempts=self.max_attempts,
+                    base_delay=self._base,
+                    max_delay=self._max_delay,
+                    jitter=self.jitter,
+                    retryable=_is_retryable,
+                    on_retry=lambda attempt, exc, delay: logger.debug(
+                        "Serper agent-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                    ),
+                )
+                agent_result = self._extract(
+                    data3, business_name, agent_query,
+                    domain_hint=None, strategy="with",
+                    agent_name=agent_name, fallback_blocklist=fallback_blocklist,
+                )
+                if agent_result.candidate_emails or agent_result.candidate_domain:
+                    result = EnrichmentResult(
+                        candidate_emails=agent_result.candidate_emails,
+                        candidate_domain=agent_result.candidate_domain,
+                        source="serper",
+                        query_used=agent_query,
+                        raw_snippets=agent_result.raw_snippets,
+                    )
+
+            # 4th fallback: for long business names (4+ significant words), retry with
+            # first 3 words only. Full legal names like "BREWER-LOWDER-MCCUISTON POST 9010
+            # VETERANS OF FOREIGN WARS" rarely appear verbatim; a shorter prefix often works.
+            words = normalize_business_name(business_name).split()
+            if (
+                len(words) >= 4
+                and not result.candidate_domain
+                and not result.candidate_emails
+            ):
+                state_name = _STATE_NAMES.get((state or "").upper(), state or "")
+                short_query = f"{' '.join(words[:3])} {state_name} email contact"
+                logger.debug("Serper short-name fallback for %s → %s", business_name, short_query)
+                await self.rate_limiter.acquire()
+                data4 = await with_backoff(
+                    lambda: self._call_api(short_query),
+                    max_attempts=self.max_attempts,
+                    base_delay=self._base,
+                    max_delay=self._max_delay,
+                    jitter=self.jitter,
+                    retryable=_is_retryable,
+                    on_retry=lambda attempt, exc, delay: logger.debug(
+                        "Serper short-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
+                    ),
+                )
+                self._fallback_calls += 1
+                short_result = self._extract(
+                    data4, business_name, short_query,
+                    domain_hint=None, strategy=strategy,
+                    agent_name=agent_name, fallback_blocklist=fallback_blocklist,
+                )
+                if short_result.candidate_emails or short_result.candidate_domain:
+                    result = EnrichmentResult(
+                        candidate_emails=short_result.candidate_emails,
+                        candidate_domain=short_result.candidate_domain,
+                        source="serper",
+                        query_used=short_query,
+                        raw_snippets=short_result.raw_snippets,
+                    )
+
+            return result
+
         except _SerperCreditsError as exc:
             logger.error("Serper credits exhausted — enrichment disabled for remaining records: %s", exc)
             self._credits_exhausted = True
             return EnrichmentResult(source="serper", query_used=query)
-
-        if conn is not None:
-            await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
-
-        result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
-
-        # Fallback: if site:-scoped query returned no emails, retry without site: filter
-        if domain_hint and not result.candidate_emails and "site:" in query:
-            fallback_query = self._build_query(
-                business_name, agent_name, state, None, strategy
-            )
-            logger.debug("Serper site: miss for %s — retrying without site: filter", domain_hint)
-            await self.rate_limiter.acquire()
-            data2 = await with_backoff(
-                lambda: self._call_api(fallback_query),
-                max_attempts=self.max_attempts,
-                base_delay=self._base,
-                max_delay=self._max_delay,
-                jitter=self.jitter,
-                retryable=_is_retryable,
-                on_retry=lambda attempt, exc, delay: logger.debug(
-                    "Serper fallback retry %d: %s (wait %.1fs)", attempt, exc, delay,
-                ),
-            )
-            self._fallback_calls += 1
-            fallback = self._extract(data2, business_name, fallback_query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
-            if fallback.candidate_emails:
-                result = EnrichmentResult(
-                    candidate_emails=fallback.candidate_emails,
-                    candidate_domain=result.candidate_domain or fallback.candidate_domain,
-                    source="serper",
-                    query_used=fallback_query,
-                    raw_snippets=fallback.raw_snippets,
-                )
-
-        # Third fallback: agent-name-focused query when primary found neither emails nor domain.
-        # Registered agents are often individual lawyers whose contact appears under their name,
-        # not the filing entity — a simpler personal query can surface what the business query misses.
-        if (
-            strategy == "with"
-            and agent_name
-            and not result.candidate_emails
-            and not result.candidate_domain
-        ):
-            state_name = _STATE_NAMES.get((state or "").upper(), state or "")
-            first, _, last = parse_name(agent_name)
-            agent_q = f"{first} {last}".strip() if first and last else normalize_business_name(agent_name)
-            agent_query = f"{agent_q} {state_name} email"
-            logger.debug("Serper agent-name fallback for %s → %s", agent_name, agent_query)
-            await self.rate_limiter.acquire()
-            data3 = await with_backoff(
-                lambda: self._call_api(agent_query),
-                max_attempts=self.max_attempts,
-                base_delay=self._base,
-                max_delay=self._max_delay,
-                jitter=self.jitter,
-                retryable=_is_retryable,
-                on_retry=lambda attempt, exc, delay: logger.debug(
-                    "Serper agent-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
-                ),
-            )
-            agent_result = self._extract(
-                data3, business_name, agent_query,
-                domain_hint=None, strategy="with",
-                agent_name=agent_name, fallback_blocklist=fallback_blocklist,
-            )
-            if agent_result.candidate_emails or agent_result.candidate_domain:
-                result = EnrichmentResult(
-                    candidate_emails=agent_result.candidate_emails,
-                    candidate_domain=agent_result.candidate_domain,
-                    source="serper",
-                    query_used=agent_query,
-                    raw_snippets=agent_result.raw_snippets,
-                )
-
-        # 4th fallback: for long business names (4+ significant words), retry with
-        # first 3 words only. Full legal names like "BREWER-LOWDER-MCCUISTON POST 9010
-        # VETERANS OF FOREIGN WARS" rarely appear verbatim; a shorter prefix often works.
-        words = normalize_business_name(business_name).split()
-        if (
-            len(words) >= 4
-            and not result.candidate_domain
-            and not result.candidate_emails
-        ):
-            state_name = _STATE_NAMES.get((state or "").upper(), state or "")
-            short_query = f"{' '.join(words[:3])} {state_name} email contact"
-            logger.debug("Serper short-name fallback for %s → %s", business_name, short_query)
-            await self.rate_limiter.acquire()
-            data4 = await with_backoff(
-                lambda: self._call_api(short_query),
-                max_attempts=self.max_attempts,
-                base_delay=self._base,
-                max_delay=self._max_delay,
-                jitter=self.jitter,
-                retryable=_is_retryable,
-                on_retry=lambda attempt, exc, delay: logger.debug(
-                    "Serper short-name retry %d: %s (wait %.1fs)", attempt, exc, delay,
-                ),
-            )
-            self._fallback_calls += 1
-            short_result = self._extract(
-                data4, business_name, short_query,
-                domain_hint=None, strategy=strategy,
-                agent_name=agent_name, fallback_blocklist=fallback_blocklist,
-            )
-            if short_result.candidate_emails or short_result.candidate_domain:
-                result = EnrichmentResult(
-                    candidate_emails=short_result.candidate_emails,
-                    candidate_domain=short_result.candidate_domain,
-                    source="serper",
-                    query_used=short_query,
-                    raw_snippets=short_result.raw_snippets,
-                )
-
-        return result
 
     async def _call_api(self, query: str) -> dict:
         headers = {

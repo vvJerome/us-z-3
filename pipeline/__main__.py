@@ -436,7 +436,7 @@ async def main() -> None:
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s",
-        "bbops_base_url", "bbops_batch_size", "bbops_max_inflight",
+        "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
         "serper_rate_limit",
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",

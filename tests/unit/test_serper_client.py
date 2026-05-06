@@ -302,3 +302,57 @@ async def test_invalid_api_key_still_raises_pipeline_halt():
     with patch.object(client.session, "post", return_value=mock_resp):
         with pytest.raises(PHE):
             await client.enrich("Acme LLC", None, "NC", None, "without")
+
+
+async def test_credits_exhausted_in_fallback_sets_flag():
+    """_SerperCreditsError raised inside a fallback call (e.g. 4th short-name fallback
+    after a cache hit on the primary) still sets _credits_exhausted so future calls
+    short-circuit without hitting the API."""
+    from unittest.mock import MagicMock
+
+    client = _client()
+    call_count = 0
+
+    credits_resp = MagicMock()
+    credits_resp.status = 400
+    credits_resp.text = AsyncMock(return_value='{"message":"Not enough credits","statusCode":400}')
+    credits_resp.__aenter__ = AsyncMock(return_value=credits_resp)
+    credits_resp.__aexit__ = AsyncMock(return_value=False)
+
+    empty_resp = MagicMock()
+    empty_resp.status = 200
+    empty_resp.__aenter__ = AsyncMock(return_value=empty_resp)
+    empty_resp.__aexit__ = AsyncMock(return_value=False)
+
+    async def _mock_call_api(query: str) -> dict:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Primary returns empty — 4th fallback will fire
+            return _EMPTY_RESPONSE
+        # 4th fallback hits exhausted credits
+        raise Exception("HTTP 400")  # simulated via _call_api raising directly
+
+    # Directly inject the credits error on the 2nd _call_api invocation
+    async def _patched_call_api(query: str) -> dict:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _EMPTY_RESPONSE
+        from pipeline.utils.serper_client import _SerperCreditsError
+        raise _SerperCreditsError('{"message":"Not enough credits"}')
+
+    with patch.object(client, "_call_api", side_effect=_patched_call_api):
+        result = await client.enrich(
+            "Norwood Rural Volunteer Fire Department",  # 5 words → triggers 4th fallback
+            None, "NC", None, "without",
+        )
+
+    assert client._credits_exhausted is True
+    assert result.candidate_domain is None
+    assert result.candidate_emails == []
+
+    # Next call must short-circuit without any API hit
+    with patch.object(client, "_call_api", new_callable=AsyncMock) as mock_api:
+        await client.enrich("Another Business Corp", None, "NC", None, "without")
+    mock_api.assert_not_called()

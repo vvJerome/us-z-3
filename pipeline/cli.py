@@ -96,6 +96,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     # bbops
     parser.add_argument("--bbops-base-url", default=None, help="bbops.io base URL")
     parser.add_argument("--bbops-batch-size", type=int, default=500, help="Emails per batch")
+    parser.add_argument("--bbops-min-batch-size", type=int, default=8,
+                        help="Minimum emails before flushing a bbops batch")
     parser.add_argument("--bbops-max-inflight", type=int, default=12,
                         help="Concurrent in-flight bbops batches")
 
