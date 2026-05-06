@@ -183,6 +183,9 @@ _V4_MIGRATIONS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id)",
+    # v6: rename zuhal_score → confidence_score (add new column; old column left unused)
+    "ALTER TABLE records ADD COLUMN confidence_score REAL",
+    "ALTER TABLE stats ADD COLUMN zuhal_calls INTEGER DEFAULT 0",
 ]
 
 INSERT_RECORD_SQL = """
