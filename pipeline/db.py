@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +183,16 @@ _V4_MIGRATIONS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id)",
-    # v6: rename zuhal_score → confidence_score (add new column; old column left unused)
-    "ALTER TABLE records ADD COLUMN confidence_score REAL",
     "ALTER TABLE stats ADD COLUMN zuhal_calls INTEGER DEFAULT 0",
+]
+
+# Migration statements for schema v7 (applied on top of v4–v6 DBs)
+_V7_MIGRATIONS: list[str] = [
+    # Add confidence_score; copy existing zuhal_score values if present.
+    # Uses a two-step approach because SQLite does not support RENAME COLUMN
+    # before v3.25 and we want this to be idempotent on any existing DB.
+    "ALTER TABLE records ADD COLUMN confidence_score REAL",
+    "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
 INSERT_RECORD_SQL = """
@@ -229,13 +236,21 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         return
 
     _log.info("Migrating DB schema from v%d to v%d", current_version, SCHEMA_VERSION)
-    for stmt in _V4_MIGRATIONS:
-        try:
-            await conn.execute(stmt)
-        except Exception as exc:
-            # Column already exists (duplicate ALTER TABLE on fresh DB) is fine
-            if "duplicate column name" not in str(exc).lower() and "already exists" not in str(exc).lower():
-                _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
+
+    migration_sets: list[tuple[int, list[str]]] = [
+        (6, _V4_MIGRATIONS),
+        (7, _V7_MIGRATIONS),
+    ]
+    for target_version, stmts in migration_sets:
+        if current_version >= target_version:
+            continue
+        for stmt in stmts:
+            try:
+                await conn.execute(stmt)
+            except Exception as exc:
+                if "duplicate column name" not in str(exc).lower() and "already exists" not in str(exc).lower():
+                    _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
+
     await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     await conn.commit()
     _log.info("Schema migration to v%d complete", SCHEMA_VERSION)
