@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
-import logging
 import signal
-import sys
 import time
 from pathlib import Path
 
@@ -168,6 +166,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 ),
                 dry_run=config.dry_run,
                 max_attempts=5,
+                ignore_cache=config.ignore_cache,
             )
 
             # --- Dispatcher ---
@@ -442,7 +441,7 @@ async def main() -> None:
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
         "max_cost", "max_consecutive_errors", "dry_run",
-        "enrichment_source", "run_id", "notify_pipe",
+        "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
         "zuhal_concurrency", "zuhal_rate_limit",
     ]:
         val = getattr(args, field_name, None)

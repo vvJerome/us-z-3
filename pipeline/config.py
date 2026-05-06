@@ -93,6 +93,7 @@ class PipelineConfig(BaseSettings):
 
     # --- Enrichment ---
     enrichment_source: Literal["serper"] = "serper"
+    ignore_cache: bool = False
 
     # --- Run identity ---
     run_id: str = ""

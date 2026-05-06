@@ -48,6 +48,7 @@ class SerperClient:
         dry_run: bool = False,
         max_attempts: int = 3,
         jitter: float = 0.2,
+        ignore_cache: bool = False,
     ) -> None:
         self.api_key = api_key
         self.session = session
@@ -55,6 +56,7 @@ class SerperClient:
         self.dry_run = dry_run
         self.max_attempts = max_attempts
         self.jitter = jitter
+        self.ignore_cache = ignore_cache
         self._base, self._max_delay = SERVICE_BACKOFF["serper"]
         self._fallback_calls = 0   # extra API calls made by site: fallback retries
         self.last_was_cache_hit = False  # set after each enrich() call
@@ -89,7 +91,7 @@ class SerperClient:
         cache_provider = f"serper:{strategy}:{(domain_hint or '').lower()}"
         cache_agent_norm = agent_norm if strategy == "with" else ""
 
-        if conn is not None:
+        if conn is not None and not self.ignore_cache:
             cached = await db.get_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider)
             if cached is not None:
                 logger.debug("Serper cache hit for %s/%s/%s", biz_norm, cache_agent_norm, state)

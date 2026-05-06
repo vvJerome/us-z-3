@@ -396,6 +396,16 @@ class Dispatcher:
                 )
 
             if not result.should_write:
+                # Racknerd blocked = IP-level Spamhaus rejection, not a verdict on the
+                # email address. Skip Zuhal (would waste credits) and re-queue so the
+                # record is retried after the SpamhausGuard cooldown expires.
+                if rk_verdict and rk_verdict.status == "blocked":
+                    async with self._write_lock:
+                        await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (Racknerd blocked — IP-level rejection)", unique_id)
+                    return
+
                 if self.zuhal is not None:
                     if self.cost_tracker.ceiling_reached():
                         logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)

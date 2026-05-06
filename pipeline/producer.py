@@ -75,6 +75,7 @@ class ProducerWorker:
             dry_run=config.dry_run,
             max_attempts=5,
             jitter=config.backoff_jitter,
+            ignore_cache=config.ignore_cache,
         )
 
     async def _heartbeat_loop(self) -> None:

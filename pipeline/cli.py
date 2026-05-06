@@ -125,6 +125,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enrichment-source", default="serper",
                         choices=["serper"],
                         help="Phase 2 search API source")
+    parser.add_argument("--ignore-cache", action="store_true",
+                        help="Bypass Serper enrichment cache (forces live API call)")
 
     # Run ID
     parser.add_argument("--run-id", default="", help="Run identifier for stats")

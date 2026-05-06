@@ -14,6 +14,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
 
+# ── Crash handler ─────────────────────────────────────────────────────────────
+_on_error() {
+  local lineno="$1"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "" >&2
+  echo "══════════════════════════════════════════════════════" >&2
+  echo "PIPELINE FAILURE — ${ts}  (line ${lineno})" >&2
+  echo "  Database:  ${DB_PATH}" >&2
+  echo "  Log:       ${LOG_FILE}" >&2
+  echo "══════════════════════════════════════════════════════" >&2
+  mkdir -p "$(dirname "$LOG_FILE")"
+  {
+    echo ""
+    echo "FAILURE — ${ts}  (line ${lineno})"
+    echo "  Run 'python -m pipeline status --db ${DB_PATH}' for current state."
+  } >> "$LOG_FILE" 2>/dev/null || true
+}
+trap '_on_error $LINENO' ERR
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 BATCH_SIZE=100
 MAX_BATCHES=10
@@ -59,6 +79,17 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+# ── Disk space check ──────────────────────────────────────────────────────────
+_check_disk_space() {
+  local min_mb=500
+  local available_mb
+  available_mb=$(df -m "$OUTPUT_DIR" | awk 'NR==2 {print $4}')
+  if [[ "$available_mb" -lt "$min_mb" ]]; then
+    echo "ERROR: Only ${available_mb}MB free in ${OUTPUT_DIR} — need at least ${min_mb}MB." >&2
+    exit 1
+  fi
+}
 
 # ── Checkpoint report helper ──────────────────────────────────────────────────
 _checkpoint_report() {
@@ -170,6 +201,8 @@ fi
 for batch_num in $(seq 1 "$MAX_BATCHES"); do
   start_record=$(( (batch_num - 1) * BATCH_SIZE + 1 ))
   end_record=$(( batch_num * BATCH_SIZE ))
+
+  _check_disk_space
 
   echo "──────────────────────────────────────────────────────"
   echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}–${end_record}"
