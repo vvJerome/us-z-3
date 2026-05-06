@@ -21,6 +21,7 @@ def _make_config(**kwargs) -> PipelineConfig:
         strategy="auto",
         dry_run=False,
         max_attempts=1,
+        racknerd_enabled=False,
     )
     defaults.update(kwargs)
     return PipelineConfig(**defaults)
@@ -107,6 +108,38 @@ async def test_process_record_both_miss_discovery_failed(worker):
 
     assert result["record_state"] == State.DISCOVERY_FAILED
     assert result["discovery_source"] is None
+
+
+async def test_serper_skipped_on_dns_hit_without_strategy(db_conn):
+    """DNS hit + strategy=without → Serper not called (cost saved)."""
+    record = _make_record()
+    worker = await _make_worker(db_conn, _make_config(strategy="without"))
+
+    with patch("pipeline.producer.probe_domains", new=AsyncMock(return_value=("acmecorp.com", "mx1.google.com"))):
+        serper_mock = AsyncMock()
+        worker._serper.enrich = serper_mock
+        result = await worker._process_record(record)
+
+    serper_mock.assert_not_called()
+    assert result["record_state"] == State.DISCOVERED
+    trace = json.loads(result["process_trace"])
+    serper_entry = next(e for e in trace if e["stage"] == "serper")
+    assert serper_entry["outcome"] == "skipped"
+
+
+async def test_serper_skipped_on_dns_hit_with_strategy(db_conn):
+    """DNS hit + strategy=with → Serper not called in producer (dispatcher handles fallback)."""
+    record = _make_record()
+    worker = await _make_worker(db_conn, _make_config(strategy="with"))
+
+    with patch("pipeline.producer.probe_domains", new=AsyncMock(return_value=("acmecorp.com", "mx1.google.com"))):
+        serper_mock = AsyncMock()
+        worker._serper.enrich = serper_mock
+        result = await worker._process_record(record)
+
+    serper_mock.assert_not_called()
+    assert result["record_state"] == State.DISCOVERED
+    assert result.get("serper_enriched") == 0
 
 
 async def test_process_record_existing_email_short_circuits(worker):

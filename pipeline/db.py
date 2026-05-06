@@ -6,7 +6,10 @@ from pathlib import Path
 
 import aiosqlite
 
-_log = logging.getLogger("pipeline.producer")
+_log = logging.getLogger("pipeline.db")
+
+SCHEMA_VERSION = 7
+
 
 # ---------------------------------------------------------------------------
 # Status taxonomy constants — single source of truth
@@ -44,14 +47,25 @@ CREATE TABLE IF NOT EXISTS records (
     is_org_agent        INTEGER DEFAULT 0,
     mx_provider         TEXT,
 
-    -- Validation outputs
+    -- Reconciliation path (encodes which backends ran and what Zuhal did)
     zuhal_status        TEXT,
-    zuhal_score         REAL,
-    validation_attempts INTEGER DEFAULT 0,
+    confidence_score    REAL,
 
-    -- State machine (lifecycle + verdict)
+    -- Per-backend verdicts
+    racknerd_status     TEXT,
+    racknerd_message    TEXT,
+    racknerd_verified_at TEXT,
+    bbops_status        TEXT,
+    bbops_message       TEXT,
+    bbops_verified_at   TEXT,
+    final_verdict       TEXT,
+    dispatch_attempts   INTEGER DEFAULT 0,
+
+    -- Enrichment tracking
+    serper_enriched     INTEGER DEFAULT 0,
+
+    -- State machine
     record_state        TEXT NOT NULL DEFAULT 'RAW',
-    verdict             TEXT,
     process_trace       TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
@@ -72,12 +86,15 @@ CREATE TABLE IF NOT EXISTS stats (
     discovery_misses         INTEGER DEFAULT 0,
     validated                INTEGER DEFAULT 0,
     validation_failed        INTEGER DEFAULT 0,
-    serper_calls             INTEGER DEFAULT 0,
-    brave_calls              INTEGER DEFAULT 0,
+    serper_producer_calls    INTEGER DEFAULT 0,
+    serper_dispatcher_calls  INTEGER DEFAULT 0,
     zuhal_calls              INTEGER DEFAULT 0,
+    racknerd_probes          INTEGER DEFAULT 0,
+    bbops_probes             INTEGER DEFAULT 0,
+    backend_disagreements    INTEGER DEFAULT 0,
     estimated_cost_usd       REAL DEFAULT 0.0,
     last_producer_heartbeat  TEXT,
-    last_consumer_heartbeat  TEXT,
+    last_dispatcher_heartbeat TEXT,
     updated_at               TEXT DEFAULT (datetime('now'))
 );
 
@@ -110,19 +127,81 @@ CREATE TABLE IF NOT EXISTS enrichment_cache (
     UNIQUE(business_name_norm, agent_name_norm, state, provider)
 );
 
+-- Crash-recovery table for in-flight bbops batch jobs
+CREATE TABLE IF NOT EXISTS bbops_jobs (
+    record_id       INTEGER NOT NULL,
+    email           TEXT NOT NULL,
+    job_id          TEXT,
+    batch_id        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    result_status   TEXT,
+    result_message  TEXT,
+    submitted_at    TEXT DEFAULT (datetime('now')),
+    completed_at    TEXT,
+    PRIMARY KEY (record_id, email)
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(record_state);
 CREATE INDEX IF NOT EXISTS idx_records_unique_id ON records(unique_id);
 CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
 CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business_name_norm, agent_name_norm, state, provider);
+CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
 """
+
+# Migration statements from schema v3 → v4
+_V4_MIGRATIONS: list[str] = [
+    # v5
+    "ALTER TABLE records ADD COLUMN serper_enriched INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN serper_producer_calls INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN serper_dispatcher_calls INTEGER DEFAULT 0",
+    "ALTER TABLE records ADD COLUMN racknerd_status TEXT",
+    "ALTER TABLE records ADD COLUMN racknerd_message TEXT",
+    "ALTER TABLE records ADD COLUMN racknerd_verified_at TEXT",
+    "ALTER TABLE records ADD COLUMN bbops_status TEXT",
+    "ALTER TABLE records ADD COLUMN bbops_message TEXT",
+    "ALTER TABLE records ADD COLUMN bbops_verified_at TEXT",
+    "ALTER TABLE records ADD COLUMN final_verdict TEXT",
+    "ALTER TABLE records ADD COLUMN dispatch_attempts INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN racknerd_probes INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN bbops_probes INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN backend_disagreements INTEGER DEFAULT 0",
+    "ALTER TABLE stats ADD COLUMN last_dispatcher_heartbeat TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS bbops_jobs (
+        record_id       INTEGER NOT NULL,
+        email           TEXT NOT NULL,
+        job_id          TEXT,
+        batch_id        TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'submitted',
+        result_status   TEXT,
+        result_message  TEXT,
+        submitted_at    TEXT DEFAULT (datetime('now')),
+        completed_at    TEXT,
+        PRIMARY KEY (record_id, email)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id)",
+    "ALTER TABLE stats ADD COLUMN zuhal_calls INTEGER DEFAULT 0",
+]
+
+# Migration statements for schema v7 (applied on top of v4–v6 DBs)
+_V7_MIGRATIONS: list[str] = [
+    # Add confidence_score; copy existing zuhal_score values if present.
+    # Uses a two-step approach because SQLite does not support RENAME COLUMN
+    # before v3.25 and we want this to be idempotent on any existing DB.
+    "ALTER TABLE records ADD COLUMN confidence_score REAL",
+    "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
+]
 
 INSERT_RECORD_SQL = """
 INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
     position_type, name_entity_type, candidate_email, candidate_emails,
     subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
-    strategy, is_org_agent, mx_provider, record_state, process_trace
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    strategy, is_org_agent, mx_provider, record_state, process_trace, serper_enriched
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_CHECKPOINT_SQL = """
@@ -132,8 +211,7 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('no
 """
 
 
-async def init_db(db_path: Path) -> aiosqlite.Connection:
-    # isolation_level=None = true autocommit; explicit BEGIN in insert_records_batch works correctly
+async def init_db(db_path: Path | str) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(str(db_path), isolation_level=None)
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA synchronous=NORMAL")
@@ -144,8 +222,46 @@ async def init_db(db_path: Path) -> aiosqlite.Connection:
     await conn.execute("PRAGMA temp_store=MEMORY")
     await conn.executescript(SCHEMA_SQL)
     await conn.commit()
+    await _run_migrations(conn)
     conn.row_factory = aiosqlite.Row
     return conn
+
+
+async def _run_migrations(conn: aiosqlite.Connection) -> None:
+    async with conn.execute("PRAGMA user_version") as cur:
+        row = await cur.fetchone()
+        current_version = row[0] if row else 0
+
+    if current_version >= SCHEMA_VERSION:
+        return
+
+    _log.info("Migrating DB schema from v%d to v%d", current_version, SCHEMA_VERSION)
+
+    migration_sets: list[tuple[int, list[str]]] = [
+        (6, _V4_MIGRATIONS),
+        (7, _V7_MIGRATIONS),
+    ]
+    for target_version, stmts in migration_sets:
+        if current_version >= target_version:
+            continue
+        for stmt in stmts:
+            try:
+                await conn.execute(stmt)
+            except Exception as exc:
+                exc_lower = str(exc).lower()
+                # Suppress expected non-fatal migration failures:
+                # - "duplicate column name" / "already exists": column was already added
+                # - "no such column": best-effort backfill targeting a column from an
+                #   older schema that never existed on this install (e.g. zuhal_score)
+                expected = any(p in exc_lower for p in (
+                    "duplicate column name", "already exists", "no such column",
+                ))
+                if not expected:
+                    _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
+
+    await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    await conn.commit()
+    _log.info("Schema migration to v%d complete", SCHEMA_VERSION)
 
 
 async def get_checkpoint(conn: aiosqlite.Connection, key: str) -> str | None:
@@ -190,6 +306,7 @@ async def insert_records_batch(
                     r.get("mx_provider"),
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
+                    1 if r.get("serper_enriched") else 0,
                 ))
                 inserted += cur.rowcount
             if inserted < len(records):
@@ -288,16 +405,74 @@ async def update_record_status(
     await conn.commit()
 
 
+async def update_record_dual(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    record_state: str,
+    *,
+    racknerd_status: str | None,
+    racknerd_message: str | None,
+    racknerd_verified_at: str | None,
+    bbops_status: str | None,
+    bbops_message: str | None,
+    bbops_verified_at: str | None,
+    final_verdict: str,
+    candidate_email: str | None = None,
+    confidence_score: float | None = None,
+    dispatch_attempts_delta: int = 1,
+    zuhal_status_override: str | None = None,
+) -> None:
+    """Write dual-backend verdicts and advance dispatch_attempts atomically."""
+    sets = [
+        "record_state = ?",
+        "racknerd_status = ?",
+        "racknerd_message = ?",
+        "racknerd_verified_at = ?",
+        "bbops_status = ?",
+        "bbops_message = ?",
+        "bbops_verified_at = ?",
+        "final_verdict = ?",
+        "dispatch_attempts = dispatch_attempts + ?",
+        "updated_at = datetime('now')",
+    ]
+    values: list[object] = [
+        record_state,
+        racknerd_status,
+        racknerd_message,
+        racknerd_verified_at,
+        bbops_status,
+        bbops_message,
+        bbops_verified_at,
+        final_verdict,
+        dispatch_attempts_delta,
+    ]
+
+    if candidate_email is not None:
+        sets.append("candidate_email = ?")
+        values.append(candidate_email)
+        sets.append("zuhal_status = ?")
+        values.append(zuhal_status_override if zuhal_status_override is not None else f"dual_{final_verdict}")
+
+    if confidence_score is not None:
+        sets.append("confidence_score = ?")
+        values.append(confidence_score)
+
+    values.append(unique_id)
+    sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
+    await conn.execute(sql, values)
+    await conn.commit()
+
+
 async def recover_stale_validating(
     conn: aiosqlite.Connection,
     timeout_minutes: int = 5,
 ) -> int:
-    """Reset rows orphaned in VALIDATING by a crashed consumer back to DISCOVERED."""
+    """Reset rows orphaned in VALIDATING by a crashed dispatcher back to DISCOVERED."""
     cursor = await conn.execute(
         """
         UPDATE records
            SET record_state = 'DISCOVERED',
-               validation_attempts = validation_attempts + 1,
+               dispatch_attempts = dispatch_attempts + 1,
                updated_at = datetime('now')
          WHERE record_state = 'VALIDATING'
            AND updated_at < datetime('now', ?)
@@ -405,10 +580,10 @@ async def upsert_producer_heartbeat(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
-async def upsert_consumer_heartbeat(conn: aiosqlite.Connection) -> None:
+async def upsert_dispatcher_heartbeat(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         """
-        UPDATE stats SET last_consumer_heartbeat = datetime('now'), updated_at = datetime('now')
+        UPDATE stats SET last_dispatcher_heartbeat = datetime('now'), updated_at = datetime('now')
         WHERE rowid = (SELECT MAX(rowid) FROM stats)
         """
     )
@@ -443,6 +618,11 @@ async def get_status_summary(conn: aiosqlite.Connection) -> dict:
     ) as cursor:
         summary["failures_by_phase"] = {row[0]: row[1] async for row in cursor}
 
+    async with conn.execute(
+        "SELECT final_verdict, COUNT(*) FROM records WHERE final_verdict IS NOT NULL GROUP BY final_verdict"
+    ) as cursor:
+        summary["records_by_verdict"] = {row[0]: row[1] async for row in cursor}
+
     return summary
 
 
@@ -460,16 +640,10 @@ async def reset_failed_records(
         """
         cursor = await conn.execute(sql, (record_state, phase))
     else:
-        if record_state == State.VALIDATION_FAILED:
+        if record_state in (State.VALIDATION_FAILED, State.COST_SKIPPED):
             sql = """
-                UPDATE records SET record_state = 'DISCOVERED', validation_attempts = 0,
-                updated_at = datetime('now')
-                WHERE record_state = ?
-            """
-        elif record_state == State.COST_SKIPPED:
-            sql = """
-                UPDATE records SET record_state = 'DISCOVERED', validation_attempts = 0,
-                updated_at = datetime('now')
+                UPDATE records SET record_state = 'DISCOVERED', dispatch_attempts = 0,
+                validation_attempts = 0, updated_at = datetime('now')
                 WHERE record_state = ?
             """
         else:
@@ -523,6 +697,15 @@ async def record_pattern_result(
             total_count = total_count + 1
         """,
         (mx_provider, template, 1 if success else 0, 1 if success else 0),
+    )
+    await conn.commit()
+
+
+async def mark_serper_enriched(conn: aiosqlite.Connection, unique_id: str) -> None:
+    """Mark a record as having been enriched by Serper (prevents duplicate calls)."""
+    await conn.execute(
+        "UPDATE records SET serper_enriched = 1, updated_at = datetime('now') WHERE unique_id = ?",
+        (unique_id,),
     )
     await conn.commit()
 
@@ -587,3 +770,61 @@ async def set_enrichment_cache(
         ),
     )
     await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# bbops_jobs helpers (crash recovery for in-flight batches)
+# ---------------------------------------------------------------------------
+
+async def insert_bbops_jobs(
+    conn: aiosqlite.Connection,
+    jobs: list[dict],
+) -> None:
+    """Persist bbops job mappings BEFORE polling — enables crash recovery."""
+    for job in jobs:
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO bbops_jobs
+                (record_id, email, job_id, batch_id, submitted_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            """,
+            (job["record_id"], job["email"], job.get("job_id", ""), job["batch_id"]),
+        )
+    await conn.commit()
+
+
+async def mark_bbops_job_done(
+    conn: aiosqlite.Connection,
+    job_id: str,
+    result_status: str,
+    result_message: str,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE bbops_jobs
+           SET status = 'done', result_status = ?, result_message = ?,
+               completed_at = datetime('now')
+         WHERE job_id = ?
+        """,
+        (result_status, result_message, job_id),
+    )
+    await conn.commit()
+
+
+async def fetch_inflight_bbops_batches(
+    conn: aiosqlite.Connection,
+) -> dict[str, list[dict]]:
+    """Return all submitted-but-not-done batches grouped by batch_id for crash recovery."""
+    async with conn.execute(
+        """
+        SELECT batch_id, record_id, email
+          FROM bbops_jobs
+         WHERE status = 'submitted'
+        """
+    ) as cursor:
+        batches: dict[str, list[dict]] = {}
+        async for row in cursor:
+            batches.setdefault(row[0], []).append(
+                {"record_id": row[1], "email": row[2]}
+            )
+    return batches

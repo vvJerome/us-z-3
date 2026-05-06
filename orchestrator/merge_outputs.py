@@ -56,7 +56,7 @@ def _read_v2(db_path: Path) -> list[dict[str, str]]:
                    candidate_email, candidate_domain, zuhal_status, zuhal_score
               FROM records
              WHERE record_state = 'VALIDATED'
-               AND verdict IN ('valid', 'catch_all', 'accept-all', 'ms_valid')
+               AND final_verdict IN ('valid', 'catch_all')
                AND candidate_email IS NOT NULL
                AND candidate_email <> ''
             """

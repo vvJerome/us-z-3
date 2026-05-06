@@ -174,3 +174,35 @@ class TestTokenBucket:
         # Trigger refill by calling _refill directly
         bucket._refill()
         assert bucket._tokens > tokens_after_first
+
+    async def test_initial_tokens_zero_starts_empty(self):
+        """initial_tokens=0 means bucket starts with no tokens."""
+        from pipeline.utils.rate_limiter import TokenBucket
+
+        bucket = TokenBucket(capacity=10, refill_rate=1.0, initial_tokens=0)
+        assert bucket._tokens == 0.0
+
+    async def test_initial_tokens_zero_first_acquire_waits(self):
+        """initial_tokens=0 forces even the first acquire to wait for refill."""
+        from pipeline.utils.rate_limiter import TokenBucket
+
+        # rate=2/s → ~0.5s to accumulate 1 token from empty
+        bucket = TokenBucket(capacity=5, refill_rate=2.0, initial_tokens=0)
+        start = time.monotonic()
+        await bucket.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed > 0.3
+
+    async def test_initial_tokens_custom_value(self):
+        """initial_tokens sets an arbitrary starting level below capacity."""
+        from pipeline.utils.rate_limiter import TokenBucket
+
+        bucket = TokenBucket(capacity=10, refill_rate=1.0, initial_tokens=3.0)
+        assert bucket._tokens == 3.0
+
+    async def test_initial_tokens_default_preserves_full_start(self):
+        """Without initial_tokens, bucket starts at capacity (existing behaviour unchanged)."""
+        from pipeline.utils.rate_limiter import TokenBucket
+
+        bucket = TokenBucket(capacity=7, refill_rate=1.0)
+        assert bucket._tokens == 7.0

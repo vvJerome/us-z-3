@@ -12,7 +12,7 @@ from pipeline.models import PipelineHaltError, ValidationResult
 from pipeline.utils.backoff import SERVICE_BACKOFF, with_backoff
 from pipeline.utils.rate_limiter import TokenBucket
 
-logger = logging.getLogger("pipeline.consumer")
+logger = logging.getLogger("pipeline.zuhal_client")
 
 
 class ZuhalClient:
@@ -22,6 +22,7 @@ class ZuhalClient:
         session: aiohttp.ClientSession,
         rate_limiter: TokenBucket,
         *,
+        concurrency: int = 5,
         dry_run: bool = False,
         max_attempts: int = 3,
         jitter: float = 0.2,
@@ -33,6 +34,7 @@ class ZuhalClient:
         self.max_attempts = max_attempts
         self.jitter = jitter
         self._base, self._max_delay = SERVICE_BACKOFF["zuhal"]
+        self._sem = asyncio.Semaphore(concurrency)
         self._breaker = aiobreaker.CircuitBreaker(
             fail_max=5,
             timeout_duration=timedelta(seconds=600),
@@ -40,6 +42,10 @@ class ZuhalClient:
         )
 
     async def validate(self, email: str) -> ValidationResult:
+        async with self._sem:
+            return await self._validate_inner(email)
+
+    async def _validate_inner(self, email: str) -> ValidationResult:
         if self.dry_run:
             return ValidationResult(
                 email=email,
@@ -69,8 +75,8 @@ class ZuhalClient:
                 ),
             )
         except aiobreaker.CircuitBreakerError:
-            logger.warning("Zuhal circuit breaker open — pausing 600s before next canary probe")
-            raise _RetryableHTTPError(429)
+            logger.warning("Zuhal circuit breaker open — records will be re-queued for retry")
+            raise ZuhalCircuitOpenError()
 
     async def _call_api(self, email: str) -> ValidationResult:
         headers = {
@@ -127,6 +133,10 @@ class ZuhalClient:
             raw_status=data.get("status", ""),
             http_status=status,
         )
+
+
+class ZuhalCircuitOpenError(Exception):
+    """Raised when Zuhal's circuit breaker is open — service is temporarily unavailable."""
 
 
 class _RetryableHTTPError(Exception):

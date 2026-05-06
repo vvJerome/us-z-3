@@ -63,3 +63,31 @@ class ValidationResult:
     is_disposable: bool
     raw_status: str
     http_status: int
+
+
+# ---------------------------------------------------------------------------
+# Dual-backend verdict types
+# ---------------------------------------------------------------------------
+
+BackendStatus = Literal["valid", "invalid", "catch_all", "blocked", "error", "not_run"]
+
+
+@dataclass
+class BackendVerdict:
+    """Result from a single SMTP backend for one email probe."""
+    status: BackendStatus
+    message: str
+    verified_at: str  # ISO timestamp
+
+
+FinalVerdict = Literal["valid", "invalid", "catch_all", "unknown"]
+
+
+@dataclass
+class ReconcileResult:
+    """Output of OR-of-valids reconciliation across both backends."""
+    final_verdict: FinalVerdict
+    # True → write verdict and advance state; False → re-queue without burning attempt
+    should_write: bool
+    # True → mark as validated terminal state; False → mark as validation_failed or pending
+    is_terminal: bool

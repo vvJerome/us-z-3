@@ -7,7 +7,7 @@ Valid transitions only. Never set `record_state` to an arbitrary string — alwa
 ```
 RAW → DISCOVERING | DISCOVERED | DISCOVERY_FAILED
 DISCOVERING → DISCOVERED | DISCOVERY_FAILED      (retry only)
-DISCOVERED → VALIDATING                           (atomic UPDATE RETURNING — consumer only)
+DISCOVERED → VALIDATING                           (atomic UPDATE RETURNING — dispatcher only)
 VALIDATING → VALIDATED | VALIDATION_FAILED | COST_SKIPPED
 ```
 
@@ -17,7 +17,7 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 
 - `isolation_level=None` on the connection (set in `init_db`) — do not change this.
 - Batch inserts always use explicit `BEGIN` / `COMMIT` / `ROLLBACK`.
-- `conn.commit()` after every single-row write in consumer (not batched — rows must be visible to concurrent readers immediately).
+- `conn.commit()` after every single-row write in the dispatcher (not batched — rows must be visible to concurrent readers immediately).
 - Never add new SQL without a parameterized `?` placeholder. No f-strings in SQL.
 - All new tables need an index on the primary lookup column.
 
@@ -28,13 +28,29 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 - Fallback domain blocklist: any domain that appears as first-organic fallback for 2+ different businesses is promoted to `_fallback_blocklist` at runtime. Static seed is in `constants.FALLBACK_DOMAIN_BLOCKLIST`.
 - `process_trace` must have an entry for every stage that ran: `dns`, `patterns`, `serper`, and (if applicable) `input`.
 
-## Consumer
+## Dispatcher
 
-- `recover_stale_validating()` must be called at startup before the poll loop.
-- MS probe runs first — only for records where `is_microsoft_mx(mx_provider)` is True.
-- `cost_tracker.ceiling_reached()` checked before every Zuhal call, not after.
-- `email_to_template()` called after every Zuhal verdict to update `pattern_stats`.
-- Circuit breaker (`self._breaker`) is per-instance — never shared across workers.
+`_process_record()` order per email candidate:
+1. MS probe pre-filter (free) — only when `is_microsoft_mx(mx_provider)` is True; short-circuits on `valid`/`invalid`, falls through on `error`/`unknown`
+2. Fan out: Racknerd SMTP + bbops concurrently via `asyncio.gather`
+3. OR-of-valids reconciliation (`reconcile()`) → `valid`, `catch_all`, `invalid`, or `unknown`
+4. If `unknown` (tunnel down / both inconclusive) → re-queue as DISCOVERED without burning `dispatch_attempts`
+5. If `invalid` and `self.zuhal is not None` → Zuhal rescue (sequential, paid)
+6. If Zuhal raises `ZuhalCircuitOpenError` → re-queue as DISCOVERED without burning `dispatch_attempts` (auto-heal)
+7. `email_to_template()` called after every terminal verdict to update `pattern_stats`
+
+Other rules:
+- `recover_stale_validating()` called at startup before the poll loop.
+- `cost_tracker.ceiling_reached()` checked before the Zuhal rescue call, not before SMTP backends.
+- Racknerd and bbops do NOT increment the cost tracker — only Zuhal does.
+- `last_rk` / `last_bb` tracked throughout the candidate loop so the final write always reflects the last actual backend verdict, not NULL.
+
+## Field naming
+
+- DB columns: `racknerd_status`, `bbops_status`, `confidence_score` (not `zuhal_score`)
+- CSV headers: `racknerd_verdict`, `bbops_verdict`, `zuhal_verdict`, `confidence_score`, `confidence_tier`
+- `validation_method` values: `ms_probe`, `smtp_both`, `smtp_racknerd`, `smtp_bbops`, `zuhal_rescue`, `unknown`
+- Never use the old names `zuhal_score`, `racknerd+bbops`, `zuhal_fallback` — they are gone
 
 ## Output
 

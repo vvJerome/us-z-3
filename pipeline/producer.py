@@ -63,24 +63,27 @@ class ProducerWorker:
         self._fallback_seen: Counter[str] = Counter()
         self._notify_pipe: Path | None = None
 
+        # 2 calls/second sustained, burst cap 5, starts empty to prevent startup burst.
         _serper_bucket = TokenBucket(
-            capacity=config.serper_rate_limit,
-            refill_rate=config.serper_rate_limit / 3600,
+            capacity=5,
+            refill_rate=2.0,
+            initial_tokens=0,
         )
 
         self._serper = SerperClient(
             config.serper_api_key, session, _serper_bucket,
             dry_run=config.dry_run,
-            max_attempts=config.max_attempts,
+            max_attempts=5,
             jitter=config.backoff_jitter,
+            ignore_cache=config.ignore_cache,
         )
 
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 await db.upsert_producer_heartbeat(self.conn)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Producer heartbeat failed: %s", exc)
             try:
                 await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
             except asyncio.TimeoutError:
@@ -128,10 +131,12 @@ class ProducerWorker:
                 remaining = config.limit - total_processed if config.limit else config.chunk_size
                 read_size = min(config.chunk_size, remaining)
 
+                lines_read = 0
                 for _ in range(read_size):
                     line = f.readline()
                     if not line:
                         break
+                    lines_read += 1
                     line = line.strip()
                     if not line:
                         continue
@@ -139,17 +144,18 @@ class ProducerWorker:
                         record = InputRecord.from_dict(json.loads(line))
                         chunk.append(record)
                     except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                        logger.warning("Skipping invalid record at offset %d: %s", offset + total_processed, exc)
+                        logger.warning("Skipping invalid record at offset %d: %s", offset + lines_read, exc)
 
-                if not chunk:
+                if not chunk and lines_read == 0:
                     logger.info("Producer exhausted input file at offset %d", offset)
                     break
 
                 # Process chunk concurrently
                 results = await self._process_chunk(chunk)
 
-                # Atomic write + checkpoint advance
-                new_offset = offset + len(chunk)
+                # Atomic write + checkpoint advance (advance by lines read, not parsed count,
+                # so bad-JSON lines are skipped on resume rather than retried indefinitely)
+                new_offset = offset + lines_read
                 await db.insert_records_batch(self.conn, results, new_offset)
                 if self._notify_pipe:
                     await signal_consumer(self._notify_pipe)
@@ -280,52 +286,60 @@ class ProducerWorker:
             candidate_emails.extend(patterns)
             result["_trace"].append({"stage": "patterns", "outcome": "gen", "n": len(patterns)})
 
-        # Phase 2: Serper enrichment (find emails in snippets; find domain if DNS missed)
+        # Phase 2: Serper enrichment — only when DNS missed.
+        # When DNS found the domain, all we need are the generated patterns; the dispatcher
+        # will call Serper as a fallback only if every pattern fails SMTP validation.
+        # This avoids paying $0.001 upfront on records that validate on the first pattern guess.
         enrichment_emails: list[str] = []
         enrichment_domain: str | None = None
         all_subdomain_emails: list[str] = []
 
-        try:
-            async with self._enrichment_sem:
-                serper_result = await self._serper.enrich(
-                    record.business_name,
-                    parsed_agent if strategy == "with" else None,
-                    record.state,
-                    domain,
-                    strategy,
-                    fallback_blocklist=self._fallback_blocklist,
-                    conn=self.conn,
-                )
-                self.cost_tracker.record_call("serper")
-                # Record any extra cost from site: fallback retries
-                for _ in range(self._serper._fallback_calls):
-                    self.cost_tracker.record_call("serper")
-                self._serper._fallback_calls = 0
+        if domain:
+            result["serper_enriched"] = 0
+            result["_trace"].append({"stage": "serper", "outcome": "skipped", "reason": "dns_hit"})
+        else:
+            try:
+                async with self._enrichment_sem:
+                    serper_result = await self._serper.enrich(
+                        record.business_name,
+                        parsed_agent if strategy == "with" else None,
+                        record.state,
+                        domain,
+                        strategy,
+                        fallback_blocklist=self._fallback_blocklist,
+                        conn=self.conn,
+                    )
+                    if not self._serper.last_was_cache_hit:
+                        self.cost_tracker.record_call("serper_producer")
+                    # Record any extra cost from site: fallback retries
+                    for _ in range(self._serper._fallback_calls):
+                        self.cost_tracker.record_call("serper_producer")
+                    self._serper._fallback_calls = 0
 
-            _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
-            enrichment_emails.extend(serper_result.candidate_emails)
-            all_subdomain_emails.extend(serper_result.subdomain_emails)
-            result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
-            if not domain and serper_result.candidate_domain:
-                enrichment_domain = serper_result.candidate_domain
-                result["discovery_source"] = "serper"
-                if serper_result.is_fallback_domain:
-                    self._record_fallback_domain(serper_result.candidate_domain)
-            elif not domain and serper_result.candidate_emails:
-                # Email found in snippet with no domain — still came from Serper
-                result["discovery_source"] = "serper"
+                result["serper_enriched"] = 1
+                _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
+                enrichment_emails.extend(serper_result.candidate_emails)
+                all_subdomain_emails.extend(serper_result.subdomain_emails)
+                result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
+                if serper_result.candidate_domain:
+                    enrichment_domain = serper_result.candidate_domain
+                    result["discovery_source"] = "serper"
+                    if serper_result.is_fallback_domain:
+                        self._record_fallback_domain(serper_result.candidate_domain)
+                elif serper_result.candidate_emails:
+                    result["discovery_source"] = "serper"
 
-        except PipelineHaltError:
-            raise
-        except Exception as exc:
-            if _is_transient_enrichment_error(exc):
-                had_transient_error = True
-                transient_error_source = "serper"
-                result["_trace"].append({"stage": "serper", "outcome": "error"})
-                logger.warning("Serper transient error for %s: %s", record.unique_id, exc)
-            else:
-                result["_trace"].append({"stage": "serper", "outcome": "error"})
-                logger.warning("Serper error for %s: %s", record.unique_id, exc)
+            except PipelineHaltError:
+                raise
+            except Exception as exc:
+                if _is_transient_enrichment_error(exc):
+                    had_transient_error = True
+                    transient_error_source = "serper"
+                    result["_trace"].append({"stage": "serper", "outcome": "error"})
+                    logger.warning("Serper transient error for %s: %s", record.unique_id, exc)
+                else:
+                    result["_trace"].append({"stage": "serper", "outcome": "error"})
+                    logger.warning("Serper error for %s: %s", record.unique_id, exc)
 
         # If enrichment found a domain but DNS didn't, generate patterns from it
         if not domain and enrichment_domain:
