@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# scripts/run_checkpoints.sh — Run pipeline in 100-record batches with checkpoint reviews
+# scripts/run_checkpoints.sh — Run pipeline in batches with checkpoint reviews
 #
 # Usage:
-#   scripts/run_checkpoints.sh [--dry-run] [--max-batches N]
+#   scripts/run_checkpoints.sh --input FILE --name NAME [OPTIONS]
 #
-# Runs up to 1,000 records (10 × 100) against nc_1k with a $1.00 cost ceiling.
-# After each batch: prints a metrics report, appends it to checkpoints.log,
-# and prompts whether to continue.
+# Required:
+#   --input FILE        Input JSONL file path (relative to project root)
+#   --name NAME         Run name; outputs go to output/NAME/
+#
+# Optional:
+#   --batch-size N      Records per batch (default: 100)
+#   --max-batches N     Number of batches (default: 10)
+#   --max-cost USD      Cost ceiling per batch (default: 1.00)
+#   --dry-run           No real API calls
+#   --no-racknerd       Disable Racknerd backend (bbops + Zuhal only)
+#   --racknerd-direct   Skip SSH tunnel; probe MX servers directly (use on the egress VPS)
 
 set -euo pipefail
 
@@ -22,27 +30,26 @@ _on_error() {
   echo "" >&2
   echo "══════════════════════════════════════════════════════" >&2
   echo "PIPELINE FAILURE — ${ts}  (line ${lineno})" >&2
-  echo "  Database:  ${DB_PATH}" >&2
-  echo "  Log:       ${LOG_FILE}" >&2
+  echo "  Database:  ${DB_PATH:-unknown}" >&2
+  echo "  Log:       ${LOG_FILE:-unknown}" >&2
   echo "══════════════════════════════════════════════════════" >&2
-  mkdir -p "$(dirname "$LOG_FILE")"
-  {
-    echo ""
-    echo "FAILURE — ${ts}  (line ${lineno})"
-    echo "  Run 'python -m pipeline status --db ${DB_PATH}' for current state."
-  } >> "$LOG_FILE" 2>/dev/null || true
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    {
+      echo ""
+      echo "FAILURE — ${ts}  (line ${lineno})"
+      echo "  Run 'python -m pipeline status --db ${DB_PATH:-unknown}' for current state."
+    } >> "$LOG_FILE" 2>/dev/null || true
+  fi
 }
 trap '_on_error $LINENO' ERR
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Defaults ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=100
 MAX_BATCHES=10
-PIPELINE_NAME="nc_1k"
-INPUT_FILE="input/nc_retry_300k.jsonl"
-OUTPUT_DIR="output/${PIPELINE_NAME}"
-DB_PATH="${OUTPUT_DIR}/pipeline.db"
-LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 MAX_COST="1.00"
+PIPELINE_NAME=""
+INPUT_FILE=""
 DRY_RUN=false
 NO_RACKNERD=false
 RACKNERD_DIRECT=false
@@ -50,17 +57,36 @@ RACKNERD_DIRECT=false
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)          DRY_RUN=true; shift ;;
-    --no-racknerd)      NO_RACKNERD=true; shift ;;
-    --racknerd-direct)  RACKNERD_DIRECT=true; shift ;;
-    --max-batches)      MAX_BATCHES="$2"; shift 2 ;;
+    --input)           INPUT_FILE="$2";      shift 2 ;;
+    --name)            PIPELINE_NAME="$2";   shift 2 ;;
+    --batch-size)      BATCH_SIZE="$2";      shift 2 ;;
+    --max-batches)     MAX_BATCHES="$2";     shift 2 ;;
+    --max-cost)        MAX_COST="$2";        shift 2 ;;
+    --dry-run)         DRY_RUN=true;         shift ;;
+    --no-racknerd)     NO_RACKNERD=true;     shift ;;
+    --racknerd-direct) RACKNERD_DIRECT=true; shift ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--dry-run] [--no-racknerd] [--racknerd-direct] [--max-batches N]"
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+# ── Required argument validation ──────────────────────────────────────────────
+if [[ -z "$INPUT_FILE" ]]; then
+  echo "ERROR: --input FILE is required." >&2
+  exit 1
+fi
+if [[ -z "$PIPELINE_NAME" ]]; then
+  echo "ERROR: --name NAME is required." >&2
+  exit 1
+fi
+
+# ── Derived paths ─────────────────────────────────────────────────────────────
+OUTPUT_DIR="output/${PIPELINE_NAME}"
+DB_PATH="${OUTPUT_DIR}/pipeline.db"
+LOG_FILE="${OUTPUT_DIR}/checkpoints.log"
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -98,23 +124,20 @@ _checkpoint_report() {
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  # State counts (cumulative)
   local total validated val_failed disc_failed discovered validating cost_skipped
-  total=$(sqlite3       "$db" "SELECT COUNT(*) FROM records" 2>/dev/null || echo 0)
-  validated=$(sqlite3   "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATED'" 2>/dev/null || echo 0)
-  val_failed=$(sqlite3  "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATION_FAILED'" 2>/dev/null || echo 0)
-  disc_failed=$(sqlite3 "$db" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERY_FAILED'" 2>/dev/null || echo 0)
-  discovered=$(sqlite3  "$db" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERED'" 2>/dev/null || echo 0)
-  validating=$(sqlite3  "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATING'" 2>/dev/null || echo 0)
+  total=$(sqlite3        "$db" "SELECT COUNT(*) FROM records" 2>/dev/null || echo 0)
+  validated=$(sqlite3    "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATED'" 2>/dev/null || echo 0)
+  val_failed=$(sqlite3   "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATION_FAILED'" 2>/dev/null || echo 0)
+  disc_failed=$(sqlite3  "$db" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERY_FAILED'" 2>/dev/null || echo 0)
+  discovered=$(sqlite3   "$db" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERED'" 2>/dev/null || echo 0)
+  validating=$(sqlite3   "$db" "SELECT COUNT(*) FROM records WHERE record_state='VALIDATING'" 2>/dev/null || echo 0)
   cost_skipped=$(sqlite3 "$db" "SELECT COUNT(*) FROM records WHERE record_state='COST_SKIPPED'" 2>/dev/null || echo 0)
 
-  # Discovery source (cumulative)
   local dns_hits serper_hits input_hits
   dns_hits=$(sqlite3    "$db" "SELECT COUNT(*) FROM records WHERE discovery_source='dns'" 2>/dev/null || echo 0)
   serper_hits=$(sqlite3 "$db" "SELECT COUNT(*) FROM records WHERE discovery_source='serper'" 2>/dev/null || echo 0)
   input_hits=$(sqlite3  "$db" "SELECT COUNT(*) FROM records WHERE discovery_source='input'" 2>/dev/null || echo 0)
 
-  # Derived rates
   local terminal_n disc_n pct_validated pct_dns pct_serper pct_disc
   terminal_n=$(( validated + val_failed ))
   disc_n=$(( dns_hits + serper_hits + input_hits ))
@@ -131,7 +154,6 @@ _checkpoint_report() {
   pct_serper="n/a"
   [[ $disc_n -gt 0 ]] && pct_serper=$(awk "BEGIN{printf \"%.1f%%\", 100*$serper_hits/$disc_n}")
 
-  # Stats table — written at pipeline shutdown, reflects the most recent batch
   local sp_calls sd_calls zuhal_calls rk_probes bb_probes disagreements batch_cost
   sp_calls=$(sqlite3      "$db" "SELECT COALESCE(serper_producer_calls,0)   FROM stats LIMIT 1" 2>/dev/null || echo 0)
   sd_calls=$(sqlite3      "$db" "SELECT COALESCE(serper_dispatcher_calls,0) FROM stats LIMIT 1" 2>/dev/null || echo 0)
@@ -142,7 +164,6 @@ _checkpoint_report() {
   batch_cost=$(sqlite3    "$db" "SELECT COALESCE(estimated_cost_usd,0.0)    FROM stats LIMIT 1" 2>/dev/null || echo "0.0000")
   batch_cost=$(awk "BEGIN{printf \"%.4f\", $batch_cost}")
 
-  # Pct of total for validated/failed/disc_failed
   local pct_v pct_f pct_df
   pct_v="";  [[ $total -gt 0 ]] && pct_v=$(awk "BEGIN{printf \" (%.1f%%)\", 100*$validated/$total}")
   pct_f="";  [[ $total -gt 0 ]] && pct_f=$(awk "BEGIN{printf \" (%.1f%%)\", 100*$val_failed/$total}")
@@ -183,13 +204,14 @@ REPORT
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Checkpoint runner starting"
-echo "  Batches:   ${MAX_BATCHES} × ${BATCH_SIZE} = $(( MAX_BATCHES * BATCH_SIZE )) records max"
+echo "  Input:     ${INPUT_FILE}"
+echo "  Name:      ${PIPELINE_NAME}"
+echo "  Batches:   ${MAX_BATCHES} x ${BATCH_SIZE} = $(( MAX_BATCHES * BATCH_SIZE )) records max"
 echo "  Cost cap:  \$${MAX_COST}"
 echo "  Dry-run:   ${DRY_RUN}"
 echo "  Output:    ${OUTPUT_DIR}"
 echo
 
-# Initialise log header if first run
 if [[ ! -f "$LOG_FILE" ]]; then
   {
     echo "# Pipeline checkpoint log: ${PIPELINE_NAME}"
@@ -198,6 +220,9 @@ if [[ ! -f "$LOG_FILE" ]]; then
   } > "$LOG_FILE"
 fi
 
+PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+[[ ! -x "$PYTHON" ]] && PYTHON="python3"
+
 for batch_num in $(seq 1 "$MAX_BATCHES"); do
   start_record=$(( (batch_num - 1) * BATCH_SIZE + 1 ))
   end_record=$(( batch_num * BATCH_SIZE ))
@@ -205,11 +230,8 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   _check_disk_space
 
   echo "──────────────────────────────────────────────────────"
-  echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}–${end_record}"
+  echo "Batch ${batch_num}/${MAX_BATCHES}: records ${start_record}-${end_record}"
   echo "──────────────────────────────────────────────────────"
-
-  PYTHON="${PROJECT_ROOT}/.venv/bin/python"
-  [[ ! -x "$PYTHON" ]] && PYTHON="python3"
 
   pipeline_cmd=(
     "$PYTHON" -m pipeline run
@@ -238,13 +260,11 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   echo "$report" >> "$LOG_FILE"
   echo >> "$LOG_FILE"
 
-  # Warn if any records were cost-skipped
   skipped=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM records WHERE record_state='COST_SKIPPED'" 2>/dev/null || echo 0)
   if [[ $skipped -gt 0 ]]; then
-    echo "⚠  WARNING: ${skipped} record(s) hit the cost ceiling — consider raising --max-cost."
+    echo "WARNING: ${skipped} record(s) hit the cost ceiling -- consider raising --max-cost."
   fi
 
-  # Prompt to continue (skip after final batch)
   if [[ $batch_num -lt $MAX_BATCHES ]]; then
     echo
     read -r -p "Continue to batch $(( batch_num + 1 ))/${MAX_BATCHES}? [Y/n] " response
@@ -258,7 +278,7 @@ for batch_num in $(seq 1 "$MAX_BATCHES"); do
   echo
 done
 
-# ── Drain pass: clear any DISCOVERED records left by the final batch ──────────
+# ── Drain pass ────────────────────────────────────────────────────────────────
 discovered_remaining=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM records WHERE record_state='DISCOVERED'" 2>/dev/null || echo 0)
 if [[ $discovered_remaining -gt 0 ]]; then
   echo "──────────────────────────────────────────────────────"
