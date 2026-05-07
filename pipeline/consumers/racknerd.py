@@ -213,9 +213,7 @@ class RacknerdConsumer:
             return "error", f"SOCKS5 connect failed: {exc}"
 
         try:
-            smtp = aiosmtplib.SMTP(
-                hostname=mx_host, port=25, timeout=cfg.smtp_timeout_s, sock=sock,
-            )
+            smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
             return await self._run_smtp_probe(smtp, email, mx_host)
         except aiosmtplib.SMTPException as exc:
