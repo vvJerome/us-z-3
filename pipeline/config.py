@@ -43,7 +43,7 @@ class PipelineConfig(BaseSettings):
     serper_concurrency: int = 15
 
     # --- Dispatcher ---
-    dispatch_concurrency: int = Field(default=20, ge=1)
+    dispatch_concurrency: int = Field(default=50, ge=1)
     dispatch_backend_timeout_s: float = 60.0
     dispatch_poll_interval_s: float = 5.0
     dispatch_chunk_size: int = Field(default=50, ge=1)
@@ -56,7 +56,7 @@ class PipelineConfig(BaseSettings):
     racknerd_ssh_key: str = "~/.ssh/racknerd_egress"
     racknerd_ssh_port: int = 22
     racknerd_socks_port: int = 1080
-    racknerd_concurrency: int = Field(default=10, ge=1)
+    racknerd_concurrency: int = Field(default=25, ge=1)
     racknerd_smtp_timeout_s: float = 8.0
 
     # --- bbops async backend ---
