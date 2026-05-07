@@ -84,7 +84,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--racknerd-direct", action="store_true", default=None,
                         help="Use Racknerd in direct TCP mode (no SOCKS5 tunnel — use when running on the egress VPS)")
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
-    parser.add_argument("--racknerd-ssh-user", default="egress", help="SSH username")
+    parser.add_argument("--racknerd-ssh-user", default=None, help="SSH username")
     parser.add_argument("--racknerd-ssh-key", default=None, help="SSH private key path")
     parser.add_argument("--racknerd-ssh-port", type=int, default=22, help="SSH port")
     parser.add_argument("--racknerd-socks-port", type=int, default=1080, help="Local SOCKS5 port")
