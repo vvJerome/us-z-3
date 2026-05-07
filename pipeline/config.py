@@ -43,7 +43,7 @@ class PipelineConfig(BaseSettings):
     serper_concurrency: int = 15
 
     # --- Dispatcher ---
-    dispatch_concurrency: int = Field(default=20, ge=1)
+    dispatch_concurrency: int = Field(default=50, ge=1)
     dispatch_backend_timeout_s: float = 60.0
     dispatch_poll_interval_s: float = 5.0
     dispatch_chunk_size: int = Field(default=50, ge=1)
@@ -56,8 +56,8 @@ class PipelineConfig(BaseSettings):
     racknerd_ssh_key: str = "~/.ssh/racknerd_egress"
     racknerd_ssh_port: int = 22
     racknerd_socks_port: int = 1080
-    racknerd_concurrency: int = Field(default=10, ge=1)
-    racknerd_smtp_timeout_s: float = 15.0
+    racknerd_concurrency: int = Field(default=25, ge=1)
+    racknerd_smtp_timeout_s: float = 8.0
 
     # --- bbops async backend ---
     bbops_base_url: str = "https://email-verifier.bbops.io"
@@ -90,6 +90,7 @@ class PipelineConfig(BaseSettings):
     dry_run: bool = False
     max_consecutive_errors: int = Field(default=10, ge=1)
     max_discovery_retries: int = Field(default=3, ge=0)
+    max_dispatch_attempts: int = Field(default=10, ge=1)
 
     # --- Enrichment ---
     enrichment_source: Literal["serper"] = "serper"

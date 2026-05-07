@@ -136,7 +136,9 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATION_FAILED
         assert row["final_verdict"] == "invalid"
 
-    async def test_both_error_requeues_without_burning_attempt(self, test_db, config):
+    async def test_both_error_requeues_and_increments_attempt(self, test_db, config):
+        """Both-error re-queues the record AND increments dispatch_attempts so the
+        max_dispatch_attempts guard can terminate infinite error loops."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "timeout")
@@ -152,9 +154,10 @@ class TestDispatcherReconciliation:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 0  # not burned
+        assert row["dispatch_attempts"] == 1  # incremented to bound re-queue loops
 
-    async def test_tunnel_down_requeues_without_burning_attempt(self, test_db, config):
+    async def test_tunnel_down_requeues_and_increments_attempt(self, test_db, config):
+        """Tunnel-down re-queues the record AND increments dispatch_attempts."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "tunnel not up")
@@ -170,7 +173,7 @@ class TestDispatcherReconciliation:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 0
+        assert row["dispatch_attempts"] == 1
 
     async def test_catch_all_writes_validated(self, test_db, config):
         await _insert_discovered(test_db, "rec1")
@@ -268,9 +271,10 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.COST_SKIPPED
         zuhal.validate.assert_not_called()
 
-    async def test_racknerd_blocked_requeues_without_burning_attempt(self, test_db, config):
-        """Racknerd 'blocked' verdict (IP-level Spamhaus rejection) re-queues the record
-        as DISCOVERED without incrementing dispatch_attempts or calling Zuhal."""
+    async def test_racknerd_blocked_requeues_and_increments_attempt(self, test_db, config):
+        """Racknerd 'blocked' re-queues the record and increments dispatch_attempts so the
+        max_dispatch_attempts guard eventually terminates persistently blocked records.
+        Zuhal must not be called — the block is IP-level, not an email verdict."""
         from unittest.mock import AsyncMock as AM
         from pipeline.utils.zuhal_client import ZuhalClient
 
@@ -292,8 +296,37 @@ class TestDispatcherReconciliation:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 0  # not burned — blocked is not a validation attempt
-        zuhal.validate.assert_not_called()    # Zuhal must not be called on IP-level block
+        assert row["dispatch_attempts"] == 1  # incremented to bound persistent-block loops
+        zuhal.validate.assert_not_called()
+
+    async def test_max_dispatch_attempts_terminates_loop(self, test_db, config):
+        """A record that has hit max_dispatch_attempts is marked VALIDATION_FAILED
+        immediately without calling any backend."""
+        from pipeline.config import PipelineConfig
+        from pathlib import Path
+
+        # Insert a record that already has dispatch_attempts == max
+        await _insert_discovered(test_db, "rec1")
+        await test_db.execute(
+            "UPDATE records SET dispatch_attempts = ? WHERE unique_id = 'rec1'",
+            (config.max_dispatch_attempts,),
+        )
+        await test_db.commit()
+
+        rk = _mock_racknerd("valid")  # would validate if called
+        bb = _mock_bbops("valid")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.VALIDATION_FAILED
+        rk.verify.assert_not_called()
 
     async def test_racknerd_blocked_bbops_valid_validates_on_bbops(self, test_db, config):
         """When Racknerd is blocked but bbops returns valid, the OR-of-valids reconciliation

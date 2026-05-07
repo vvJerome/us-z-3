@@ -106,3 +106,60 @@ class TestRacknerdSmtpResponseParsing:
         code, msg = 421, "4.2.1 try again later"
         assert 400 <= code < 500
         # → "error" (temporary failure)
+
+    def test_recipient_not_found_is_invalid(self):
+        """GoDaddy 550 'Recipient not found' must classify as invalid via SMTPRecipientRefused path."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.1.0 <user@example.com> Recipient not found."
+        )
+        assert status == "invalid"
+
+    def test_nosuchuser_gmail_is_invalid(self):
+        """Gmail 550 NoSuchUser bounce must classify as invalid via SMTPRecipientRefused path."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.1.1 The email account that you tried to reach does not exist. NoSuchUser"
+        )
+        assert status == "invalid"
+
+    def test_spamhaus_rejection_is_blocked(self):
+        """Spamhaus PBL rejection via SMTPRecipientRefused must classify as blocked."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.7.1 Connection refused - blocked by Spamhaus PBL"
+        )
+        assert status == "blocked"
+
+    def test_generic_5xx_rejection_stays_error(self):
+        """Unknown 5xx must stay as error, not promoted to invalid or blocked."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, 5.7.1 Service unavailable for unknown reason"
+        )
+        assert status == "error"
+
+    def test_helo_hostname_is_not_private(self):
+        """Default helo_hostname must not be the placeholder private hostname."""
+        config = RacknerdConfig()
+        assert config.helo_hostname != "mail.verify.local"
+        assert config.helo_hostname  # not empty
+
+    def test_helo_hostname_is_valid_fqdn_or_ip_literal(self):
+        """When socket.getfqdn() returns a non-FQDN, _default_helo_hostname returns IP literal."""
+        from unittest.mock import patch
+        from pipeline.consumers.racknerd import _default_helo_hostname
+
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"):
+            result = _default_helo_hostname()
+        # Must be an IP literal [x.x.x.x] since there's no dot in the mock FQDN
+        assert result.startswith("[") and result.endswith("]")
+
+    def test_helo_hostname_uses_fqdn_when_valid(self):
+        """When socket.getfqdn() returns a real FQDN, use it directly."""
+        from unittest.mock import patch
+        from pipeline.consumers.racknerd import _default_helo_hostname
+
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="mail.example.com"):
+            result = _default_helo_hostname()
+        assert result == "mail.example.com"

@@ -202,7 +202,7 @@ class SerperClient:
             # VETERANS OF FOREIGN WARS" rarely appear verbatim; a shorter prefix often works.
             words = normalize_business_name(business_name).split()
             if (
-                len(words) >= 4
+                len(words) >= 3
                 and not result.candidate_domain
                 and not result.candidate_emails
             ):
@@ -302,7 +302,9 @@ class SerperClient:
 
         is_fallback_domain = False
         if not domain:
-            norm_biz = business_name.lower()
+            # Use normalize_business_name so legal suffixes (INC., CORP.) don't
+            # corrupt the fuzzy match against short brand domains.
+            norm_biz_joined = normalize_business_name(business_name).replace(" ", "")
             blocked = fallback_blocklist or set()
             first_organic_domain: str | None = None
             for result in data.get("organic", []):
@@ -314,7 +316,9 @@ class SerperClient:
                     continue
                 netloc_base = netloc.rsplit(".", 1)[0] if "." in netloc else netloc
                 netloc_norm = netloc_base.replace("-", "")
-                if fuzz.ratio(norm_biz.replace(" ", ""), netloc_norm) >= 75:
+                # partial_ratio catches short brand domains ("anixter") inside longer
+                # normalized names ("anixerpowersolutions") that ratio() would miss.
+                if fuzz.partial_ratio(netloc_norm, norm_biz_joined) >= 75:
                     domain = netloc
                     break
                 # Track first non-blocked organic domain for with-strategy fallback

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -33,9 +34,45 @@ _SPAMHAUS_KEYWORDS: tuple[str, ...] = (
 _INVALID_KEYWORDS: tuple[str, ...] = (
     "no such", "doesn't exist", "does not exist", "user unknown",
     "invalid mailbox", "invalid recipient", "address rejected",
+    "recipient not found", "nosuchuser", "account does not exist",
+    "account not found", "no mailbox",
 )
 
 _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
+
+
+def _default_helo_hostname() -> str:
+    """Return a valid FQDN for SMTP EHLO/HELO.
+
+    socket.getfqdn() returns the short hostname when the VPS has no FQDN configured.
+    Per RFC 5321, an IP literal [x.x.x.x] is valid when no hostname is available.
+    """
+    fqdn = socket.getfqdn()
+    if "." in fqdn:
+        return fqdn
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"[{ip}]"
+    except Exception:
+        return f"[{socket.gethostbyname(socket.gethostname())}]"
+
+
+def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
+    """Map a SMTPRecipientRefused exception string to (status, message).
+
+    aiosmtplib raises instead of returning (code, msg) for 5xx RCPT TO responses,
+    so _INVALID_KEYWORDS and _SPAMHAUS_KEYWORDS checks must happen on the exception
+    string rather than in _run_smtp_probe's tuple-return path.
+    """
+    lower = exc_str.lower()
+    if any(kw in lower for kw in _SPAMHAUS_KEYWORDS):
+        return "blocked", f"SMTP error: {exc_str}"
+    if any(kw in lower for kw in _INVALID_KEYWORDS):
+        return "invalid", f"SMTP error: {exc_str}"
+    return "error", f"SMTP error: {exc_str}"
 
 
 @dataclass
@@ -44,7 +81,7 @@ class RacknerdConfig:
     socks_port: int = 1080
     concurrency: int = 10
     smtp_timeout_s: float = RACKNERD_SMTP_TIMEOUT_S
-    helo_hostname: str = "mail.verify.local"
+    helo_hostname: str = field(default_factory=_default_helo_hostname)
     direct: bool = False  # skip SOCKS5 tunnel, connect directly (use when running on the egress VPS)
 
 
@@ -184,6 +221,10 @@ class RacknerdConsumer:
             smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=cfg.smtp_timeout_s)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
             return await self._run_smtp_probe(smtp, email, mx_host)
+        except aiosmtplib.SMTPRecipientRefused as exc:
+            # aiosmtplib raises SMTPRecipientRefused for 5xx RCPT TO responses instead of
+            # returning (code, msg) — so keyword checks must happen here, not in _run_smtp_probe.
+            return _classify_smtp_rejection(str(exc))
         except aiosmtplib.SMTPException as exc:
             return "error", f"SMTP error: {exc}"
         except asyncio.TimeoutError:
@@ -216,6 +257,8 @@ class RacknerdConsumer:
             smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
             return await self._run_smtp_probe(smtp, email, mx_host)
+        except aiosmtplib.SMTPRecipientRefused as exc:
+            return _classify_smtp_rejection(str(exc))
         except aiosmtplib.SMTPException as exc:
             return "error", f"SMTP error: {exc}"
         except asyncio.TimeoutError:

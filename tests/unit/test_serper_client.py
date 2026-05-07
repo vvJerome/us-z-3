@@ -304,6 +304,62 @@ async def test_invalid_api_key_still_raises_pipeline_halt():
             await client.enrich("Acme LLC", None, "NC", None, "without")
 
 
+def test_extract_domain_matches_short_brand_name():
+    """partial_ratio catches brand-name domains ('anixter') inside full normalized
+    business names ('anixerpowersolutions') that fuzz.ratio would miss."""
+    client = _client()
+    data = {
+        "organic": [
+            {"snippet": "Contact us", "link": "https://anixter.com/contact"},
+        ],
+        "knowledgeGraph": {},
+    }
+    result = client._extract(data, "ANIXTER POWER SOLUTIONS INC.", "q", strategy="without")
+    assert result.candidate_domain == "anixter.com"
+
+
+def test_extract_domain_ignores_legal_suffixes_in_match():
+    """normalize_business_name strips INC./CORP. before fuzzy matching so the
+    domain score is not diluted by legal boilerplate."""
+    client = _client()
+    data = {
+        "organic": [
+            {"snippet": "Visit us", "link": "https://huizengagreenhouses.com/about"},
+        ],
+        "knowledgeGraph": {},
+    }
+    result = client._extract(
+        data, "HUIZENGA BROS. GREENHOUSES, INC.", "q",
+        strategy="with", agent_name="LOUIS J HUIZENGA",
+    )
+    assert result.candidate_domain == "huizengagreenhouses.com"
+
+
+async def test_short_name_fallback_fires_for_three_word_name():
+    """4th fallback fires for 3-word normalized names (threshold lowered from 4).
+    Uses 'Huizenga Bros Greenhouses' — none of those words are LEGAL_SUFFIXES."""
+    client = _client()
+    call_count = 0
+    hit_response = {
+        "organic": [{"snippet": "info@huizengagreenhouses.com contact", "link": "https://huizengagreenhouses.com"}],
+        "knowledgeGraph": {},
+    }
+
+    async def _mock(query: str) -> dict:
+        nonlocal call_count
+        call_count += 1
+        return _EMPTY_RESPONSE if call_count == 1 else hit_response
+
+    with patch.object(client, "_call_api", side_effect=_mock):
+        result = await client.enrich(
+            "Huizenga Bros Greenhouses",  # 3 words, none are legal suffixes
+            None, "MI", None, "without",
+        )
+
+    assert call_count == 2
+    assert result.candidate_emails or result.candidate_domain
+
+
 async def test_credits_exhausted_in_fallback_sets_flag():
     """_SerperCreditsError raised inside a fallback call (e.g. 4th short-name fallback
     after a cache hit on the primary) still sets _credits_exhausted so future calls
