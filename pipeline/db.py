@@ -385,6 +385,23 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
     await conn.commit()
 
 
+async def requeue_record(conn: aiosqlite.Connection, unique_id: str) -> None:
+    """Return a record to DISCOVERED and increment dispatch_attempts.
+
+    Unlike update_record_status, this uses a SQL increment so the attempt count
+    accumulates across re-queue cycles even when no terminal verdict was written.
+    """
+    await conn.execute(
+        """UPDATE records
+              SET record_state = 'DISCOVERED',
+                  dispatch_attempts = dispatch_attempts + 1,
+                  updated_at = datetime('now')
+            WHERE unique_id = ?""",
+        (unique_id,),
+    )
+    await conn.commit()
+
+
 async def update_record_status(
     conn: aiosqlite.Connection,
     unique_id: str,

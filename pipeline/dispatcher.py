@@ -296,6 +296,20 @@ class Dispatcher:
         unique_id = row["unique_id"]
         raw_candidates = row["candidate_emails"]
 
+        # Guard against infinite re-queue loops. dispatch_attempts is incremented
+        # on every requeue_record() call (including inconclusive/error cycles),
+        # so this cap applies across all retries, not just terminal verdicts.
+        dispatch_attempts = row["dispatch_attempts"] or 0
+        if dispatch_attempts >= self.config.max_dispatch_attempts:
+            logger.warning(
+                "Record %s hit max dispatch attempts (%d) — marking VALIDATION_FAILED",
+                unique_id, dispatch_attempts,
+            )
+            async with self._write_lock:
+                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            self.stats["validation_failed"] += 1
+            return
+
         if not raw_candidates:
             logger.warning("No candidate_emails for %s — marking failed", unique_id)
             await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
@@ -401,7 +415,7 @@ class Dispatcher:
                 # record is retried after the SpamhausGuard cooldown expires.
                 if rk_verdict and rk_verdict.status == "blocked":
                     async with self._write_lock:
-                        await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                        await db.requeue_record(self.conn, unique_id)
                     self.stats["requeued"] += 1
                     logger.debug("Re-queued %s (Racknerd blocked — IP-level rejection)", unique_id)
                     return
@@ -418,7 +432,7 @@ class Dispatcher:
                     if zuhal_status == "circuit_open":
                         # Zuhal unavailable — re-queue without burning attempt; retries when circuit heals
                         async with self._write_lock:
-                            await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                            await db.requeue_record(self.conn, unique_id)
                         self.stats["requeued"] += 1
                         logger.warning("Zuhal circuit open — re-queued %s for later retry", unique_id)
                         return
@@ -466,7 +480,7 @@ class Dispatcher:
                 else:
                     # No Zuhal configured — re-queue as before
                     async with self._write_lock:
-                        await db.update_record_status(self.conn, unique_id, State.DISCOVERED)
+                        await db.requeue_record(self.conn, unique_id)
                     self.stats["requeued"] += 1
                     logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
                     return

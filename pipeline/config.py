@@ -90,6 +90,7 @@ class PipelineConfig(BaseSettings):
     dry_run: bool = False
     max_consecutive_errors: int = Field(default=10, ge=1)
     max_discovery_retries: int = Field(default=3, ge=0)
+    max_dispatch_attempts: int = Field(default=10, ge=1)
 
     # --- Enrichment ---
     enrichment_source: Literal["serper"] = "serper"
