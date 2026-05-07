@@ -27,7 +27,7 @@ DOMAIN_STEM_MIN_LENGTH: int = 5
 MAX_WITHOUT_CANDIDATES: int = 3
 
 # --- Racknerd / direct SMTP ---
-RACKNERD_SMTP_TIMEOUT_S: float = 15.0
+RACKNERD_SMTP_TIMEOUT_S: float = 8.0
 RACKNERD_MX_CACHE_TTL_S: int = 3600       # 1 hour MX resolution cache
 RACKNERD_MX_MAX_HOSTS: int = 3            # probe up to N MX hosts per domain
 RACKNERD_SPAMHAUS_WINDOW_S: int = 60      # sliding window for block detection

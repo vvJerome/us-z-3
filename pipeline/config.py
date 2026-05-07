@@ -57,7 +57,7 @@ class PipelineConfig(BaseSettings):
     racknerd_ssh_port: int = 22
     racknerd_socks_port: int = 1080
     racknerd_concurrency: int = Field(default=10, ge=1)
-    racknerd_smtp_timeout_s: float = 15.0
+    racknerd_smtp_timeout_s: float = 8.0
 
     # --- bbops async backend ---
     bbops_base_url: str = "https://email-verifier.bbops.io"
