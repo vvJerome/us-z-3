@@ -41,6 +41,25 @@ _INVALID_KEYWORDS: tuple[str, ...] = (
 _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
 
 
+def _default_helo_hostname() -> str:
+    """Return a valid FQDN for SMTP EHLO/HELO.
+
+    socket.getfqdn() returns the short hostname when the VPS has no FQDN configured.
+    Per RFC 5321, an IP literal [x.x.x.x] is valid when no hostname is available.
+    """
+    fqdn = socket.getfqdn()
+    if "." in fqdn:
+        return fqdn
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"[{ip}]"
+    except Exception:
+        return f"[{socket.gethostbyname(socket.gethostname())}]"
+
+
 def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
     """Map a SMTPRecipientRefused exception string to (status, message).
 
@@ -62,7 +81,7 @@ class RacknerdConfig:
     socks_port: int = 1080
     concurrency: int = 10
     smtp_timeout_s: float = RACKNERD_SMTP_TIMEOUT_S
-    helo_hostname: str = field(default_factory=socket.getfqdn)
+    helo_hostname: str = field(default_factory=_default_helo_hostname)
     direct: bool = False  # skip SOCKS5 tunnel, connect directly (use when running on the egress VPS)
 
 

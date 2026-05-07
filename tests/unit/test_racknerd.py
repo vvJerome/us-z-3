@@ -144,3 +144,22 @@ class TestRacknerdSmtpResponseParsing:
         config = RacknerdConfig()
         assert config.helo_hostname != "mail.verify.local"
         assert config.helo_hostname  # not empty
+
+    def test_helo_hostname_is_valid_fqdn_or_ip_literal(self):
+        """When socket.getfqdn() returns a non-FQDN, _default_helo_hostname returns IP literal."""
+        from unittest.mock import patch
+        from pipeline.consumers.racknerd import _default_helo_hostname
+
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"):
+            result = _default_helo_hostname()
+        # Must be an IP literal [x.x.x.x] since there's no dot in the mock FQDN
+        assert result.startswith("[") and result.endswith("]")
+
+    def test_helo_hostname_uses_fqdn_when_valid(self):
+        """When socket.getfqdn() returns a real FQDN, use it directly."""
+        from unittest.mock import patch
+        from pipeline.consumers.racknerd import _default_helo_hostname
+
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="mail.example.com"):
+            result = _default_helo_hostname()
+        assert result == "mail.example.com"
