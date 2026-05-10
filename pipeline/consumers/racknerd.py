@@ -253,9 +253,14 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"SOCKS5 connect failed: {exc}"
 
-        # aiosmtplib takes ownership of `sock` once smtp.connect() succeeds —
-        # closing it ourselves causes "File descriptor X is used by transport"
-        # errors that corrupt the event loop's selector for all backends.
+        # aiosmtplib takes ownership of `sock` once smtp.connect() succeeds.
+        # The transport's _call_connection_lost is deferred via call_soon and
+        # only then drops the strong ref that keeps loop._transports[fd] alive
+        # (it's a WeakValueDictionary). If we don't yield + force-evict, a
+        # concurrent probe can grab the recycled FD before cleanup runs and
+        # asyncio raises "File descriptor X is used by transport" — the error
+        # then cascades into bbops/Zuhal because the selector is corrupted.
+        sock_fd = sock.fileno()
         smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
         connected = False
         try:
@@ -276,11 +281,26 @@ class RacknerdConsumer:
                     smtp.close()
                 except Exception:
                     pass
+                # Yield so the loop runs the deferred _call_connection_lost
+                # callback, GCs the transport, and clears loop._transports[fd].
+                await asyncio.sleep(0)
             else:
+                # smtp.connect() may have partially constructed the transport
+                # (registering fd in loop._transports) before raising — close
+                # the raw socket so the OS frees the FD.
                 try:
                     sock.close()
                 except Exception:
                     pass
+            # Always force-evict the WeakValueDictionary entry. Handles both the
+            # successful path (in case GC is delayed under load) and the partial-
+            # connect failure path (where the transport was registered but never
+            # got a clean close()).
+            if sock_fd >= 0:
+                loop = asyncio.get_running_loop()
+                transports = getattr(loop, "_transports", None)
+                if transports is not None:
+                    transports.pop(sock_fd, None)
 
     async def _run_smtp_probe(
         self, smtp: aiosmtplib.SMTP, email: str, mx_host: str
