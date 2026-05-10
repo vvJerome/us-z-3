@@ -253,9 +253,14 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"SOCKS5 connect failed: {exc}"
 
+        # aiosmtplib takes ownership of `sock` once smtp.connect() succeeds —
+        # closing it ourselves causes "File descriptor X is used by transport"
+        # errors that corrupt the event loop's selector for all backends.
+        smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
+        connected = False
         try:
-            smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
+            connected = True
             return await self._run_smtp_probe(smtp, email, mx_host)
         except aiosmtplib.SMTPRecipientRefused as exc:
             return _classify_smtp_rejection(str(exc))
@@ -266,10 +271,16 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"probe error: {exc}"
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            if connected:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     async def _run_smtp_probe(
         self, smtp: aiosmtplib.SMTP, email: str, mx_host: str
