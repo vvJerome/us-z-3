@@ -115,13 +115,6 @@ class PipelineConfig(BaseSettings):
                 "Set RACKNERD_HOST in .env, pass --racknerd-host, or use --racknerd-direct."
             )
 
-        needs_dispatcher = not self.producer_only and not self.dry_run
-        if needs_dispatcher and not self.zuhal_api_key:
-            raise ValueError(
-                "ZUHAL_API_KEY must be set — Zuhal is required as the rescue backend. "
-                "Set ZUHAL_API_KEY in .env or use --dry-run / --producer-only."
-            )
-
         if self.ignore_checkpoint and self.start_offset == 0:
             logging.getLogger("pipeline").warning(
                 "--ignore-checkpoint without --start-offset is a no-op (starts from line 0)"
