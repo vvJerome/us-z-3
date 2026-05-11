@@ -440,9 +440,9 @@ async def main() -> None:
         "serper_rate_limit",
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
-        "max_cost", "max_consecutive_errors", "dry_run",
+        "max_cost", "max_consecutive_errors", "max_dispatch_attempts", "max_requeue_count", "dry_run",
         "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
-        "zuhal_concurrency", "zuhal_rate_limit",
+        "zuhal_concurrency", "zuhal_rate_limit", "zuhal_on_both_invalid",
     ]:
         val = getattr(args, field_name, None)
         if val is not None:

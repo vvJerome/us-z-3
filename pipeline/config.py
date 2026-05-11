@@ -66,7 +66,7 @@ class PipelineConfig(BaseSettings):
     bbops_max_inflight: int = Field(default=12, ge=1)
     bbops_flush_interval_s: float = 2.0
     bbops_poll_interval_s: float = 10.0
-    bbops_poll_timeout_s: float = 1800.0
+    bbops_poll_timeout_s: float = 600.0
     bbops_health_fail_threshold: int = Field(default=3, ge=1)
     bbops_health_ok_threshold: int = Field(default=2, ge=1)
 
@@ -76,6 +76,7 @@ class PipelineConfig(BaseSettings):
 
     # --- Zuhal fallback backend ---
     zuhal_concurrency: int = Field(default=5, ge=1)
+    zuhal_on_both_invalid: bool = False
 
     # --- Backoff ---
     max_attempts: int = 3
@@ -90,7 +91,8 @@ class PipelineConfig(BaseSettings):
     dry_run: bool = False
     max_consecutive_errors: int = Field(default=10, ge=1)
     max_discovery_retries: int = Field(default=3, ge=0)
-    max_dispatch_attempts: int = Field(default=3, ge=1)
+    max_dispatch_attempts: int = Field(default=5, ge=1)
+    max_requeue_count: int = Field(default=15, ge=1)
 
     # --- Enrichment ---
     enrichment_source: Literal["serper"] = "serper"

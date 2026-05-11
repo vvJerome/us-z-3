@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS records (
     -- State machine
     record_state        TEXT NOT NULL DEFAULT 'RAW',
     process_trace       TEXT,
+
+    -- Re-queue tracking
+    requeue_count       INTEGER DEFAULT 0,
+    retry_after         TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -195,6 +199,16 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v8
+_V8_MIGRATIONS: list[str] = [
+    # requeue_count: total re-queues (including infra transients) — safety valve against
+    # infinite loops when dispatch_attempts does not increment for infra failures.
+    "ALTER TABLE records ADD COLUMN requeue_count INTEGER DEFAULT 0",
+    # retry_after: ISO timestamp; when set, fetch_pending_validation skips the record until
+    # this time passes, implementing a greylisting hold (SMTP 4xx temporary deferral).
+    "ALTER TABLE records ADD COLUMN retry_after TEXT",
+]
+
 INSERT_RECORD_SQL = """
 INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
@@ -240,6 +254,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
     migration_sets: list[tuple[int, list[str]]] = [
         (6, _V4_MIGRATIONS),
         (7, _V7_MIGRATIONS),
+        (8, _V8_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -326,13 +341,19 @@ async def fetch_pending_validation(
     conn: aiosqlite.Connection,
     limit: int = 10,
 ) -> list[aiosqlite.Row]:
-    """Atomically claim up to `limit` DISCOVERED rows by setting them to VALIDATING."""
+    """Atomically claim up to `limit` DISCOVERED rows by setting them to VALIDATING.
+
+    Skips records whose retry_after timestamp has not yet passed (greylisting hold).
+    """
     async with conn.execute(
         """
         UPDATE records
            SET record_state = 'VALIDATING', updated_at = datetime('now')
          WHERE id IN (
-             SELECT id FROM records WHERE record_state = 'DISCOVERED' LIMIT ?
+             SELECT id FROM records
+              WHERE record_state = 'DISCOVERED'
+                AND (retry_after IS NULL OR retry_after <= datetime('now'))
+              LIMIT ?
          )
         RETURNING *
         """,
@@ -385,20 +406,41 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
     await conn.commit()
 
 
-async def requeue_record(conn: aiosqlite.Connection, unique_id: str) -> None:
-    """Return a record to DISCOVERED and increment dispatch_attempts.
+async def requeue_record(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    *,
+    increment_attempts: bool = True,
+    retry_after: str | None = None,
+) -> None:
+    """Return a record to DISCOVERED.
 
-    Unlike update_record_status, this uses a SQL increment so the attempt count
-    accumulates across re-queue cycles even when no terminal verdict was written.
+    increment_attempts=True when at least one backend returned a real verdict
+    (valid/invalid/catch_all). False for infra transients (tunnel down, Zuhal
+    circuit open, bbops unhealthy) that should not penalise the dispatch budget.
+
+    requeue_count always increments regardless of increment_attempts — it is a
+    safety valve that bounds records in infinite-loop infra failure scenarios.
+
+    retry_after (ISO timestamp) sets a hold: fetch_pending_validation skips
+    the record until that time passes. Use for greylisting (SMTP 4xx).
     """
-    await conn.execute(
-        """UPDATE records
-              SET record_state = 'DISCOVERED',
-                  dispatch_attempts = dispatch_attempts + 1,
-                  updated_at = datetime('now')
-            WHERE unique_id = ?""",
-        (unique_id,),
-    )
+    if increment_attempts:
+        sql = """UPDATE records
+                    SET record_state = 'DISCOVERED',
+                        dispatch_attempts = dispatch_attempts + 1,
+                        requeue_count = requeue_count + 1,
+                        retry_after = ?,
+                        updated_at = datetime('now')
+                  WHERE unique_id = ?"""
+    else:
+        sql = """UPDATE records
+                    SET record_state = 'DISCOVERED',
+                        requeue_count = requeue_count + 1,
+                        retry_after = ?,
+                        updated_at = datetime('now')
+                  WHERE unique_id = ?"""
+    await conn.execute(sql, (retry_after, unique_id))
     await conn.commit()
 
 

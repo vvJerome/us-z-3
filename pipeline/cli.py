@@ -108,6 +108,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Zuhal calls/hour ceiling")
     parser.add_argument("--zuhal-concurrency", type=int, default=5,
                         help="Concurrent Zuhal fallback probes")
+    parser.add_argument("--zuhal-on-both-invalid", action="store_true", default=False,
+                        help="Run Zuhal rescue even when both SMTP backends return invalid")
 
     # Backoff
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")
@@ -121,6 +123,10 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-cost", type=float, default=None, help="USD cost ceiling")
     parser.add_argument("--max-consecutive-errors", type=int, default=10,
                         help="Halt pipeline after this many consecutive errors")
+    parser.add_argument("--max-dispatch-attempts", type=int, default=None,
+                        help="Max real-verdict attempts before marking VALIDATION_FAILED (default: 5)")
+    parser.add_argument("--max-requeue-count", type=int, default=None,
+                        help="Max total re-queues (safety valve against infra loops, default: 15)")
     parser.add_argument("--dry-run", action="store_true", help="Mock all API calls")
 
     # Enrichment
