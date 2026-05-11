@@ -137,6 +137,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 _zuhal_bucket = TokenBucket(
                     capacity=config.zuhal_rate_limit,
                     refill_rate=config.zuhal_rate_limit / 3600,
+                    initial_tokens=0,
                 )
                 zuhal_client = ZuhalClient(
                     config.zuhal_api_key,
