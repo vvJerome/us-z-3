@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -153,20 +154,27 @@ def confidence_tier(score: int) -> str:
     return "low"
 
 
+def _greylisting_retry_after(minutes: int = 30) -> str:
+    """Return an ISO timestamp N minutes from now for a greylisting hold."""
+    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
 class Dispatcher:
     """
-    Dual-backend dispatch coordinator.
+    Sequential-backend dispatch coordinator.
 
     For each DISCOVERED record:
     1. MS probe pre-filter (free, short-circuits Microsoft domains)
-    2. Fan out to Racknerd + bbops concurrently
-    3. OR-of-valids reconciliation
-    4. Write dual-verdict + final_verdict to DB
-    5. Pattern learning on success
+    2. Racknerd SMTP probe; if valid/catch_all → done (bbops skipped)
+    3. bbops probe (only when Racknerd gives error/invalid/blocked)
+    4. OR-of-valids reconciliation; Zuhal rescue for inconclusive results
+    5. Write dual-verdict + final_verdict to DB
+    6. Pattern learning on success
     """
 
     def __init__(
@@ -296,14 +304,24 @@ class Dispatcher:
         unique_id = row["unique_id"]
         raw_candidates = row["candidate_emails"]
 
-        # Guard against infinite re-queue loops. dispatch_attempts is incremented
-        # on every requeue_record() call (including inconclusive/error cycles),
-        # so this cap applies across all retries, not just terminal verdicts.
+        # dispatch_attempts counts only re-queues where a real verdict was obtained.
+        # requeue_count counts every re-queue including infra transients — it is the
+        # safety valve that terminates records stuck in permanent infra failure loops.
         dispatch_attempts = row["dispatch_attempts"] or 0
+        requeue_count = row["requeue_count"] or 0
         if dispatch_attempts >= self.config.max_dispatch_attempts:
             logger.warning(
                 "Record %s hit max dispatch attempts (%d) — marking VALIDATION_FAILED",
                 unique_id, dispatch_attempts,
+            )
+            async with self._write_lock:
+                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            self.stats["validation_failed"] += 1
+            return
+        if requeue_count >= self.config.max_requeue_count:
+            logger.warning(
+                "Record %s hit max requeue count (%d) — marking VALIDATION_FAILED",
+                unique_id, requeue_count,
             )
             async with self._write_lock:
                 await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
@@ -384,41 +402,118 @@ class Dispatcher:
 
                 # unknown/error → fall through to SMTP backends
 
-            # Fan out to both SMTP backends concurrently
-            rk_verdict, bb_verdict, trace_entries = await self._dual_probe(
-                unique_id, email, row["id"]
-            )
-            pending_trace.extend(trace_entries)
-            last_rk, last_bb = rk_verdict, bb_verdict
+            # Sequential SMTP probe: Racknerd first, bbops only when Racknerd can't decide
+            timeout = self.config.dispatch_backend_timeout_s
+
+            t_rk = time.monotonic()
+            try:
+                rk_verdict = await asyncio.wait_for(
+                    self._safe_racknerd(email), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at="")
+            elapsed_rk = int((time.monotonic() - t_rk) * 1000)
+            pending_trace.append({
+                "stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed_rk, "email": email,
+            })
+            last_rk = rk_verdict
+
+            # Racknerd valid/catch_all: bbops not needed
+            if rk_verdict.status in ("valid", "catch_all"):
+                score = compute_confidence_score(
+                    email, candidate_domain, strategy, rk_verdict.status, agent_name
+                )
+                async with self._write_lock:
+                    await db.update_record_dual(
+                        self.conn,
+                        unique_id,
+                        State.VALIDATED,
+                        racknerd_status=rk_verdict.status,
+                        racknerd_message=rk_verdict.message,
+                        racknerd_verified_at=rk_verdict.verified_at,
+                        bbops_status="not_run",
+                        bbops_message="skipped — Racknerd hit",
+                        bbops_verified_at=None,
+                        final_verdict=rk_verdict.status,
+                        candidate_email=email,
+                        confidence_score=float(score),
+                    )
+                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
+                await self._record_pattern(
+                    email, _first, _last, candidate_domain, mx_provider, success=True
+                )
+                self.stats["validated"] += 1
+                logger.info("Racknerd-validated (bbops skipped): %s → %s", unique_id, email)
+                return
+
+            # Tunnel down: pure infra, re-queue without burning dispatch_attempts
+            if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
+                async with self._write_lock:
+                    await db.requeue_record(
+                        self.conn, unique_id, increment_attempts=False, retry_after=None
+                    )
+                self.stats["requeued"] += 1
+                logger.debug("Re-queued %s (SSH tunnel not up)", unique_id)
+                return
+
+            # Racknerd gave blocked/error/invalid — run bbops
+            t_bb = time.monotonic()
+            try:
+                bb_verdict = await asyncio.wait_for(
+                    self._safe_bbops(row["id"], email), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at="")
+            except BbopsUnhealthy:
+                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at="")
+            elapsed_bb = int((time.monotonic() - t_bb) * 1000)
+            pending_trace.append({
+                "stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed_bb, "email": email,
+            })
+            last_bb = bb_verdict
 
             result = reconcile(rk_verdict, bb_verdict)
 
-            # Disagreement detection
+            # Disagreement detection (only when both gave definitive verdicts)
             if (
-                rk_verdict and bb_verdict
-                and rk_verdict.status in _DEFINITIVE
+                rk_verdict.status in _DEFINITIVE
                 and bb_verdict.status in _DEFINITIVE
                 and rk_verdict.status != bb_verdict.status
             ):
                 self.stats["disagreements"] += 1
                 logger.info(
                     "Backend disagreement for %s/%s: racknerd=%s bbops=%s",
-                    unique_id,
-                    email,
-                    rk_verdict.status,
-                    bb_verdict.status,
+                    unique_id, email, rk_verdict.status, bb_verdict.status,
                 )
 
             if not result.should_write:
-                # Racknerd blocked = IP-level Spamhaus rejection, not a verdict on the
-                # email address. Skip Zuhal (would waste credits) and re-queue so the
-                # record is retried after the SpamhausGuard cooldown expires.
-                if rk_verdict and rk_verdict.status == "blocked":
+                # Racknerd IP block: skip Zuhal (block is IP-level, not email verdict),
+                # re-queue so the record retries after the Spamhaus cooldown clears.
+                if rk_verdict.status == "blocked":
+                    # Count attempt only if bbops gave a definitive verdict — a blocked
+                    # Racknerd + bbops invalid is one real verdict; blocked + bbops error
+                    # is purely infra and should not consume the budget.
+                    any_real = bb_verdict.status in _DEFINITIVE
                     async with self._write_lock:
-                        await db.requeue_record(self.conn, unique_id)
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=any_real, retry_after=None
+                        )
                     self.stats["requeued"] += 1
                     logger.debug("Re-queued %s (Racknerd blocked — IP-level rejection)", unique_id)
                     return
+
+                # Count attempt only when at least one backend gave a definitive verdict.
+                # Both-error or error+not_run are pure infra and do not consume the budget.
+                any_real_verdict = (
+                    rk_verdict.status in _DEFINITIVE or bb_verdict.status in _DEFINITIVE
+                )
+
+                # Greylisting: Racknerd got a 4xx temporary SMTP deferral — hold for 30 min.
+                rk_is_4xx = (
+                    rk_verdict.status == "error"
+                    and "(4xx temporary)" in (rk_verdict.message or "")
+                )
+                greylist_hold = _greylisting_retry_after() if rk_is_4xx else None
 
                 if self.zuhal is not None:
                     if self.cost_tracker.ceiling_reached():
@@ -430,14 +525,14 @@ class Dispatcher:
                     pending_trace.append(zuhal_trace)
 
                     if zuhal_status == "circuit_open":
-                        # Zuhal unavailable — re-queue without burning attempt; retries when circuit heals
                         async with self._write_lock:
-                            await db.requeue_record(self.conn, unique_id)
+                            await db.requeue_record(
+                                self.conn, unique_id, increment_attempts=False, retry_after=None
+                            )
                         self.stats["requeued"] += 1
                         logger.warning("Zuhal circuit open — re-queued %s for later retry", unique_id)
                         return
 
-                    # normalize accept-all to catch_all for consistency
                     if zuhal_status == "accept-all":
                         zuhal_status = "catch_all"
                     terminal = zuhal_status in ("valid", "catch_all")
@@ -450,12 +545,12 @@ class Dispatcher:
                             self.conn,
                             unique_id,
                             state,
-                            racknerd_status=rk_verdict.status if rk_verdict else "not_run",
-                            racknerd_message=rk_verdict.message if rk_verdict else "",
-                            racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
-                            bbops_status=bb_verdict.status if bb_verdict else "not_run",
-                            bbops_message=bb_verdict.message if bb_verdict else "",
-                            bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
+                            racknerd_status=rk_verdict.status,
+                            racknerd_message=rk_verdict.message,
+                            racknerd_verified_at=rk_verdict.verified_at,
+                            bbops_status=bb_verdict.status,
+                            bbops_message=bb_verdict.message,
+                            bbops_verified_at=bb_verdict.verified_at,
                             final_verdict=zuhal_status,
                             candidate_email=email,
                             confidence_score=float(score),
@@ -464,7 +559,9 @@ class Dispatcher:
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
                     if terminal:
-                        await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
+                        await self._record_pattern(
+                            email, _first, _last, candidate_domain, mx_provider, success=True
+                        )
                         self.stats["validated"] += 1
                         logger.info(
                             "Zuhal-validated: %s → %s [zuhal=%s]",
@@ -478,11 +575,17 @@ class Dispatcher:
                         )
                     return
                 else:
-                    # No Zuhal configured — re-queue as before
                     async with self._write_lock:
-                        await db.requeue_record(self.conn, unique_id)
+                        await db.requeue_record(
+                            self.conn, unique_id,
+                            increment_attempts=any_real_verdict,
+                            retry_after=greylist_hold,
+                        )
                     self.stats["requeued"] += 1
-                    logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
+                    if rk_is_4xx:
+                        logger.debug("Re-queued %s (greylisted — 4xx hold until %s)", unique_id, greylist_hold)
+                    else:
+                        logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
                     return
 
             if result.final_verdict in ("valid", "catch_all"):
@@ -494,26 +597,82 @@ class Dispatcher:
                         self.conn,
                         unique_id,
                         State.VALIDATED,
-                        racknerd_status=rk_verdict.status if rk_verdict else "not_run",
-                        racknerd_message=rk_verdict.message if rk_verdict else "",
-                        racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
-                        bbops_status=bb_verdict.status if bb_verdict else "not_run",
-                        bbops_message=bb_verdict.message if bb_verdict else "",
-                        bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
+                        racknerd_status=rk_verdict.status,
+                        racknerd_message=rk_verdict.message,
+                        racknerd_verified_at=rk_verdict.verified_at,
+                        bbops_status=bb_verdict.status,
+                        bbops_message=bb_verdict.message,
+                        bbops_verified_at=bb_verdict.verified_at,
                         final_verdict=result.final_verdict,
                         candidate_email=email,
                         confidence_score=float(score),
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
+                await self._record_pattern(
+                    email, _first, _last, candidate_domain, mx_provider, success=True
+                )
                 self.stats["validated"] += 1
                 logger.info(
                     "Validated %s → %s [rk=%s bb=%s]",
-                    unique_id, email,
-                    rk_verdict.status if rk_verdict else "n/a",
-                    bb_verdict.status if bb_verdict else "n/a",
+                    unique_id, email, rk_verdict.status, bb_verdict.status,
                 )
                 return
+
+            # Both invalid — optional Zuhal rescue when zuhal_on_both_invalid is enabled
+            if self.zuhal is not None and self.config.zuhal_on_both_invalid:
+                if self.cost_tracker.ceiling_reached():
+                    logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
+                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+                    cost_skipped = True
+                    break
+                zuhal_status, zuhal_trace = await self._zuhal_probe(email)
+                pending_trace.append(zuhal_trace)
+
+                if zuhal_status == "circuit_open":
+                    async with self._write_lock:
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=False, retry_after=None
+                        )
+                    self.stats["requeued"] += 1
+                    logger.warning(
+                        "Zuhal circuit open (both-invalid rescue) — re-queued %s", unique_id
+                    )
+                    return
+
+                if zuhal_status == "accept-all":
+                    zuhal_status = "catch_all"
+                if zuhal_status in ("valid", "catch_all"):
+                    score = compute_confidence_score(
+                        email, candidate_domain, strategy, zuhal_status, agent_name
+                    )
+                    async with self._write_lock:
+                        await db.update_record_dual(
+                            self.conn,
+                            unique_id,
+                            State.VALIDATED,
+                            racknerd_status=rk_verdict.status,
+                            racknerd_message=rk_verdict.message,
+                            racknerd_verified_at=rk_verdict.verified_at,
+                            bbops_status=bb_verdict.status,
+                            bbops_message=bb_verdict.message,
+                            bbops_verified_at=bb_verdict.verified_at,
+                            final_verdict=zuhal_status,
+                            candidate_email=email,
+                            confidence_score=float(score),
+                            zuhal_status_override=zuhal_status,
+                        )
+                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
+                    self.cost_tracker.record_call("zuhal")
+                    await self._record_pattern(
+                        email, _first, _last, candidate_domain, mx_provider, success=True
+                    )
+                    self.stats["validated"] += 1
+                    logger.info(
+                        "Zuhal-rescued both-invalid: %s → %s [zuhal=%s]",
+                        unique_id, email, zuhal_status,
+                    )
+                    return
+                # Zuhal also invalid/error — fall through to try next candidate
 
             # invalid — record pattern miss and try next candidate
             await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=False)
@@ -616,56 +775,6 @@ class Dispatcher:
         ms = int((time.monotonic() - t0) * 1000)
         status = result.get("status", "error")
         return status, {"stage": "ms_api", "outcome": status, "ms": ms, "email": email}
-
-    async def _dual_probe(
-        self,
-        unique_id: str,
-        email: str,
-        record_id: int,
-    ) -> tuple[BackendVerdict | None, BackendVerdict | None, list[dict]]:
-        """Run Racknerd + bbops concurrently. Returns (rk, bb, trace_entries)."""
-        timeout = self.config.dispatch_backend_timeout_s
-        trace: list[dict] = []
-
-        rk_coro = self._safe_racknerd(email)
-        bb_coro = self._safe_bbops(record_id, email)
-
-        t0 = time.monotonic()
-        rk_result, bb_result = await asyncio.gather(
-            asyncio.wait_for(rk_coro, timeout=timeout),
-            asyncio.wait_for(bb_coro, timeout=timeout),
-            return_exceptions=True,
-        )
-        elapsed = int((time.monotonic() - t0) * 1000)
-
-        rk_verdict: BackendVerdict | None = None
-        bb_verdict: BackendVerdict | None = None
-
-        if isinstance(rk_result, BackendVerdict):
-            rk_verdict = rk_result
-        elif isinstance(rk_result, BaseException):
-            rk_verdict = BackendVerdict(status="error", message=str(rk_result), verified_at="")
-        trace.append({
-            "stage": "racknerd",
-            "outcome": rk_verdict.status if rk_verdict else "error",
-            "ms": elapsed,
-            "email": email,
-        })
-
-        if isinstance(bb_result, BackendVerdict):
-            bb_verdict = bb_result
-        elif isinstance(bb_result, BbopsUnhealthy):
-            bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at="")
-        elif isinstance(bb_result, BaseException):
-            bb_verdict = BackendVerdict(status="error", message=str(bb_result), verified_at="")
-        trace.append({
-            "stage": "bbops",
-            "outcome": bb_verdict.status if bb_verdict else "error",
-            "ms": elapsed,
-            "email": email,
-        })
-
-        return rk_verdict, bb_verdict, trace
 
     async def _safe_racknerd(self, email: str) -> BackendVerdict:
         try:

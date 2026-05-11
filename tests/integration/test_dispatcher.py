@@ -76,7 +76,8 @@ async def _insert_discovered(conn, unique_id: str, email: str = "test@example.co
 
 
 class TestDispatcherReconciliation:
-    async def test_both_valid_writes_validated(self, test_db, config):
+    async def test_racknerd_valid_skips_bbops(self, test_db, config):
+        """Racknerd valid short-circuits: bbops is skipped (sequential flow)."""
         await _insert_discovered(test_db, "rec1")
         await db.upsert_checkpoint(test_db, "producer_done", "true")
 
@@ -85,7 +86,6 @@ class TestDispatcherReconciliation:
         stop = asyncio.Event()
         dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), stop)
 
-        # Run one cycle
         rows = await db.fetch_pending_validation(test_db, limit=10)
         for row in rows:
             await dispatcher._process_record(row)
@@ -99,7 +99,8 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"
         assert row["racknerd_status"] == "valid"
-        assert row["bbops_status"] == "valid"
+        assert row["bbops_status"] == "not_run"  # skipped — Racknerd hit
+        bb.verify.assert_not_called()
 
     async def test_racknerd_valid_bbops_invalid_still_valid(self, test_db, config):
         await _insert_discovered(test_db, "rec1")
@@ -136,9 +137,9 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATION_FAILED
         assert row["final_verdict"] == "invalid"
 
-    async def test_both_error_requeues_and_increments_attempt(self, test_db, config):
-        """Both-error re-queues the record AND increments dispatch_attempts so the
-        max_dispatch_attempts guard can terminate infinite error loops."""
+    async def test_both_error_requeues_without_incrementing_attempt(self, test_db, config):
+        """Both-error is a pure infra failure — re-queues without burning dispatch_attempts,
+        but requeue_count always increments to bound infinite loops."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "timeout")
@@ -149,15 +150,18 @@ class TestDispatcherReconciliation:
         await dispatcher._process_record(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state, dispatch_attempts FROM records WHERE unique_id = ?", ("rec1",)
+            "SELECT record_state, dispatch_attempts, requeue_count FROM records WHERE unique_id = ?",
+            ("rec1",)
         ) as cur:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 1  # incremented to bound re-queue loops
+        assert row["dispatch_attempts"] == 0  # infra transient — budget not consumed
+        assert row["requeue_count"] == 1  # safety valve always increments
 
-    async def test_tunnel_down_requeues_and_increments_attempt(self, test_db, config):
-        """Tunnel-down re-queues the record AND increments dispatch_attempts."""
+    async def test_tunnel_down_requeues_without_incrementing_attempt(self, test_db, config):
+        """Tunnel-down is a pure infra failure — re-queues without burning dispatch_attempts
+        and bbops is never called (early return before running bbops)."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "tunnel not up")
@@ -168,12 +172,15 @@ class TestDispatcherReconciliation:
         await dispatcher._process_record(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state, dispatch_attempts FROM records WHERE unique_id = ?", ("rec1",)
+            "SELECT record_state, dispatch_attempts, requeue_count FROM records WHERE unique_id = ?",
+            ("rec1",)
         ) as cur:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 1
+        assert row["dispatch_attempts"] == 0  # infra transient — budget not consumed
+        assert row["requeue_count"] == 1  # safety valve always increments
+        bb.verify.assert_not_called()  # bbops never runs when tunnel is down
 
     async def test_catch_all_writes_validated(self, test_db, config):
         await _insert_discovered(test_db, "rec1")
@@ -272,9 +279,8 @@ class TestDispatcherReconciliation:
         zuhal.validate.assert_not_called()
 
     async def test_racknerd_blocked_requeues_and_increments_attempt(self, test_db, config):
-        """Racknerd 'blocked' re-queues the record and increments dispatch_attempts so the
-        max_dispatch_attempts guard eventually terminates persistently blocked records.
-        Zuhal must not be called — the block is IP-level, not an email verdict."""
+        """Racknerd blocked + bbops invalid: bbops gave a real verdict so dispatch_attempts
+        is incremented. Zuhal must not be called — the block is IP-level, not an email verdict."""
         from unittest.mock import AsyncMock as AM
         from pipeline.utils.zuhal_client import ZuhalClient
 
@@ -439,3 +445,82 @@ class TestDispatcherReconciliation:
 
         assert row["record_state"] == State.COST_SKIPPED
         serper.enrich.assert_not_called()
+
+    async def test_greylisting_sets_retry_after(self, test_db, config):
+        """Racknerd 4xx temporary deferral sets retry_after ~30 min in the future."""
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("error", "421 (4xx temporary) try again")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, retry_after FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.DISCOVERED
+        assert row["retry_after"] is not None  # hold set
+
+    async def test_non_greylist_error_no_retry_after(self, test_db, config):
+        """A plain error (not 4xx temporary) does not set retry_after."""
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("error", "connection refused")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, retry_after FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.DISCOVERED
+        assert row["retry_after"] is None
+
+    async def test_max_requeue_count_terminates_loop(self, test_db, config):
+        """A record that has hit max_requeue_count is marked VALIDATION_FAILED
+        immediately without calling any backend."""
+        await _insert_discovered(test_db, "rec1")
+        await test_db.execute(
+            "UPDATE records SET requeue_count = ? WHERE unique_id = 'rec1'",
+            (config.max_requeue_count,),
+        )
+        await test_db.commit()
+
+        rk = _mock_racknerd("valid")
+        bb = _mock_bbops("valid")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.VALIDATION_FAILED
+        rk.verify.assert_not_called()
+
+    async def test_fetch_pending_skips_retry_after_hold(self, test_db, config):
+        """fetch_pending_validation does not return records whose retry_after is in the future."""
+        import datetime
+
+        await _insert_discovered(test_db, "rec1")
+        future = (
+            datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        await test_db.execute(
+            "UPDATE records SET retry_after = ? WHERE unique_id = 'rec1'", (future,)
+        )
+        await test_db.commit()
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        assert not any(r["unique_id"] == "rec1" for r in rows)
