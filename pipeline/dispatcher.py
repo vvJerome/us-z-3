@@ -73,10 +73,16 @@ def reconcile(
         return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
 
     if rk == "invalid" and bb in _INCONCLUSIVE:
+        # not_run = backend intentionally disabled; treat as definitive invalid
+        if bb == "not_run":
+            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
         # One said invalid, one errored — can't trust the invalid verdict alone
         return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
     if rk in _INCONCLUSIVE and bb == "invalid":
+        # not_run = backend intentionally disabled; treat as definitive invalid
+        if rk == "not_run":
+            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
         return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
     # Both inconclusive
