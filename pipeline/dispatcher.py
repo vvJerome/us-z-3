@@ -29,6 +29,16 @@ from pipeline.db import State
 
 logger = logging.getLogger("pipeline.dispatcher")
 
+
+def _valid_email_format(email: str) -> bool:
+    """Return False for emails whose local part violates RFC 5321 basics (e.g. ...@domain)."""
+    parts = email.split("@")
+    if len(parts) != 2:
+        return False
+    local = parts[0]
+    return bool(local) and not local.startswith(".") and not local.endswith(".") and ".." not in local
+
+
 _GENERIC_PREFIXES: frozenset[str] = frozenset({
     "info", "contact", "hello", "admin", "support", "sales", "help",
 })
@@ -366,6 +376,10 @@ class Dispatcher:
         while i < len(candidates):
             email = candidates[i]
             i += 1
+            if not _valid_email_format(email):
+                logger.debug("Skipping malformed candidate %s for %s", email, unique_id)
+                pending_trace.append({"stage": "format_skip", "outcome": "invalid", "email": email})
+                continue
             if self.cost_tracker.ceiling_reached():
                 logger.info("Cost ceiling reached — skipping %s", unique_id)
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
