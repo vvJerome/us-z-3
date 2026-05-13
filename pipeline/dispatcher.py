@@ -29,6 +29,16 @@ from pipeline.db import State
 
 logger = logging.getLogger("pipeline.dispatcher")
 
+
+def _valid_email_format(email: str) -> bool:
+    """Return False for emails whose local part violates RFC 5321 basics (e.g. ...@domain)."""
+    parts = email.split("@")
+    if len(parts) != 2:
+        return False
+    local = parts[0]
+    return bool(local) and not local.startswith(".") and not local.endswith(".") and ".." not in local
+
+
 _GENERIC_PREFIXES: frozenset[str] = frozenset({
     "info", "contact", "hello", "admin", "support", "sales", "help",
 })
@@ -73,10 +83,16 @@ def reconcile(
         return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
 
     if rk == "invalid" and bb in _INCONCLUSIVE:
+        # not_run = backend intentionally disabled; treat as definitive invalid
+        if bb == "not_run":
+            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
         # One said invalid, one errored — can't trust the invalid verdict alone
         return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
     if rk in _INCONCLUSIVE and bb == "invalid":
+        # not_run = backend intentionally disabled; treat as definitive invalid
+        if rk == "not_run":
+            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
         return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
     # Both inconclusive
@@ -360,6 +376,10 @@ class Dispatcher:
         while i < len(candidates):
             email = candidates[i]
             i += 1
+            if not _valid_email_format(email):
+                logger.debug("Skipping malformed candidate %s for %s", email, unique_id)
+                pending_trace.append({"stage": "format_skip", "outcome": "invalid", "email": email})
+                continue
             if self.cost_tracker.ceiling_reached():
                 logger.info("Cost ceiling reached — skipping %s", unique_id)
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
