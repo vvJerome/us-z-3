@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>us-z-3 dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { background:#0b1020; color:#e6edf3; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .card { background:#111a33; border:1px solid #1f2a48; border-radius:12px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:9999px; font-size:11px; font-weight:600; }
+  .pill-valid    { background:#0e3a2a; color:#7ee2b8; }
+  .pill-invalid  { background:#3a1a1a; color:#ffb4b4; }
+  .pill-catch_all,.pill-dual_catch_all { background:#3a2e0e; color:#ffe08a; }
+  .pill-dual_valid,.pill-ms_valid { background:#0e3a2a; color:#7ee2b8; }
+  .pill-error,.pill-not_run,.pill-unknown { background:#27314e; color:#8da3c7; }
+  .pill-blocked  { background:#3a0e0e; color:#ff8a8a; }
+  .indicator { display:inline-block; width:10px; height:10px; border-radius:9999px;
+               background:#10b981; transition:background-color 0.2s; flex:none; }
+  .indicator.polling { background:#0ea5e9; animation: pulse-ring 1.2s ease-out infinite; }
+  .indicator.stale   { background:#f43f5e; animation: pulse-stale 1.2s ease-out infinite; }
+  @keyframes pulse-ring  { 0%{box-shadow:0 0 0 0 rgba(14,165,233,0.55)} 100%{box-shadow:0 0 0 10px rgba(14,165,233,0)} }
+  @keyframes pulse-stale { 0%,100%{opacity:1} 50%{opacity:0.35} }
+  .bar { background:#1f2a48; border-radius:6px; overflow:hidden; }
+  .bar-fill { height:8px; background:linear-gradient(90deg,#3b82f6,#22d3ee); }
+  table.tight th, table.tight td { padding:4px 8px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+</style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+  <header class="flex flex-wrap items-center justify-between gap-2 mb-4">
+    <div class="flex items-center gap-3">
+      <span id="indicator" class="indicator" title="live"></span>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-slate-400">us-z-3 pipeline</div>
+        <h1 class="text-xl font-semibold num" id="run-id">—</h1>
+      </div>
+    </div>
+    <div class="text-xs text-slate-400 text-right">
+      <span id="as-of">—</span>
+      · build <span id="build-ms" class="num">—</span> ms
+      · <span id="poll-status" class="num">polling</span>
+    </div>
+  </header>
+
+  <main class="grid grid-cols-12 gap-4">
+
+    <!-- State counts -->
+    <section class="card p-4 col-span-12 md:col-span-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">State machine</h2>
+      <div class="grid grid-cols-2 gap-y-2 num" id="states-grid"></div>
+      <div class="mt-3 pt-3 border-t border-slate-700 text-xs text-slate-400 flex justify-between num">
+        <span>Total: <b id="total-records" class="text-slate-200">—</b></span>
+        <span>Pending: <b id="total-pending" class="text-slate-200">—</b></span>
+      </div>
+    </section>
+
+    <!-- Throughput chart + rate -->
+    <section class="card p-4 col-span-12 md:col-span-5 flex flex-col">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 mb-2">
+        <h2 class="text-sm font-semibold text-slate-300">Throughput (last 60 min)</h2>
+        <div class="text-xs text-slate-400 num"><b id="rate-per-hour" class="text-slate-100">—</b>/hr · ETA <b id="rate-eta" class="text-slate-100">—</b></div>
+      </div>
+      <div style="position:relative;height:160px"><canvas id="throughput-chart"></canvas></div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 pt-3 border-t border-slate-700 text-center text-xs num">
+        <div><div class="text-slate-400">Peak / min</div><div class="text-base font-semibold" id="tp-peak">—</div></div>
+        <div><div class="text-slate-400">Avg / min</div><div class="text-base font-semibold" id="tp-avg">—</div></div>
+        <div><div class="text-slate-400">Last 15 m</div><div class="text-base font-semibold" id="tp-15m">—</div></div>
+        <div><div class="text-slate-400">Trend</div><div class="text-base font-semibold" id="tp-trend">—</div></div>
+      </div>
+    </section>
+
+    <!-- Cost gauge -->
+    <section class="card p-4 col-span-12 md:col-span-3 flex flex-col">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Cost</h2>
+      <div class="text-3xl font-bold num" id="cost-spent">$—</div>
+      <div class="text-xs text-slate-400 mt-1">of <span id="cost-ceiling" class="num">—</span></div>
+      <div class="bar mt-3"><div class="bar-fill" id="cost-bar" style="width:0%"></div></div>
+      <div class="text-xs text-slate-400 mt-1 num"><span id="cost-pct">0</span>%</div>
+      <div class="mt-3 pt-3 border-t border-slate-700 text-xs space-y-1" id="cost-breakdown"></div>
+      <div class="mt-auto pt-2 text-xs text-slate-400 num">Projected total: <b id="cost-projected" class="text-slate-200">—</b></div>
+    </section>
+
+    <!-- Backends -->
+    <section class="card p-4 col-span-12 lg:col-span-7">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Backend verdicts (last 30 min)</h2>
+      <div class="space-y-3" id="backends"></div>
+    </section>
+
+    <!-- Discovery -->
+    <section class="card p-4 col-span-12 lg:col-span-5 flex flex-col">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Discovery (cumulative)</h2>
+      <div class="grid grid-cols-3 gap-2 text-center">
+        <div>
+          <div class="text-xs text-slate-400">DNS hit</div>
+          <div class="text-2xl font-bold num text-emerald-300" id="disc-dns">—</div>
+        </div>
+        <div>
+          <div class="text-xs text-slate-400">Serper hit</div>
+          <div class="text-2xl font-bold num text-amber-300" id="disc-serper">—</div>
+        </div>
+        <div>
+          <div class="text-xs text-slate-400">Failed</div>
+          <div class="text-2xl font-bold num text-rose-300" id="disc-failed">—</div>
+        </div>
+      </div>
+      <div class="mt-auto pt-4">
+        <div class="flex h-2 rounded overflow-hidden bg-slate-800">
+          <div id="disc-share-dns"    class="bg-emerald-500" style="width:0%"></div>
+          <div id="disc-share-serper" class="bg-amber-400"   style="width:0%"></div>
+          <div id="disc-share-failed" class="bg-rose-500"    style="width:0%"></div>
+        </div>
+        <div class="grid grid-cols-3 gap-1 text-[11px] text-slate-400 mt-1 num text-center">
+          <span>DNS <span id="disc-pct-dns">—</span>%</span>
+          <span>Serper <span id="disc-pct-serper">—</span>%</span>
+          <span>Failed <span id="disc-pct-failed">—</span>%</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-2 num">
+          Hit rate <b id="disc-hit-rate" class="text-slate-200">—</b>% of
+          <span id="disc-total" class="text-slate-200">—</span> input
+        </div>
+      </div>
+    </section>
+
+    <!-- Run timeline (entire run) -->
+    <section class="card p-4 col-span-12">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 mb-2">
+        <h2 class="text-sm font-semibold text-slate-300">Run timeline (per hour)</h2>
+        <div class="text-xs text-slate-400 num">
+          started <span id="run-started" class="text-slate-200">—</span>
+          · elapsed <span id="run-elapsed" class="text-slate-200">—</span>
+          · <span id="run-buckets" class="text-slate-200">—</span> h
+        </div>
+      </div>
+      <div style="position:relative;height:220px"><canvas id="run-history-chart"></canvas></div>
+      <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400 num" id="run-legend">
+        <span><i class="inline-block w-2 h-2 mr-1 align-middle rounded-sm" style="background:#10b981"></i>valid</span>
+        <span><i class="inline-block w-2 h-2 mr-1 align-middle rounded-sm" style="background:#f59e0b"></i>catch_all</span>
+        <span><i class="inline-block w-2 h-2 mr-1 align-middle rounded-sm" style="background:#f43f5e"></i>invalid</span>
+        <span><i class="inline-block w-2 h-2 mr-1 align-middle rounded-sm" style="background:#64748b"></i>error/unknown</span>
+        <span><i class="inline-block w-2 h-2 mr-1 align-middle rounded-sm" style="background:#7f1d1d"></i>discovery_failed</span>
+      </div>
+    </section>
+
+    <!-- Recent validated -->
+    <section class="card p-4 col-span-12 lg:col-span-7">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Recent validations</h2>
+      <div class="overflow-auto" style="max-height:380px">
+        <table class="tight w-full mono">
+          <thead class="text-slate-400 text-left">
+            <tr><th>id</th><th>email</th><th>rk</th><th>bb</th><th>zuhal</th><th>when</th></tr>
+          </thead>
+          <tbody id="recent-validated"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Top errors -->
+    <section class="card p-4 col-span-12 lg:col-span-5">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Top errors (last hour)</h2>
+      <div class="overflow-auto" style="max-height:380px">
+        <table class="tight w-full mono">
+          <thead class="text-slate-400 text-left">
+            <tr><th>#</th><th>src</th><th>message</th></tr>
+          </thead>
+          <tbody id="top-errors"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="mt-6 text-xs text-slate-500">read-only · 2s poll · server cache ~1.5s</footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
