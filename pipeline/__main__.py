@@ -14,7 +14,9 @@ from pipeline.cli import parse_args
 from pipeline.config import PipelineConfig
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer
 from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
-from pipeline.dispatcher import Dispatcher, confidence_tier
+from pipeline.dispatcher import Dispatcher
+from pipeline._dispatch_helpers import confidence_tier
+from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
@@ -181,8 +183,31 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 zuhal=zuhal_client,
                 serper=dispatcher_serper,
             )
-            tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
+            smtp_done_event = asyncio.Event()
+
+            async def _smtp_dispatcher_task() -> None:
+                try:
+                    await dispatcher.run()
+                finally:
+                    smtp_done_event.set()
+
+            tasks.append(asyncio.create_task(_smtp_dispatcher_task(), name="dispatcher"))
             logger.info("Dispatcher started (concurrency=%d)", config.dispatch_concurrency)
+
+            if zuhal_client is not None and config.zuhal_decoupled:
+                zuhal_dispatcher = ZuhalDispatcher(
+                    config=config,
+                    conn=conn,
+                    zuhal=zuhal_client,
+                    cost_tracker=cost_tracker,
+                    stop_event=stop_event,
+                    smtp_done_event=smtp_done_event,
+                )
+                tasks.append(asyncio.create_task(zuhal_dispatcher.run(), name="zuhal-dispatcher"))
+                logger.info(
+                    "Zuhal dispatcher started — decoupled rescue worker (concurrency=%d)",
+                    config.zuhal_concurrency,
+                )
 
         if not tasks:
             logger.error("No workers to run — check flags")

@@ -100,6 +100,10 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Minimum emails before flushing a bbops batch")
     parser.add_argument("--bbops-max-inflight", type=int, default=12,
                         help="Concurrent in-flight bbops batches")
+    parser.add_argument("--bbops-flush-interval-s", type=float, default=None,
+                        help="Seconds before flushing a partial bbops batch")
+    parser.add_argument("--bbops-poll-interval-s", type=float, default=None,
+                        help="Seconds between bbops result-polling cycles")
 
     # Rate limits
     parser.add_argument("--serper-rate-limit", type=int, default=500,
@@ -110,6 +114,14 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Concurrent Zuhal fallback probes")
     parser.add_argument("--zuhal-on-both-invalid", action="store_true", default=False,
                         help="Run Zuhal rescue even when both SMTP backends return invalid")
+    parser.add_argument("--zuhal-decoupled", dest="zuhal_decoupled", action="store_true", default=None,
+                        help="Run Zuhal rescue in a separate worker pool (default: on)")
+    parser.add_argument("--no-zuhal-decoupled", dest="zuhal_decoupled", action="store_false",
+                        help="Run Zuhal inline inside the SMTP dispatcher (legacy behavior)")
+    parser.add_argument("--zuhal-poll-interval-s", type=float, default=None,
+                        help="Zuhal worker poll interval when queue is empty")
+    parser.add_argument("--zuhal-chunk-size", type=int, default=None,
+                        help="Records claimed per Zuhal-worker poll cycle")
 
     # Backoff
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")

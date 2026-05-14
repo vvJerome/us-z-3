@@ -77,6 +77,9 @@ class PipelineConfig(BaseSettings):
     # --- Zuhal fallback backend ---
     zuhal_concurrency: int = Field(default=5, ge=1)
     zuhal_on_both_invalid: bool = False
+    zuhal_decoupled: bool = True
+    zuhal_poll_interval_s: float = 5.0
+    zuhal_chunk_size: int = Field(default=20, ge=1)
 
     # --- Backoff ---
     max_attempts: int = 3
@@ -103,6 +106,18 @@ class PipelineConfig(BaseSettings):
 
     # --- IPC: named pipe path for producer→dispatcher notification ---
     notify_pipe: str = ""
+
+    @model_validator(mode="after")
+    def _saturate_dispatcher_chunk(self) -> PipelineConfig:
+        if self.dispatch_chunk_size < self.dispatch_concurrency:
+            logging.getLogger("pipeline").warning(
+                "dispatch_chunk_size=%d < dispatch_concurrency=%d — auto-bumping chunk_size to %d "
+                "so the worker pool stays saturated",
+                self.dispatch_chunk_size, self.dispatch_concurrency,
+                self.dispatch_concurrency * 2,
+            )
+            self.dispatch_chunk_size = self.dispatch_concurrency * 2
+        return self
 
     @model_validator(mode="after")
     def _validate_flags(self) -> PipelineConfig:
