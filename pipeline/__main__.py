@@ -14,8 +14,10 @@ from pipeline.cli import parse_args
 from pipeline.config import PipelineConfig
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer
 from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
-from pipeline.dispatcher import Dispatcher, confidence_tier
+from pipeline.dispatcher import Dispatcher
+from pipeline._dispatch_helpers import confidence_tier
 from pipeline.producer import ProducerWorker
+from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.logger import setup_logging, get_logger
@@ -180,8 +182,32 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 zuhal=zuhal_client,
                 serper=dispatcher_serper,
             )
-            tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
+
+            smtp_done_event = asyncio.Event()
+
+            async def _smtp_dispatcher_task() -> None:
+                try:
+                    await dispatcher.run()
+                finally:
+                    smtp_done_event.set()
+
+            tasks.append(asyncio.create_task(_smtp_dispatcher_task(), name="dispatcher"))
             logger.info("Dispatcher started (concurrency=%d)", config.dispatch_concurrency)
+
+            if zuhal_client is not None and config.zuhal_decoupled:
+                zuhal_dispatcher = ZuhalDispatcher(
+                    config=config,
+                    conn=conn,
+                    zuhal=zuhal_client,
+                    cost_tracker=cost_tracker,
+                    stop_event=stop_event,
+                    smtp_done_event=smtp_done_event,
+                )
+                tasks.append(asyncio.create_task(zuhal_dispatcher.run(), name="zuhal-dispatcher"))
+                logger.info(
+                    "Zuhal dispatcher started — decoupled rescue worker (concurrency=%d)",
+                    config.zuhal_concurrency,
+                )
 
         if not tasks:
             logger.error("No workers to run — check flags")
@@ -276,6 +302,8 @@ async def cmd_reset(args) -> None:
             "discovery_failed": "DISCOVERY_FAILED",
             "validation_failed": "VALIDATION_FAILED",
             "cost_skipped": "COST_SKIPPED",
+            "needs_zuhal": "NEEDS_ZUHAL",
+            "zuhal_validating": "ZUHAL_VALIDATING",
         }
         state = state_map.get(args.status, args.status.upper())
         async with conn.execute(
@@ -289,6 +317,8 @@ async def cmd_reset(args) -> None:
             "discovery_failed": "DISCOVERY_FAILED",
             "validation_failed": "VALIDATION_FAILED",
             "cost_skipped": "COST_SKIPPED",
+            "needs_zuhal": "NEEDS_ZUHAL",
+            "zuhal_validating": "ZUHAL_VALIDATING",
         }
         state = state_map.get(args.status, args.status.upper())
         count = await db.reset_failed_records(conn, state, args.phase)
@@ -437,12 +467,14 @@ async def main() -> None:
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
+        "bbops_flush_interval_s", "bbops_poll_interval_s",
         "serper_rate_limit",
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
         "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
         "max_cost", "max_consecutive_errors", "dry_run",
         "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
         "zuhal_concurrency", "zuhal_rate_limit",
+        "zuhal_decoupled", "zuhal_poll_interval_s", "zuhal_chunk_size",
     ]:
         val = getattr(args, field_name, None)
         if val is not None:

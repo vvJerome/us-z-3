@@ -6,7 +6,6 @@ import logging
 import time
 
 import aiosqlite
-from rapidfuzz import fuzz
 
 from pipeline.config import PipelineConfig
 from pipeline.constants import (
@@ -19,18 +18,18 @@ from pipeline.utils.zuhal_client import ZuhalClient, ZuhalCircuitOpenError
 from pipeline.utils.serper_client import SerperClient
 from pipeline.models import BackendVerdict, PipelineHaltError, ReconcileResult
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.email_patterns import email_to_template
 from pipeline.utils.ms_verify import check_microsoft_email_async, is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.text import parse_name
 from pipeline import db
 from pipeline.db import State
+from pipeline._dispatch_helpers import (
+    compute_confidence_score,
+    confidence_tier,
+    record_pattern,
+)
 
 logger = logging.getLogger("pipeline.dispatcher")
-
-_GENERIC_PREFIXES: frozenset[str] = frozenset({
-    "info", "contact", "hello", "admin", "support", "sales", "help",
-})
 
 # Statuses that indicate the backend actually ran and returned a definitive answer
 _DEFINITIVE: frozenset[str] = frozenset({"valid", "invalid", "catch_all"})
@@ -83,77 +82,6 @@ def reconcile(
 
 
 # ---------------------------------------------------------------------------
-# Confidence scoring
-# ---------------------------------------------------------------------------
-
-def _name_matches_email(local: str, agent_name: str) -> bool:
-    parts = agent_name.strip().lower().split()
-    first = parts[0] if parts else ""
-    last = parts[-1] if len(parts) > 1 else ""
-    variants = [v for v in [
-        f"{first}{last}",
-        f"{first}.{last}",
-        f"{first}_{last}",
-        f"{first[0]}{last}" if first else "",
-        first,
-        last,
-    ] if v]
-    return bool(variants) and max(fuzz.ratio(local.lower(), v) for v in variants) >= 75
-
-
-def compute_confidence_score(
-    email: str,
-    candidate_domain: str | None,
-    strategy: str,
-    verdict: str,
-    agent_name: str = "",
-) -> int:
-    """Return an additive confidence score 0–4 for a validated email.
-
-    +1 domain match (email domain fuzzy-matches candidate_domain, ≥85 ratio)
-    strategy="with" (name-targeted search):
-        +1 name match (local part resembles agent_name)
-        +1 not a generic prefix (info/contact/admin/…)
-        +1 verdict == "valid" (not catch_all)
-    strategy="without" (generic/org search):
-        +1 IS a generic prefix
-        +1 verdict == "valid"
-    High ≥ 3, medium = 2, low ≤ 1 — see confidence_tier().
-    """
-    local, _, domain = email.partition("@")
-    score = 0
-
-    if candidate_domain:
-        d_norm = domain.rsplit(".", 1)[0].replace("-", "") if "." in domain else domain
-        c_norm = candidate_domain.rsplit(".", 1)[0].replace("-", "") if "." in candidate_domain else candidate_domain
-        if fuzz.ratio(d_norm, c_norm) >= 85:
-            score += 1
-
-    if strategy == "with":
-        if agent_name and _name_matches_email(local, agent_name):
-            score += 1
-        if local.lower() not in _GENERIC_PREFIXES:
-            score += 1
-        if verdict == "valid":
-            score += 1
-    else:
-        if local.lower() in _GENERIC_PREFIXES:
-            score += 1
-        if verdict == "valid":
-            score += 1
-
-    return score
-
-
-def confidence_tier(score: int) -> str:
-    if score >= 3:
-        return "high"
-    if score == 2:
-        return "medium"
-    return "low"
-
-
-# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -196,22 +124,8 @@ class Dispatcher:
             "validation_failed": 0,
             "disagreements": 0,
             "requeued": 0,
+            "handed_off_to_zuhal": 0,
         }
-
-    async def _record_pattern(
-        self,
-        email: str,
-        first: str,
-        last: str,
-        candidate_domain: str,
-        mx_provider: str | None,
-        success: bool,
-    ) -> None:
-        if not mx_provider:
-            return
-        tmpl = email_to_template(email, first, last, candidate_domain)
-        if tmpl:
-            await db.record_pattern_result(self.conn, mx_provider, tmpl, success=success)
 
     async def run(self) -> None:
         base_interval = self.config.dispatch_poll_interval_s
@@ -277,11 +191,12 @@ class Dispatcher:
 
         _hb.cancel()
         logger.info(
-            "Dispatcher finished — validated=%d failed=%d requeued=%d disagreements=%d",
+            "Dispatcher finished — validated=%d failed=%d requeued=%d disagreements=%d handed_off_to_zuhal=%d",
             self.stats["validated"],
             self.stats["validation_failed"],
             self.stats["requeued"],
             self.stats["disagreements"],
+            self.stats["handed_off_to_zuhal"],
         )
 
     async def _dispatch_record(self, row: aiosqlite.Row) -> None:
@@ -372,14 +287,14 @@ class Dispatcher:
                             dispatch_attempts_delta=0,  # MS probe is free, don't count
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
+                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                     self.stats["validated"] += 1
                     logger.info("MS-validated (no SMTP): %s → %s", unique_id, email)
                     return
 
                 if ms_status == "invalid":
                     pending_trace.append({"stage": "ms_skip", "outcome": "invalid", "email": email})
-                    await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=False)
+                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=False)
                     continue  # try next candidate
 
                 # unknown/error → fall through to SMTP backends
@@ -421,6 +336,27 @@ class Dispatcher:
                     return
 
                 if self.zuhal is not None:
+                    if self.config.zuhal_decoupled:
+                        # Hand off to the Zuhal worker queue so the SMTP worker
+                        # is freed immediately. Trace is flushed here; the
+                        # Zuhal worker appends its own trace entry on completion.
+                        async with self._write_lock:
+                            await db.handoff_to_zuhal(
+                                self.conn,
+                                unique_id,
+                                racknerd_status=rk_verdict.status if rk_verdict else "not_run",
+                                racknerd_message=rk_verdict.message if rk_verdict else "",
+                                racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
+                                bbops_status=bb_verdict.status if bb_verdict else "not_run",
+                                bbops_message=bb_verdict.message if bb_verdict else "",
+                                bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
+                                candidate_email=email,
+                            )
+                            await db.flush_process_trace(self.conn, unique_id, pending_trace)
+                        self.stats["handed_off_to_zuhal"] += 1
+                        logger.debug("Handed off to Zuhal queue: %s → %s", unique_id, email)
+                        return
+
                     if self.cost_tracker.ceiling_reached():
                         logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
                         await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
@@ -464,7 +400,7 @@ class Dispatcher:
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
                     if terminal:
-                        await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
+                        await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                         self.stats["validated"] += 1
                         logger.info(
                             "Zuhal-validated: %s → %s [zuhal=%s]",
@@ -505,7 +441,7 @@ class Dispatcher:
                         confidence_score=float(score),
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=True)
+                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                 self.stats["validated"] += 1
                 logger.info(
                     "Validated %s → %s [rk=%s bb=%s]",
@@ -516,7 +452,7 @@ class Dispatcher:
                 return
 
             # invalid — record pattern miss and try next candidate
-            await self._record_pattern(email, _first, _last, candidate_domain, mx_provider, success=False)
+            await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=False)
             logger.debug(
                 "Candidate %s for %s: %s — trying next",
                 email, unique_id, result.final_verdict,

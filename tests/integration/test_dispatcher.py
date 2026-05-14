@@ -237,7 +237,7 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.COST_SKIPPED
 
     async def test_cost_ceiling_before_zuhal_marks_cost_skipped(self, test_db, config):
-        """Cost ceiling hit mid-loop before Zuhal rescue → COST_SKIPPED not VALIDATED/FAILED."""
+        """Inline (legacy) path: cost ceiling hit mid-loop before Zuhal rescue → COST_SKIPPED."""
         from unittest.mock import AsyncMock as AM
         from pipeline.utils.zuhal_client import ZuhalClient
         from pipeline.models import ValidationResult
@@ -258,7 +258,9 @@ class TestDispatcherReconciliation:
         cost_tracker = CostTracker(max_cost=0.0)
         cost_tracker.record_call("zuhal")
 
-        dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, zuhal=zuhal)
+        # Force legacy inline path so the ceiling check before Zuhal applies
+        legacy_config = config.model_copy(update={"zuhal_decoupled": False})
+        dispatcher = Dispatcher(legacy_config, test_db, rk, bb, cost_tracker, zuhal=zuhal)
         rows = await db.fetch_pending_validation(test_db, limit=10)
         await dispatcher._process_record(rows[0])
 
@@ -327,6 +329,58 @@ class TestDispatcherReconciliation:
 
         assert row["record_state"] == State.VALIDATION_FAILED
         rk.verify.assert_not_called()
+
+    async def test_inconclusive_hands_off_to_zuhal_queue(self, test_db, config):
+        """Decoupled path: inconclusive SMTP → record routed to NEEDS_ZUHAL with SMTP verdicts persisted."""
+        from unittest.mock import AsyncMock as AM
+        from pipeline.utils.zuhal_client import ZuhalClient
+
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("error", "timeout")
+        bb = _mock_bbops("error", "timeout")
+
+        zuhal = MagicMock(spec=ZuhalClient)
+        zuhal.validate = AM()  # must NOT be called by the dispatcher
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=zuhal)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, final_verdict, racknerd_status, bbops_status, "
+            "candidate_email, dispatch_attempts FROM records WHERE unique_id = ?",
+            ("rec1",),
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.NEEDS_ZUHAL
+        assert row["final_verdict"] is None  # Zuhal worker owns final_verdict
+        assert row["racknerd_status"] == "error"
+        assert row["bbops_status"] == "error"
+        assert row["candidate_email"] == "test@example.com"
+        assert row["dispatch_attempts"] == 0  # handoff is not a retry
+        zuhal.validate.assert_not_called()
+        assert dispatcher.stats["handed_off_to_zuhal"] == 1
+
+    async def test_inconclusive_without_zuhal_requeues(self, test_db, config):
+        """Decoupled flag on but zuhal=None → re-queue as before (no NEEDS_ZUHAL handoff)."""
+        await _insert_discovered(test_db, "rec1")
+
+        rk = _mock_racknerd("error", "timeout")
+        bb = _mock_bbops("error", "timeout")
+
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=None)
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.DISCOVERED  # re-queued
+        assert dispatcher.stats["handed_off_to_zuhal"] == 0
 
     async def test_racknerd_blocked_bbops_valid_validates_on_bbops(self, test_db, config):
         """When Racknerd is blocked but bbops returns valid, the OR-of-valids reconciliation

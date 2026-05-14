@@ -76,6 +76,9 @@ class PipelineConfig(BaseSettings):
 
     # --- Zuhal fallback backend ---
     zuhal_concurrency: int = Field(default=5, ge=1)
+    zuhal_decoupled: bool = True
+    zuhal_poll_interval_s: float = 5.0
+    zuhal_chunk_size: int = Field(default=20, ge=1)
 
     # --- Backoff ---
     max_attempts: int = 3
@@ -101,6 +104,23 @@ class PipelineConfig(BaseSettings):
 
     # --- IPC: named pipe path for producer→dispatcher notification ---
     notify_pipe: str = ""
+
+    @model_validator(mode="after")
+    def _saturate_dispatcher_chunk(self) -> PipelineConfig:
+        # The dispatcher fetches `chunk_size` records per iteration and dispatches all
+        # of them into an asyncio.gather, with the Semaphore(concurrency) capping in-flight
+        # work. If chunk_size < concurrency, only chunk_size workers ever run at once —
+        # the remaining (concurrency - chunk_size) workers sit idle. Auto-bump so callers
+        # can set --dispatch-concurrency without remembering to also bump --dispatch-chunk-size.
+        if self.dispatch_chunk_size < self.dispatch_concurrency:
+            logging.getLogger("pipeline").warning(
+                "dispatch_chunk_size=%d < dispatch_concurrency=%d — auto-bumping chunk_size to %d "
+                "so the worker pool stays saturated",
+                self.dispatch_chunk_size, self.dispatch_concurrency,
+                self.dispatch_concurrency * 2,
+            )
+            self.dispatch_chunk_size = self.dispatch_concurrency * 2
+        return self
 
     @model_validator(mode="after")
     def _validate_flags(self) -> PipelineConfig:
