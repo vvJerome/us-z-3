@@ -23,6 +23,8 @@ class State:
     VALIDATION_FAILED = "VALIDATION_FAILED"
     DISCOVERY_FAILED  = "DISCOVERY_FAILED"
     COST_SKIPPED      = "COST_SKIPPED"
+    NEEDS_ZUHAL       = "NEEDS_ZUHAL"
+    ZUHAL_VALIDATING  = "ZUHAL_VALIDATING"
 
 
 SCHEMA_SQL = """
@@ -540,6 +542,118 @@ async def recover_stale_validating(
     )
     await conn.commit()
     return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Zuhal-queue helpers (decoupled rescue worker)
+# ---------------------------------------------------------------------------
+
+async def handoff_to_zuhal(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    *,
+    racknerd_status: str | None,
+    racknerd_message: str | None,
+    racknerd_verified_at: str | None,
+    bbops_status: str | None,
+    bbops_message: str | None,
+    bbops_verified_at: str | None,
+    candidate_email: str,
+) -> None:
+    """Persist SMTP verdicts and route the record to the Zuhal queue.
+
+    Atomic: SMTP-side outcome lands on the row in the same UPDATE that moves
+    state to NEEDS_ZUHAL. Does NOT write final_verdict (Zuhal worker owns that)
+    and does NOT increment dispatch_attempts (the handoff is a transition, not
+    a retry; the SMTP attempt is already counted).
+    """
+    await conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'NEEDS_ZUHAL',
+               racknerd_status = ?,
+               racknerd_message = ?,
+               racknerd_verified_at = ?,
+               bbops_status = ?,
+               bbops_message = ?,
+               bbops_verified_at = ?,
+               candidate_email = ?,
+               updated_at = datetime('now')
+         WHERE unique_id = ?
+        """,
+        (
+            racknerd_status,
+            racknerd_message,
+            racknerd_verified_at,
+            bbops_status,
+            bbops_message,
+            bbops_verified_at,
+            candidate_email,
+            unique_id,
+        ),
+    )
+    await conn.commit()
+
+
+async def fetch_pending_zuhal(
+    conn: aiosqlite.Connection,
+    limit: int = 10,
+) -> list[aiosqlite.Row]:
+    """Atomically claim up to `limit` NEEDS_ZUHAL rows by setting them to ZUHAL_VALIDATING."""
+    async with conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'ZUHAL_VALIDATING', updated_at = datetime('now')
+         WHERE id IN (
+             SELECT id FROM records WHERE record_state = 'NEEDS_ZUHAL' LIMIT ?
+         )
+        RETURNING *
+        """,
+        (limit,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def has_pending_zuhal(conn: aiosqlite.Connection) -> bool:
+    """Non-claiming check: True if any NEEDS_ZUHAL or ZUHAL_VALIDATING rows exist."""
+    async with conn.execute(
+        "SELECT 1 FROM records "
+        "WHERE record_state IN ('NEEDS_ZUHAL', 'ZUHAL_VALIDATING') LIMIT 1"
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def recover_stale_zuhal_validating(
+    conn: aiosqlite.Connection,
+    timeout_minutes: int = 5,
+) -> int:
+    """Return rows orphaned in ZUHAL_VALIDATING back to NEEDS_ZUHAL for retry."""
+    cursor = await conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'NEEDS_ZUHAL',
+               updated_at = datetime('now')
+         WHERE record_state = 'ZUHAL_VALIDATING'
+           AND updated_at < datetime('now', ?)
+        """,
+        (f"-{timeout_minutes} minutes",),
+    )
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def requeue_zuhal(conn: aiosqlite.Connection, unique_id: str) -> None:
+    """Return a ZUHAL_VALIDATING row to NEEDS_ZUHAL (circuit-open or 429 re-queue)."""
+    await conn.execute(
+        """
+        UPDATE records
+           SET record_state = 'NEEDS_ZUHAL',
+               updated_at = datetime('now')
+         WHERE unique_id = ?
+        """,
+        (unique_id,),
+    )
+    await conn.commit()
 
 
 async def flush_process_trace(

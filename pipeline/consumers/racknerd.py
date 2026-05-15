@@ -253,9 +253,12 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"SOCKS5 connect failed: {exc}"
 
+        sock_fd = sock.fileno()
+        smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
+        connected = False
         try:
-            smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
             await asyncio.wait_for(smtp.connect(), timeout=cfg.smtp_timeout_s)
+            connected = True
             return await self._run_smtp_probe(smtp, email, mx_host)
         except aiosmtplib.SMTPRecipientRefused as exc:
             return _classify_smtp_rejection(str(exc))
@@ -266,10 +269,25 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"probe error: {exc}"
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            if connected:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+                # Yield so the loop runs the deferred _call_connection_lost callback,
+                # GCs the transport, and clears loop._transports[fd].
+                await asyncio.sleep(0)
+            else:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            # Force-evict the WeakValueDictionary entry to prevent FD reuse races.
+            if sock_fd >= 0:
+                loop = asyncio.get_running_loop()
+                transports = getattr(loop, "_transports", None)
+                if transports is not None:
+                    transports.pop(sock_fd, None)
 
     async def _run_smtp_probe(
         self, smtp: aiosmtplib.SMTP, email: str, mx_host: str
