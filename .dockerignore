@@ -1,0 +1,45 @@
+# Virtual environment — largest exclusion (530 MB)
+.venv/
+venv/
+env/
+
+# Git history
+.git/
+.github/
+
+# Runtime artifacts — never baked into image
+runs/
+input/
+output/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# Claude harness
+.claude/
+
+# Dev / docs
+context/
+docs/
+tests/
+scripts/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+*.swp
+*~
+
+# Secrets
+.env

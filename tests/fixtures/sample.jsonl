@@ -1,0 +1,3 @@
+{"unique_id":"FL001","unique_agent_id":"AG001","business_name":"Acme Corp","agent_name":"John Doe","state":"FL","jurisdiction":"FL","position_type":"Registered Agent"}
+{"unique_id":"FL002","unique_agent_id":"AG002","business_name":"Beta LLC","agent_name":"Jane Smith","state":"FL","jurisdiction":"FL","position_type":"Officer"}
+{"unique_id":"TX001","unique_agent_id":"","business_name":"Gamma Inc","agent_name":"Bob Lee","state":"TX","jurisdiction":"TX","position_type":"Manager"}
