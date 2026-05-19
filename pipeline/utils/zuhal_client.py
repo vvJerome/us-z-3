@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import random
 from datetime import timedelta
@@ -133,6 +135,113 @@ class ZuhalClient:
             raw_status=data.get("status", ""),
             http_status=status,
         )
+
+
+    async def bulk_validate(
+        self,
+        emails: list[str],
+        poll_interval_s: float = 30.0,
+        max_poll_minutes: int = 120,
+        on_poll: "asyncio.coroutines | None" = None,
+    ) -> dict[str, str]:
+        """Upload emails as CSV, poll until complete, return {email: verdict} mapping.
+
+        Falls back to empty dict on any non-auth error so callers can retry via
+        single-verify path.
+        """
+        if self.dry_run:
+            return {e: "valid" for e in emails}
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["email"])
+        for e in emails:
+            writer.writerow([e])
+        csv_bytes = buf.getvalue().encode()
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        # Upload
+        form = aiohttp.FormData()
+        form.add_field("file", csv_bytes, filename="emails.csv", content_type="text/csv")
+        async with self.session.post(
+            "https://zuhal.io/api/v1/bulk/upload",
+            data=form,
+            headers=headers,
+        ) as resp:
+            if resp.status == 401:
+                raise PipelineHaltError("Zuhal API key invalid or expired (401)")
+            if resp.status == 402:
+                raise PipelineHaltError("Zuhal credit balance exhausted (402)")
+            resp.raise_for_status()
+            data = await resp.json()
+
+        job_id = data.get("job_id") or data.get("id") or data.get("file_id")
+        if not job_id:
+            logger.warning("Zuhal bulk upload returned no job_id: %s", data)
+            return {}
+
+        logger.info("Zuhal bulk job %s — %d emails uploaded", job_id, len(emails))
+
+        # Poll
+        deadline = asyncio.get_running_loop().time() + max_poll_minutes * 60
+        while True:
+            await asyncio.sleep(poll_interval_s)
+
+            if on_poll:
+                await on_poll()
+
+            async with self.session.get(
+                f"https://zuhal.io/api/v1/bulk/status/{job_id}",
+                headers=headers,
+            ) as resp:
+                resp.raise_for_status()
+                status_data = await resp.json()
+
+            status = status_data.get("status", "")
+            pct = status_data.get("percentage_complete", 0)
+            logger.info("Zuhal bulk %s: %s (%s%%)", job_id, status, pct)
+
+            if status == "Complete":
+                break
+            if status in ("Error", "Failed"):
+                logger.warning("Zuhal bulk job %s failed: %s", job_id, status_data)
+                return {}
+            if asyncio.get_running_loop().time() > deadline:
+                logger.warning("Zuhal bulk job %s timed out after %d min", job_id, max_poll_minutes)
+                return {}
+
+        # Download — endpoint returns JSON with a download_link, not the CSV directly
+        async with self.session.get(
+            f"https://zuhal.io/api/v1/bulk/download/{job_id}",
+            headers=headers,
+        ) as resp:
+            resp.raise_for_status()
+            download_data = await resp.json()
+
+        download_url = download_data.get("download_link") or download_data.get("url") or download_data.get("link")
+        if not download_url:
+            logger.warning("Zuhal bulk download returned no download_link for job %s: %s", job_id, download_data)
+            return {}
+
+        async with self.session.get(download_url) as resp:
+            resp.raise_for_status()
+            content = await resp.text(encoding="utf-8-sig")
+
+        results: dict[str, str] = {}
+        for row in csv.DictReader(io.StringIO(content)):
+            email = (row.get("email") or row.get("Email") or "").strip().lower()
+            verdict = (
+                row.get("email_status") or row.get("status") or
+                row.get("Email Status") or "unknown"
+            ).strip().lower()
+            if email:
+                if verdict == "accept-all":
+                    verdict = "catch_all"
+                results[email] = verdict
+
+        logger.info("Zuhal bulk %s: downloaded %d results", job_id, len(results))
+        return results
 
 
 class ZuhalCircuitOpenError(Exception):

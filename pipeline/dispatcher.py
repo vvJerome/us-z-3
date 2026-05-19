@@ -143,6 +143,9 @@ class Dispatcher:
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
         self._notify_reader = None
+        # Cached backpressure state — refreshed at most every 5 seconds
+        self._bp_cached_count: int = 0
+        self._bp_last_checked: float = 0.0
         self.stats: dict[str, int] = {
             "validated": 0,
             "validation_failed": 0,
@@ -452,6 +455,21 @@ class Dispatcher:
 
                 if self.zuhal is not None:
                     if self.config.zuhal_decoupled:
+                        # Backpressure: pause handoffs when Zuhal backlog is too deep.
+                        # Count is cached for 5 seconds to avoid per-record DB queries.
+                        if self.config.zuhal_backpressure_threshold > 0:
+                            now = time.monotonic()
+                            if now - self._bp_last_checked >= 5.0:
+                                self._bp_cached_count = await db.count_needs_zuhal(self.conn)
+                                self._bp_last_checked = now
+                            if self._bp_cached_count >= self.config.zuhal_backpressure_threshold:
+                                logger.debug(
+                                    "Zuhal backpressure: backlog=%d >= threshold=%d — pausing %.1fs",
+                                    self._bp_cached_count,
+                                    self.config.zuhal_backpressure_threshold,
+                                    self.config.zuhal_backpressure_sleep_s,
+                                )
+                                await asyncio.sleep(self.config.zuhal_backpressure_sleep_s)
                         async with self._write_lock:
                             await db.handoff_to_zuhal(
                                 self.conn,

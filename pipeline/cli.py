@@ -122,6 +122,16 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Zuhal worker poll interval when queue is empty")
     parser.add_argument("--zuhal-chunk-size", type=int, default=None,
                         help="Records claimed per Zuhal-worker poll cycle")
+    parser.add_argument("--zuhal-concurrency-min", type=int, default=None,
+                        help="Minimum concurrency when adaptive scaling backs off")
+    parser.add_argument("--zuhal-concurrency-max", type=int, default=None,
+                        help="Maximum concurrency adaptive scaling can reach")
+    parser.add_argument("--zuhal-backpressure-threshold", type=int, default=None,
+                        help="Pause SMTP handoffs when NEEDS_ZUHAL exceeds this (0=disabled)")
+    parser.add_argument("--zuhal-bulk-threshold", type=int, default=None,
+                        help="Switch to bulk CSV upload mode when backlog exceeds this")
+    parser.add_argument("--zuhal-bulk-batch-size", type=int, default=None,
+                        help="Emails per bulk upload batch")
 
     # Backoff
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")
