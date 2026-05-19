@@ -1,7 +1,7 @@
 """Unit tests for confidence scoring and tier calculation."""
 
 import pytest
-from pipeline.dispatcher import compute_confidence_score, confidence_tier
+from pipeline._dispatch_helpers import compute_confidence_score, confidence_tier
 
 
 class TestComputeConfidenceScore:
