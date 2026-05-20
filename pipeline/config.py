@@ -89,6 +89,7 @@ class PipelineConfig(BaseSettings):
     zuhal_bulk_threshold: int = Field(default=200, ge=1)
     zuhal_bulk_batch_size: int = Field(default=1000, ge=1)
     zuhal_bulk_poll_interval_s: float = 30.0
+    zuhal_bulk_concurrent_jobs: int = Field(default=1, ge=1)
     zuhal_bulk_stale_timeout_minutes: int = Field(default=120, ge=5)
 
     # --- Backoff ---

@@ -113,9 +113,17 @@ class ZuhalDispatcher:
         while not self.stop_event.is_set():
             backlog = await db.count_needs_zuhal(self.conn)
 
-            # Bulk mode: large backlog → upload CSV batch
+            # Bulk mode: large backlog → upload N concurrent CSV batches
             if backlog >= self.config.zuhal_bulk_threshold:
-                drained = await self._drain_bulk()
+                n_jobs = self.config.zuhal_bulk_concurrent_jobs
+                results = await asyncio.gather(
+                    *[self._drain_bulk() for _ in range(n_jobs)],
+                    return_exceptions=True,
+                )
+                drained = sum(r for r in results if isinstance(r, int))
+                for r in results:
+                    if isinstance(r, PipelineHaltError):
+                        raise r
                 if drained > 0:
                     consecutive_empty = 0
                     poll_interval = base_interval

@@ -132,6 +132,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Switch to bulk CSV upload mode when backlog exceeds this")
     parser.add_argument("--zuhal-bulk-batch-size", type=int, default=None,
                         help="Emails per bulk upload batch")
+    parser.add_argument("--zuhal-bulk-concurrent-jobs", type=int, default=None,
+                        help="Concurrent bulk upload jobs per worker (default 1)")
 
     # Backoff
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")
