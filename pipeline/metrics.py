@@ -64,7 +64,13 @@ async def serve_metrics(conn: aiosqlite.Connection, stop_event: asyncio.Event) -
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", _PORT)
-    await site.start()
+    try:
+        await site.start()
+    except OSError:
+        logger.warning("Metrics port %d already in use — running without metrics", _PORT)
+        await runner.cleanup()
+        await stop_event.wait()
+        return
     logger.info("Metrics endpoint running on :%d/metrics", _PORT)
 
     await stop_event.wait()
