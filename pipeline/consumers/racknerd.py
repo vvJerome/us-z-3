@@ -42,11 +42,7 @@ _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
 
 
 def _default_helo_hostname() -> str:
-    """Return a valid FQDN for SMTP EHLO/HELO.
-
-    socket.getfqdn() returns the short hostname when the VPS has no FQDN configured.
-    Per RFC 5321, an IP literal [x.x.x.x] is valid when no hostname is available.
-    """
+    """Return a valid FQDN for SMTP EHLO/HELO, or an IP literal fallback (with warning)."""
     fqdn = socket.getfqdn()
     if "." in fqdn:
         return fqdn
@@ -55,24 +51,35 @@ def _default_helo_hostname() -> str:
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return f"[{ip}]"
+        literal = f"[{ip}]"
     except Exception:
-        return f"[{socket.gethostbyname(socket.gethostname())}]"
+        literal = f"[{socket.gethostbyname(socket.gethostname())}]"
+    _log.warning(
+        "No FQDN available — falling back to IP literal MAIL FROM (%s). "
+        "Many MX servers reject `verify@%s`; set RACKNERD_HELO_HOSTNAME=<fqdn> in .env to override.",
+        literal, literal,
+    )
+    return literal
 
 
 def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
     """Map a SMTPRecipientRefused exception string to (status, message).
 
-    aiosmtplib raises instead of returning (code, msg) for 5xx RCPT TO responses,
-    so _INVALID_KEYWORDS and _SPAMHAUS_KEYWORDS checks must happen on the exception
-    string rather than in _run_smtp_probe's tuple-return path.
+    aiosmtplib only raises SMTPRecipientRefused for 5xx RCPT TO responses, which are
+    permanent per RFC 5321 §4.2.1. Spamhaus-style reputation rejections route to `blocked`;
+    everything else is `invalid`.
     """
     lower = exc_str.lower()
     if any(kw in lower for kw in _SPAMHAUS_KEYWORDS):
         return "blocked", f"SMTP error: {exc_str}"
-    if any(kw in lower for kw in _INVALID_KEYWORDS):
-        return "invalid", f"SMTP error: {exc_str}"
-    return "error", f"SMTP error: {exc_str}"
+    return "invalid", f"SMTP error: {exc_str}"
+
+
+def _classify_5xx(code: int, msg: str) -> tuple[str, str]:
+    """Map a 5xx tuple-return SMTP response to (status, message). Spamhaus → blocked; else invalid."""
+    if any(kw in msg.lower() for kw in _SPAMHAUS_KEYWORDS):
+        return "blocked", f"{code} {msg}"
+    return "invalid", f"{code} {msg}"
 
 
 @dataclass
@@ -83,6 +90,19 @@ class RacknerdConfig:
     smtp_timeout_s: float = RACKNERD_SMTP_TIMEOUT_S
     helo_hostname: str = field(default_factory=_default_helo_hostname)
     direct: bool = False  # skip SOCKS5 tunnel, connect directly (use when running on the egress VPS)
+
+    def __post_init__(self) -> None:
+        if not self.helo_hostname or not self.helo_hostname.strip():
+            raise ValueError("RacknerdConfig.helo_hostname must be non-empty")
+        if self.helo_hostname.startswith("[") and self.helo_hostname.endswith("]"):
+            # Domain literals as the MAIL FROM domain are widely rejected (RFC 5321 § 4.1.3 allows
+            # them, but Proofpoint/Outlook/etc. respond 501/550). Warn loudly so the misconfig
+            # that produced the 49.12.127.119 incident is visible at startup.
+            _log.warning(
+                "RacknerdConfig.helo_hostname=%s is an IP literal — MAIL FROM:<verify@%s> "
+                "will be rejected by many MX servers. Set RACKNERD_HELO_HOSTNAME=<fqdn>.",
+                self.helo_hostname, self.helo_hostname,
+            )
 
 
 class _SpamhausGuard:
@@ -253,6 +273,13 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"SOCKS5 connect failed: {exc}"
 
+        # aiosmtplib takes ownership of `sock` once smtp.connect() succeeds.
+        # The transport's _call_connection_lost is deferred via call_soon and
+        # only then drops the strong ref that keeps loop._transports[fd] alive
+        # (it's a WeakValueDictionary). If we don't yield + force-evict, a
+        # concurrent probe can grab the recycled FD before cleanup runs and
+        # asyncio raises "File descriptor X is used by transport" — the error
+        # then cascades into bbops/Zuhal because the selector is corrupted.
         sock_fd = sock.fileno()
         smtp = aiosmtplib.SMTP(hostname=None, port=None, timeout=cfg.smtp_timeout_s, sock=sock)
         connected = False
@@ -274,15 +301,21 @@ class RacknerdConsumer:
                     smtp.close()
                 except Exception:
                     pass
-                # Yield so the loop runs the deferred _call_connection_lost callback,
-                # GCs the transport, and clears loop._transports[fd].
+                # Yield so the loop runs the deferred _call_connection_lost
+                # callback, GCs the transport, and clears loop._transports[fd].
                 await asyncio.sleep(0)
             else:
+                # smtp.connect() may have partially constructed the transport
+                # (registering fd in loop._transports) before raising — close
+                # the raw socket so the OS frees the FD.
                 try:
                     sock.close()
                 except Exception:
                     pass
-            # Force-evict the WeakValueDictionary entry to prevent FD reuse races.
+            # Always force-evict the WeakValueDictionary entry. Handles both the
+            # successful path (in case GC is delayed under load) and the partial-
+            # connect failure path (where the transport was registered but never
+            # got a clean close()).
             if sock_fd >= 0:
                 loop = asyncio.get_running_loop()
                 transports = getattr(loop, "_transports", None)
@@ -308,15 +341,10 @@ class RacknerdConsumer:
             if not isinstance(code, int):
                 return "error", "malformed SMTP response (no code)"
 
-            msg_lower = msg.lower()
             if 200 <= code <= 399:
                 return "valid", f"{code} {msg}"
             if code >= 500:
-                if any(kw in msg_lower for kw in _SPAMHAUS_KEYWORDS):
-                    return "blocked", f"{code} {msg}"
-                if any(kw in msg_lower for kw in _INVALID_KEYWORDS):
-                    return "invalid", f"{code} {msg}"
-                return "error", f"{code} {msg}"
+                return _classify_5xx(code, msg)
             # 4xx — temporary failure, try next MX
             return "error", f"{code} {msg} (4xx temporary)"
         finally:

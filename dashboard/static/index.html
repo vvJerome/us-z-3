@@ -25,24 +25,30 @@
   @keyframes pulse-stale { 0%,100%{opacity:1} 50%{opacity:0.35} }
   .bar { background:#1f2a48; border-radius:6px; overflow:hidden; }
   .bar-fill { height:8px; background:linear-gradient(90deg,#3b82f6,#22d3ee); }
+  .tab { padding:3px 10px; border-radius:6px; cursor:pointer; border:1px solid #1f2a48; color:#8da3c7; font-size:11px; white-space:nowrap; }
+  .tab:hover { background:#1a2540; }
+  .tab.active { background:#1f3560; border-color:#3b82f6; color:#e6edf3; font-weight:600; }
   table.tight th, table.tight td { padding:4px 8px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
 </style>
 </head>
 <body class="min-h-screen p-4 md:p-6">
-  <header class="flex flex-wrap items-center justify-between gap-2 mb-4">
-    <div class="flex items-center gap-3">
-      <span id="indicator" class="indicator" title="live"></span>
-      <div>
-        <div class="text-xs uppercase tracking-wider text-slate-400">us-z-3 pipeline</div>
-        <h1 class="text-xl font-semibold num" id="run-id">—</h1>
+  <header class="mb-4">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-3">
+        <span id="indicator" class="indicator" title="live"></span>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-slate-400">us-z-3 pipeline</div>
+          <h1 class="text-xl font-semibold num" id="run-id">—</h1>
+        </div>
+      </div>
+      <div class="text-xs text-slate-400 text-right">
+        <span id="as-of">—</span>
+        · build <span id="build-ms" class="num">—</span> ms
+        · <span id="poll-status" class="num">polling</span>
       </div>
     </div>
-    <div class="text-xs text-slate-400 text-right">
-      <span id="as-of">—</span>
-      · build <span id="build-ms" class="num">—</span> ms
-      · <span id="poll-status" class="num">polling</span>
-    </div>
+    <nav id="run-tabs" class="flex gap-1 flex-wrap mt-2"></nav>
   </header>
 
   <main class="grid grid-cols-12 gap-4">
