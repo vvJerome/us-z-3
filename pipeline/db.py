@@ -623,6 +623,28 @@ async def has_pending_zuhal(conn: aiosqlite.Connection) -> bool:
         return await cursor.fetchone() is not None
 
 
+async def count_needs_zuhal(conn: aiosqlite.Connection) -> int:
+    """Return current size of the NEEDS_ZUHAL backlog (non-claiming)."""
+    async with conn.execute(
+        "SELECT COUNT(*) FROM records WHERE record_state = 'NEEDS_ZUHAL'"
+    ) as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def touch_zuhal_validating(conn: aiosqlite.Connection, unique_ids: list[str]) -> None:
+    """Refresh updated_at on ZUHAL_VALIDATING rows to prevent stale-recovery eviction."""
+    if not unique_ids:
+        return
+    placeholders = ",".join("?" * len(unique_ids))
+    await conn.execute(
+        f"UPDATE records SET updated_at = datetime('now') "
+        f"WHERE unique_id IN ({placeholders}) AND record_state = 'ZUHAL_VALIDATING'",
+        unique_ids,
+    )
+    await conn.commit()
+
+
 async def recover_stale_zuhal_validating(
     conn: aiosqlite.Connection,
     timeout_minutes: int = 5,

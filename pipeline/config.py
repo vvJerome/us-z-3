@@ -77,10 +77,21 @@ class PipelineConfig(BaseSettings):
 
     # --- Zuhal fallback backend ---
     zuhal_concurrency: int = Field(default=5, ge=1)
+    zuhal_concurrency_min: int = Field(default=2, ge=1)
+    zuhal_concurrency_max: int = Field(default=50, ge=1)
     zuhal_on_both_invalid: bool = False
     zuhal_decoupled: bool = True
     zuhal_poll_interval_s: float = 5.0
     zuhal_chunk_size: int = Field(default=20, ge=1)
+    # Backpressure: pause SMTP handoffs when NEEDS_ZUHAL exceeds this (0 = disabled)
+    zuhal_backpressure_threshold: int = Field(default=5000, ge=0)
+    zuhal_backpressure_sleep_s: float = 2.0
+    # Bulk API: use CSV upload when backlog exceeds threshold
+    zuhal_bulk_threshold: int = Field(default=200, ge=1)
+    zuhal_bulk_batch_size: int = Field(default=1000, ge=1)
+    zuhal_bulk_poll_interval_s: float = 30.0
+    zuhal_bulk_concurrent_jobs: int = Field(default=1, ge=1)
+    zuhal_bulk_stale_timeout_minutes: int = Field(default=120, ge=5)
 
     # --- Backoff ---
     max_attempts: int = 3

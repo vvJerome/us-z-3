@@ -143,6 +143,9 @@ class Dispatcher:
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
         self._notify_reader = None
+        # Cached backpressure state — refreshed at most every 5 seconds
+        self._bp_cached_count: int = 0
+        self._bp_last_checked: float = 0.0
         self.stats: dict[str, int] = {
             "validated": 0,
             "validation_failed": 0,
@@ -325,14 +328,14 @@ class Dispatcher:
                             dispatch_attempts_delta=0,  # MS probe is free, don't count
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    await record_pattern(self.conn,email, _first, _last, candidate_domain, mx_provider, success=True)
+                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                     self.stats["validated"] += 1
                     logger.info("MS-validated (no SMTP): %s → %s", unique_id, email)
                     return
 
                 if ms_status == "invalid":
                     pending_trace.append({"stage": "ms_skip", "outcome": "invalid", "email": email})
-                    await record_pattern(self.conn,email, _first, _last, candidate_domain, mx_provider, success=False)
+                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=False)
                     continue  # try next candidate
 
                 # unknown/error → fall through to SMTP backends
@@ -372,11 +375,10 @@ class Dispatcher:
                         final_verdict=rk_verdict.status,
                         candidate_email=email,
                         confidence_score=float(score),
+                        dispatch_attempts_delta=1,
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn,
-                    email, _first, _last, candidate_domain, mx_provider, success=True
-                )
+                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                 self.stats["validated"] += 1
                 logger.info("Racknerd-validated (bbops skipped): %s → %s", unique_id, email)
                 return
@@ -452,6 +454,21 @@ class Dispatcher:
 
                 if self.zuhal is not None:
                     if self.config.zuhal_decoupled:
+                        # Backpressure: pause handoffs when Zuhal backlog is too deep.
+                        # Count is cached for 5 seconds to avoid per-record DB queries.
+                        if self.config.zuhal_backpressure_threshold > 0:
+                            now = time.monotonic()
+                            if now - self._bp_last_checked >= 5.0:
+                                self._bp_cached_count = await db.count_needs_zuhal(self.conn)
+                                self._bp_last_checked = now
+                            if self._bp_cached_count >= self.config.zuhal_backpressure_threshold:
+                                logger.debug(
+                                    "Zuhal backpressure: backlog=%d >= threshold=%d — pausing %.1fs",
+                                    self._bp_cached_count,
+                                    self.config.zuhal_backpressure_threshold,
+                                    self.config.zuhal_backpressure_sleep_s,
+                                )
+                                await asyncio.sleep(self.config.zuhal_backpressure_sleep_s)
                         async with self._write_lock:
                             await db.handoff_to_zuhal(
                                 self.conn,
@@ -508,13 +525,12 @@ class Dispatcher:
                             candidate_email=email,
                             confidence_score=float(score),
                             zuhal_status_override=zuhal_status,
+                            dispatch_attempts_delta=1,
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
                     if terminal:
-                        await record_pattern(self.conn,
-                            email, _first, _last, candidate_domain, mx_provider, success=True
-                        )
+                        await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                         self.stats["validated"] += 1
                         logger.info(
                             "Zuhal-validated: %s → %s [zuhal=%s]",
@@ -559,11 +575,10 @@ class Dispatcher:
                         final_verdict=result.final_verdict,
                         candidate_email=email,
                         confidence_score=float(score),
+                        dispatch_attempts_delta=1,
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn,
-                    email, _first, _last, candidate_domain, mx_provider, success=True
-                )
+                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                 self.stats["validated"] += 1
                 logger.info(
                     "Validated %s → %s [rk=%s bb=%s]",
@@ -613,12 +628,11 @@ class Dispatcher:
                             candidate_email=email,
                             confidence_score=float(score),
                             zuhal_status_override=zuhal_status,
+                            dispatch_attempts_delta=1,
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
-                    await record_pattern(self.conn,
-                        email, _first, _last, candidate_domain, mx_provider, success=True
-                    )
+                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
                     self.stats["validated"] += 1
                     logger.info(
                         "Zuhal-rescued both-invalid: %s → %s [zuhal=%s]",
@@ -628,7 +642,7 @@ class Dispatcher:
                 # Zuhal also invalid/error — fall through to try next candidate
 
             # invalid — record pattern miss and try next candidate
-            await record_pattern(self.conn,email, _first, _last, candidate_domain, mx_provider, success=False)
+            await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=False)
             logger.debug(
                 "Candidate %s for %s: %s — trying next",
                 email, unique_id, result.final_verdict,
