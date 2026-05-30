@@ -82,6 +82,10 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         if not config.producer_only:
             # --- Racknerd consumer setup ---
             shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+            rk_helo_kwargs: dict = {}
+            if config.racknerd_helo_hostname:
+                rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
+
             if config.racknerd_enabled and config.racknerd_direct:
                 logger.info("Racknerd in direct mode (no SOCKS5 tunnel)")
                 tunnel = None
@@ -89,6 +93,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     concurrency=config.racknerd_concurrency,
                     smtp_timeout_s=config.racknerd_smtp_timeout_s,
                     direct=True,
+                    **rk_helo_kwargs,
                 )
                 racknerd = RacknerdConsumer(None, rk_config, resolver=shared_resolver)
             elif config.racknerd_enabled:
@@ -108,8 +113,10 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     socks_port=config.racknerd_socks_port,
                     concurrency=config.racknerd_concurrency,
                     smtp_timeout_s=config.racknerd_smtp_timeout_s,
+                    **rk_helo_kwargs,
                 )
                 racknerd = RacknerdConsumer(tunnel, rk_config, resolver=shared_resolver)
+                logger.info("Racknerd MAIL FROM domain: %s", rk_config.helo_hostname)
             else:
                 logger.info("Racknerd disabled (--no-racknerd) — bbops + Zuhal only")
                 tunnel = None
@@ -461,7 +468,7 @@ async def main() -> None:
         "dispatch_poll_interval_s", "dispatch_chunk_size",
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
-        "racknerd_concurrency", "racknerd_smtp_timeout_s",
+        "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
         "serper_rate_limit",
         "max_attempts", "backoff_base_dns", "backoff_base_serper",
