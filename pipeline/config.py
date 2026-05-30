@@ -58,6 +58,7 @@ class PipelineConfig(BaseSettings):
     racknerd_socks_port: int = 1080
     racknerd_concurrency: int = Field(default=25, ge=1)
     racknerd_smtp_timeout_s: float = 8.0
+    racknerd_helo_hostname: str | None = None  # override SMTP EHLO/MAIL FROM domain; falls back to _default_helo_hostname()
 
     # --- bbops async backend ---
     bbops_base_url: str = "https://email-verifier.bbops.io"

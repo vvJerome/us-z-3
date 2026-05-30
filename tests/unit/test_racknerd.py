@@ -131,13 +131,50 @@ class TestRacknerdSmtpResponseParsing:
         )
         assert status == "blocked"
 
-    def test_generic_5xx_rejection_stays_error(self):
-        """Unknown 5xx must stay as error, not promoted to invalid or blocked."""
+    def test_generic_5xx_rejection_is_invalid(self):
+        """Unknown 5xx is permanent per RFC 5321 → invalid (not error)."""
         from pipeline.consumers.racknerd import _classify_smtp_rejection
         status, _ = _classify_smtp_rejection(
             "550, 5.7.1 Service unavailable for unknown reason"
         )
-        assert status == "error"
+        assert status == "invalid"
+
+    def test_domain_literal_rejection_is_invalid(self):
+        """501 domain-literal reject (the bug that produced 100% racknerd error rate)."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "501, <verify@[49.12.127.119]>: domain literals not allowed"
+        )
+        assert status == "invalid"
+
+    def test_unknown_host_rejection_is_invalid(self):
+        """550 Unknown host on MAIL FROM domain is a permanent reject."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "550, Unknown host: [49.12.127.119]"
+        )
+        assert status == "invalid"
+
+    def test_proofpoint_tss11_is_blocked(self):
+        """Proofpoint TSS11 reputation reject classifies as blocked via 'blocked' keyword."""
+        from pipeline.consumers.racknerd import _classify_smtp_rejection
+        status, _ = _classify_smtp_rejection(
+            "553, 5.7.2 [TSS11] All messages from 107.172.159.170 will be permanently deferred; "
+            "Retrying will NOT succeed. blocked"
+        )
+        assert status == "blocked"
+
+    def test_classify_5xx_unknown_is_invalid(self):
+        """_classify_5xx tuple-return path: unknown 5xx → invalid."""
+        from pipeline.consumers.racknerd import _classify_5xx
+        status, _ = _classify_5xx(550, "permanent failure of some kind")
+        assert status == "invalid"
+
+    def test_classify_5xx_spamhaus_is_blocked(self):
+        """_classify_5xx tuple-return path: spamhaus keyword → blocked."""
+        from pipeline.consumers.racknerd import _classify_5xx
+        status, _ = _classify_5xx(554, "Client host blocked by spamhaus zen.spamhaus.org")
+        assert status == "blocked"
 
     def test_helo_hostname_is_not_private(self):
         """Default helo_hostname must not be the placeholder private hostname."""
@@ -146,13 +183,13 @@ class TestRacknerdSmtpResponseParsing:
         assert config.helo_hostname  # not empty
 
     def test_helo_hostname_is_valid_fqdn_or_ip_literal(self):
-        """When socket.getfqdn() returns a non-FQDN, _default_helo_hostname returns IP literal."""
+        """When socket.getfqdn() returns a non-FQDN, _default_helo_hostname returns IP literal (with warning)."""
         from unittest.mock import patch
         from pipeline.consumers.racknerd import _default_helo_hostname
 
         with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"):
             result = _default_helo_hostname()
-        # Must be an IP literal [x.x.x.x] since there's no dot in the mock FQDN
+        # Backward compat: still returns IP literal — but RacknerdConfig will warn.
         assert result.startswith("[") and result.endswith("]")
 
     def test_helo_hostname_uses_fqdn_when_valid(self):
@@ -163,3 +200,20 @@ class TestRacknerdSmtpResponseParsing:
         with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="mail.example.com"):
             result = _default_helo_hostname()
         assert result == "mail.example.com"
+
+    def test_explicit_helo_override_wins(self):
+        """An explicit helo_hostname on RacknerdConfig overrides the default factory."""
+        config = RacknerdConfig(helo_hostname="verifier.bbops.io")
+        assert config.helo_hostname == "verifier.bbops.io"
+
+    def test_empty_helo_rejected(self):
+        """Empty helo_hostname is a misconfiguration and must raise."""
+        with pytest.raises(ValueError, match="helo_hostname must be non-empty"):
+            RacknerdConfig(helo_hostname="")
+
+    def test_ip_literal_helo_emits_warning(self, caplog):
+        """IP-literal helo_hostname is allowed (backward compat) but logs a warning."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="pipeline.racknerd"):
+            RacknerdConfig(helo_hostname="[49.12.127.119]")
+        assert any("IP literal" in rec.message for rec in caplog.records)

@@ -66,7 +66,7 @@ class ZuhalClient:
 
         try:
             return await with_backoff(
-                lambda: self._breaker.call(self._call_api, email),
+                lambda: self._breaker.call_async(self._call_api, email),
                 max_attempts=self.max_attempts,
                 base_delay=self._base,
                 max_delay=self._max_delay,
@@ -79,6 +79,15 @@ class ZuhalClient:
         except aiobreaker.CircuitBreakerError:
             logger.warning("Zuhal circuit breaker open — records will be re-queued for retry")
             raise ZuhalCircuitOpenError()
+        except _RetryableHTTPError as exc:
+            # 429 storms must always re-queue, never burn the record. Backoff
+            # exhaustion before the breaker opens (fail_max=5) used to bubble
+            # this exception up to the dispatcher's generic Exception handler,
+            # which marked the record VALIDATION_FAILED with zuhal_status='error'.
+            if exc.status == 429:
+                logger.warning("Zuhal 429 after %d retries — re-queueing %s", self.max_attempts, email)
+                raise ZuhalCircuitOpenError() from exc
+            raise
 
     async def _call_api(self, email: str) -> ValidationResult:
         headers = {

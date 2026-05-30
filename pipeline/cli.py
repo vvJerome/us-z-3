@@ -92,6 +92,9 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Concurrent SMTP probes via Racknerd")
     parser.add_argument("--racknerd-smtp-timeout-s", type=float, default=15.0,
                         help="Per-SMTP-operation timeout")
+    parser.add_argument("--racknerd-helo", dest="racknerd_helo_hostname", default=None,
+                        help="SMTP EHLO/MAIL FROM domain (overrides RACKNERD_HELO_HOSTNAME env). "
+                             "Use a real FQDN; IP literals are rejected by most MX servers.")
 
     # bbops
     parser.add_argument("--bbops-base-url", default=None, help="bbops.io base URL")

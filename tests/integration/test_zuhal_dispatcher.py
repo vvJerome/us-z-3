@@ -1,4 +1,5 @@
-"""Integration tests for ZuhalDispatcher with real SQLite and mocked Zuhal client."""
+"""Integration tests for the decoupled ZuhalDispatcher worker."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,9 +13,13 @@ import pytest
 from pipeline import db
 from pipeline.config import PipelineConfig
 from pipeline.db import State
-from pipeline.models import ValidationResult
+from pipeline.models import PipelineHaltError, ValidationResult
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.zuhal_client import ZuhalCircuitOpenError
+from pipeline.utils.zuhal_client import (
+    ZuhalCircuitOpenError,
+    ZuhalClient,
+    _RetryableHTTPError,
+)
 from pipeline.zuhal_dispatcher import ZuhalDispatcher
 
 pytestmark = pytest.mark.asyncio
@@ -38,260 +43,281 @@ def config(tmp_path: Path) -> PipelineConfig:
         db_path=tmp_path / "test.db",
         log_dir=tmp_path / "logs",
         zuhal_concurrency=2,
-        zuhal_poll_interval_s=0.05,
         zuhal_chunk_size=10,
+        zuhal_poll_interval_s=0.05,
     )
 
 
-def _mock_zuhal(verdict: str) -> MagicMock:
-    client = MagicMock()
-    client.validate = AsyncMock(
-        return_value=ValidationResult(
-            email="info@acme.com",
-            verdict=verdict,
-            score=0.9,
-            is_disposable=False,
-            raw_status="success",
-            http_status=200,
-        )
-    )
-    return client
-
-
-async def _insert_needs_zuhal(
+async def _seed_needs_zuhal(
     conn: aiosqlite.Connection,
-    unique_id: str = "MI-001",
-    email: str = "info@acme.com",
-    racknerd_status: str = "invalid",
-    bbops_status: str = "invalid",
+    unique_id: str = "rec1",
+    email: str = "test@example.com",
+    *,
+    rk_status: str = "error",
+    bb_status: str = "error",
 ) -> None:
-    """Insert a record directly into NEEDS_ZUHAL state."""
     await conn.execute(
         """
-        INSERT INTO records (
-            unique_id, business_name, agent_name, state, record_state,
-            candidate_email, candidate_domain, strategy,
-            racknerd_status, bbops_status,
-            dispatch_attempts, created_at, updated_at
-        ) VALUES (?, 'Acme Corp', 'John Doe', 'MI', 'NEEDS_ZUHAL',
-                  ?, 'acme.com', 'without',
-                  ?, ?,
-                  1, datetime('now'), datetime('now'))
+        INSERT INTO records
+            (unique_id, business_name, agent_name, record_state,
+             candidate_emails, candidate_email, candidate_domain,
+             strategy, mx_provider,
+             racknerd_status, racknerd_message, bbops_status, bbops_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (unique_id, email, racknerd_status, bbops_status),
+        (
+            unique_id, "Test Corp", "John Doe",
+            State.NEEDS_ZUHAL,
+            json.dumps([email]), email, "example.com", "with", "gmail.com",
+            rk_status, "smtp error", bb_status, "smtp error",
+        ),
     )
     await conn.commit()
 
 
-class TestZuhalDispatcherValidates:
-    async def test_valid_verdict_creates_validated_record(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-001")
-        zuhal = _mock_zuhal("valid")
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
+def _mock_zuhal(verdict: str) -> MagicMock:
+    z = MagicMock(spec=ZuhalClient)
+    z.validate = AsyncMock(return_value=ValidationResult(
+        email="test@example.com", verdict=verdict, score=0.0,
+        is_disposable=False, raw_status="", http_status=200,
+    ))
+    return z
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
+
+def _mock_zuhal_raises(exc: BaseException) -> MagicMock:
+    z = MagicMock(spec=ZuhalClient)
+    z.validate = AsyncMock(side_effect=exc)
+    return z
+
+
+class TestZuhalDispatcherTerminalVerdicts:
+    async def test_valid_promotes_record_to_validated(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal("valid")
+        cost = CostTracker(None)
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'MI-001'"
+            "SELECT record_state, final_verdict, zuhal_status, confidence_score "
+            "FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
+
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"
-        assert dispatcher.stats["validated"] == 1
+        assert row["zuhal_status"] == "valid"
+        assert row["confidence_score"] is not None
+        assert cost.counts.get("zuhal", 0) == 1
+        zuhal.validate.assert_called_once_with("test@example.com")
 
-    async def test_catch_all_verdict_creates_validated_record(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-002")
-        zuhal = _mock_zuhal("accept-all")  # Zuhal returns "accept-all", not "catch_all"
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
+    async def test_accept_all_normalizes_to_catch_all(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal("accept-all")
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'MI-002'"
+            "SELECT record_state, final_verdict, zuhal_status "
+            "FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
+
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "catch_all"
+        assert row["zuhal_status"] == "catch_all"
 
-    async def test_invalid_verdict_creates_validation_failed(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-003")
+    async def test_invalid_marks_validation_failed(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
         zuhal = _mock_zuhal("invalid")
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-003'"
+            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
+
         assert row["record_state"] == State.VALIDATION_FAILED
-        assert dispatcher.stats["validation_failed"] == 1
+        assert row["final_verdict"] == "invalid"
 
-    async def test_error_verdict_creates_validation_failed(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-004")
-        zuhal = _mock_zuhal("error")
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
+class TestZuhalDispatcherFailureModes:
+    async def test_circuit_open_requeues_to_needs_zuhal_without_cost(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal_raises(ZuhalCircuitOpenError())
+        cost = CostTracker(None)
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-004'"
+            "SELECT record_state, dispatch_attempts FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
-        assert row["record_state"] == State.VALIDATION_FAILED
 
-
-class TestZuhalDispatcherRequeue:
-    async def test_circuit_open_requeues_to_needs_zuhal(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-005")
-        zuhal = MagicMock()
-        zuhal.validate = AsyncMock(side_effect=ZuhalCircuitOpenError("open"))
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
-
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
-
-        async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-005'"
-        ) as cur:
-            row = await cur.fetchone()
         assert row["record_state"] == State.NEEDS_ZUHAL
-        assert dispatcher.stats["requeued"] == 1
+        assert row["dispatch_attempts"] == 0  # no attempt burned on circuit-open
+        assert cost.counts.get("zuhal", 0) == 0  # API was never reached
+        assert worker.stats["requeued"] == 1
 
-    async def test_no_candidate_email_marks_failed(self, test_db, config):
-        # Insert record with NULL candidate_email
-        await conn_insert_no_email(test_db, "MI-006")
+    async def test_cost_ceiling_marks_cost_skipped(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
         zuhal = _mock_zuhal("valid")
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
+        cost = CostTracker(max_cost=0.0)
+        cost.record_call("serper_producer")  # push past ceiling
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
 
         async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-006'"
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
-        assert row["record_state"] == State.VALIDATION_FAILED
-        assert dispatcher.stats["validation_failed"] == 1
 
-
-class TestZuhalDispatcherCostCeiling:
-    async def test_cost_ceiling_skips_record(self, test_db, config):
-        await _insert_needs_zuhal(test_db, "MI-007")
-        zuhal = _mock_zuhal("valid")
-        cost_tracker = CostTracker(max_cost=0.0)  # ceiling already reached
-        cost_tracker.record_call("zuhal")  # push over
-
-        stop = asyncio.Event()
-        smtp_done = asyncio.Event()
-        smtp_done.set()
-
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=cost_tracker,
-            stop_event=stop, smtp_done_event=smtp_done,
-        )
-        await dispatcher.run()
-
-        async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-007'"
-        ) as cur:
-            row = await cur.fetchone()
         assert row["record_state"] == State.COST_SKIPPED
-        assert dispatcher.stats["cost_skipped"] == 1
+        zuhal.validate.assert_not_called()
+        assert worker.stats["cost_skipped"] == 1
+
+    async def test_pipeline_halt_propagates(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal_raises(PipelineHaltError("auth failed"))
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        with pytest.raises(PipelineHaltError):
+            await worker._process(rows[0])
+
+    async def test_unknown_exception_marks_validation_failed(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal_raises(RuntimeError("transient"))
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, zuhal_status FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.VALIDATION_FAILED
+        assert row["zuhal_status"] == "error"
+
+    async def test_retryable_429_requeues_to_needs_zuhal(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal_raises(_RetryableHTTPError(429))
+        cost = CostTracker(None)
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, zuhal_status, dispatch_attempts "
+            "FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.NEEDS_ZUHAL
+        assert row["zuhal_status"] is None
+        assert row["dispatch_attempts"] == 0
+        assert cost.counts.get("zuhal", 0) == 0
+        assert worker.stats["requeued"] == 1
+
+    async def test_retryable_500_marks_validation_failed(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal_raises(_RetryableHTTPError(500))
+
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, zuhal_status FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row["record_state"] == State.VALIDATION_FAILED
+        assert row["zuhal_status"] == "error"
 
 
 class TestZuhalDispatcherRecovery:
-    async def test_recovers_stale_zuhal_validating_on_start(self, test_db, config):
-        # Insert a record stuck in ZUHAL_VALIDATING from a previous crashed run
+    async def test_recover_stale_zuhal_validating_returns_to_queue(self, test_db):
+        # Seed a stale ZUHAL_VALIDATING row by inserting with an old updated_at
         await test_db.execute(
             """
-            INSERT INTO records (
-                unique_id, business_name, agent_name, state, record_state,
-                candidate_email, candidate_domain, strategy,
-                racknerd_status, bbops_status,
-                dispatch_attempts, created_at, updated_at
-            ) VALUES ('MI-008', 'Corp', 'Agent', 'MI', 'ZUHAL_VALIDATING',
-                      'info@corp.com', 'corp.com', 'without',
-                      'invalid', 'invalid',
-                      1, datetime('now', '-10 minutes'), datetime('now', '-10 minutes'))
+            INSERT INTO records
+                (unique_id, record_state, candidate_email, updated_at)
+            VALUES ('rec1', 'ZUHAL_VALIDATING', 'test@example.com',
+                    datetime('now', '-10 minutes'))
             """
         )
         await test_db.commit()
 
+        moved = await db.recover_stale_zuhal_validating(test_db, timeout_minutes=5)
+        assert moved == 1
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.NEEDS_ZUHAL
+
+    async def test_fresh_zuhal_validating_not_recovered(self, test_db):
+        await test_db.execute(
+            """
+            INSERT INTO records
+                (unique_id, record_state, candidate_email)
+            VALUES ('rec1', 'ZUHAL_VALIDATING', 'test@example.com')
+            """
+        )
+        await test_db.commit()
+
+        moved = await db.recover_stale_zuhal_validating(test_db, timeout_minutes=5)
+        assert moved == 0
+
+
+class TestZuhalDispatcherRunLoop:
+    async def test_exits_when_smtp_done_and_queue_empty(self, test_db, config):
         zuhal = _mock_zuhal("valid")
-        stop = asyncio.Event()
         smtp_done = asyncio.Event()
         smtp_done.set()
 
-        dispatcher = ZuhalDispatcher(
-            config=config, conn=test_db, zuhal=zuhal,
-            cost_tracker=CostTracker(None),
-            stop_event=stop, smtp_done_event=smtp_done,
+        worker = ZuhalDispatcher(
+            config, test_db, zuhal, CostTracker(None),
+            smtp_done_event=smtp_done,
         )
-        await dispatcher.run()
+
+        # No NEEDS_ZUHAL rows + smtp_done set → worker should exit promptly
+        await asyncio.wait_for(worker.run(), timeout=5.0)
+        zuhal.validate.assert_not_called()
+
+    async def test_processes_queued_record_in_run_loop(self, test_db, config):
+        await _seed_needs_zuhal(test_db)
+        zuhal = _mock_zuhal("valid")
+        smtp_done = asyncio.Event()
+        smtp_done.set()  # signal smtp drained — let worker exit after processing
+
+        worker = ZuhalDispatcher(
+            config, test_db, zuhal, CostTracker(None),
+            smtp_done_event=smtp_done,
+        )
+
+        await asyncio.wait_for(worker.run(), timeout=5.0)
 
         async with test_db.execute(
-            "SELECT record_state FROM records WHERE unique_id = 'MI-008'"
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
         ) as cur:
             row = await cur.fetchone()
-        # Should have been recovered → NEEDS_ZUHAL → processed → VALIDATED
         assert row["record_state"] == State.VALIDATED
-
-
-async def conn_insert_no_email(conn: aiosqlite.Connection, unique_id: str) -> None:
-    await conn.execute(
-        """
-        INSERT INTO records (
-            unique_id, business_name, agent_name, state, record_state,
-            candidate_email, candidate_domain, strategy,
-            racknerd_status, bbops_status,
-            dispatch_attempts, created_at, updated_at
-        ) VALUES (?, 'Corp', 'Agent', 'MI', 'NEEDS_ZUHAL',
-                  NULL, 'corp.com', 'without',
-                  'invalid', 'invalid',
-                  1, datetime('now'), datetime('now'))
-        """,
-        (unique_id,),
-    )
-    await conn.commit()
+        assert worker.stats["validated"] == 1
