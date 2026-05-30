@@ -189,3 +189,17 @@ def top_recent_errors(conn: sqlite3.Connection, limit: int = 10) -> list[dict[st
 def run_id(conn: sqlite3.Connection) -> str | None:
     row = conn.execute("SELECT run_id FROM stats LIMIT 1").fetchone()
     return row["run_id"] if row else None
+
+
+def run_summary(conn: sqlite3.Connection, ceiling: float | None = None) -> dict[str, Any]:
+    sc = state_counts(conn)
+    row = conn.execute("SELECT estimated_cost_usd FROM stats LIMIT 1").fetchone()
+    cost_usd = round(row["estimated_cost_usd"], 4) if row and row["estimated_cost_usd"] else 0.0
+    lu = conn.execute("SELECT MAX(updated_at) AS lu FROM records").fetchone()
+    return {
+        "total": sc["total"],
+        "validated": sc["states"].get("VALIDATED", 0),
+        "pending": sc["pending"],
+        "cost_usd": cost_usd,
+        "last_updated": lu["lu"] if lu else None,
+    }

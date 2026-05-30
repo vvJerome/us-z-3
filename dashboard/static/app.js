@@ -20,6 +20,7 @@ let chart = null;
 let runChart = null;
 let runChartKey = "";
 let lastFetchOk = 0;
+let activeRunId = null;
 
 function setIndicator(state, title) {
   const el = document.getElementById("indicator");
@@ -286,10 +287,44 @@ function renderThroughput(series) {
   });
 }
 
+function renderRunTabs(runs) {
+  const nav = document.getElementById("run-tabs");
+  if (!nav) return;
+  nav.innerHTML = runs.map(r => {
+    const cls = r.run_id === activeRunId ? "tab active" : "tab";
+    const pct = r.total > 0 ? Math.round((r.validated / r.total) * 100) : 0;
+    const label = r.run_id || "unknown";
+    return `<button class="${cls}" onclick="switchRun('${label}')" title="${(r.total||0).toLocaleString()} records · ${pct}% done · $${(r.cost_usd||0).toFixed(2)}">${label}</button>`;
+  }).join("");
+}
+
+function switchRun(run_id) {
+  if (activeRunId === run_id) return;
+  activeRunId = run_id;
+  runChartKey = "";
+  if (runChart) { runChart.destroy(); runChart = null; }
+  if (chart) { chart.destroy(); chart = null; }
+  fetchRuns();
+  tick();
+}
+
+async function fetchRuns() {
+  try {
+    const r = await fetch("/api/runs", { cache: "no-store" });
+    if (!r.ok) return;
+    const { runs } = await r.json();
+    if (!activeRunId && runs.length) activeRunId = runs[0].run_id;
+    renderRunTabs(runs);
+  } catch (_) {}
+}
+
 async function tick() {
   setIndicator("polling", "fetching…");
+  const url = activeRunId
+    ? `/api/snapshot?run_id=${encodeURIComponent(activeRunId)}`
+    : "/api/snapshot";
   try {
-    const r = await fetch("/api/snapshot", { cache: "no-store" });
+    const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const s = await r.json();
     lastFetchOk = Date.now();
@@ -314,6 +349,8 @@ async function tick() {
   }
 }
 
+fetchRuns();
+setInterval(fetchRuns, 30000);
 tick();
 setInterval(tick, POLL_MS);
 // Mark stale (dot only) when no successful fetch in >STALE_MS.
