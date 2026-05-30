@@ -42,6 +42,9 @@ verify.log
 context/
 docs/
 
+# Local operational artifacts (session reports, running totals sheet)
+local/
+
 # Data
 input/
 output/
