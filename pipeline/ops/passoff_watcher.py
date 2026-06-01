@@ -23,7 +23,6 @@ from pipeline.manifest import (
     is_zb_results_file,
     is_zuhal_results_file,
     normalize_zuhal_verdict,
-    part_from_filename,
 )
 
 logging.basicConfig(

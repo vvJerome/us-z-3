@@ -26,7 +26,6 @@ from pipeline import db
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
     compute_confidence_score,
-    confidence_tier,
     record_pattern,
 )
 
