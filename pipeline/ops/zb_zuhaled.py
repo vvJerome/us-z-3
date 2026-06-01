@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
 """Submit /zuhaled CSVs to ZeroBounce, save results to /zerobounced.
 
 Usage:
     # Process a specific file
-    python scripts/zb_zuhaled.py --input "jerome/part5_unknown_for_zb.csv"
+    scripts/zb_zuhaled.sh --input "jerome/part5_unknown_for_zb.csv"
 
     # Process every CSV in /zuhaled (in parallel)
-    python scripts/zb_zuhaled.py
+    scripts/zb_zuhaled.sh
 
     # Resume all polling/uploading batches recorded in the manifest
-    python scripts/zb_zuhaled.py --resume-all
+    scripts/zb_zuhaled.sh --resume-all
 
 Reads each input CSV (must have a column named Email/email/candidate_email),
 dedups against emails already recorded in the manifest, submits the new
@@ -36,10 +35,8 @@ from pathlib import Path
 
 import aiohttp
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from pipeline import manifest  # noqa: E402
-from zerobounce.run_csv import (  # noqa: E402
+from pipeline import manifest
+from zerobounce.run_csv import (
     ZB_COLUMNS,
     _ZB_FIELD_MAP,
     download,
@@ -54,6 +51,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("zb_zuhaled")
 
+ROOT = Path(__file__).resolve().parents[2]
 ZUHALED = ROOT / "output" / "backup" / "us_output" / "zuhaled"
 ZEROBOUNCED = ROOT / "output" / "backup" / "us_output" / "zerobounced"
 

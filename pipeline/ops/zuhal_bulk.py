@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Submit a NEEDS_ZUHAL CSV to the Zuhal Bulk API in 1k-email chunks.
 
 Uses direct API calls (not pipeline.utils.zuhal_client.bulk_validate, which
@@ -6,8 +5,8 @@ has latent bugs around nested-JSON response parsing and a status-string
 mismatch — production silently falls back to single-validate).
 
 Usage:
-    python scripts/zuhal_bulk.py \
-        --input output/.../alpha_part2_needs_zuhal_all.csv \
+    scripts/zuhal_bulk.sh \\
+        --input output/.../alpha_part2_needs_zuhal_all.csv \\
         --out-dir output/.../zuhaled
 """
 from __future__ import annotations
@@ -39,6 +38,7 @@ def _input_has_required_columns(header: list[str]) -> bool:
     failure mode where the input was {Email}-only and standalone results lost EIDs.
     """
     return "unique_id" in header and any(c in header for c in _EMAIL_COLUMNS)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -168,7 +168,7 @@ async def main_async() -> None:
             unique_emails.append(e)
     log.info("unique emails to submit: %d", len(unique_emails))
 
-    chunks = [unique_emails[i : i + args.chunk_size] for i in range(0, len(unique_emails), args.chunk_size)]
+    chunks = [unique_emails[i: i + args.chunk_size] for i in range(0, len(unique_emails), args.chunk_size)]
     log.info("splitting into %d chunks of %d (concurrency=%d)", len(chunks), args.chunk_size, args.concurrency)
 
     sem = asyncio.Semaphore(args.concurrency)

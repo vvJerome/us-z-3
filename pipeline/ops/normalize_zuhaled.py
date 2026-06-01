@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Upgrade legacy {Email,Status} zuhaled files to the canonical 7-column shape.
 
 Reads each {Email,Status} CSV and joins unique_id (and other context columns)
@@ -14,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 US_OUT = ROOT / "output" / "us_output"
 
 CANONICAL_HEADER = [
