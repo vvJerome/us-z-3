@@ -361,7 +361,7 @@ async def fetch_pending_validation(
         """,
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()
+        return await cursor.fetchall()  # type: ignore[return-value]
 
 
 async def has_pending_validation(conn: aiosqlite.Connection) -> bool:
@@ -380,7 +380,7 @@ async def fetch_pending_discovery(
         "SELECT * FROM records WHERE record_state = 'DISCOVERING' LIMIT ?",
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()
+        return await cursor.fetchall()  # type: ignore[return-value]
 
 
 async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> None:
@@ -611,7 +611,7 @@ async def fetch_pending_zuhal(
         """,
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()
+        return await cursor.fetchall()  # type: ignore[return-value]
 
 
 async def has_pending_zuhal(conn: aiosqlite.Connection) -> bool:

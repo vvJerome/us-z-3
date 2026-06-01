@@ -5,6 +5,7 @@ import csv
 import io
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import aiohttp
@@ -145,13 +146,12 @@ class ZuhalClient:
             http_status=status,
         )
 
-
     async def bulk_validate(
         self,
         emails: list[str],
         poll_interval_s: float = 30.0,
         max_poll_minutes: int = 120,
-        on_poll: "asyncio.coroutines | None" = None,
+        on_poll: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, str]:
         """Upload emails as CSV, poll until complete, return {email: verdict} mapping.
 

@@ -141,7 +141,7 @@ class Dispatcher:
         self.serper = serper
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
-        self._notify_reader = None
+        self._notify_reader: asyncio.StreamReader | None = None
         # Cached backpressure state — refreshed at most every 5 seconds
         self._bp_cached_count: int = 0
         self._bp_last_checked: float = 0.0
@@ -701,6 +701,7 @@ class Dispatcher:
 
     async def _zuhal_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()
+        status: str
         try:
             result = await self.zuhal.validate(email)  # type: ignore[union-attr]
             status = result.verdict

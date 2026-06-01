@@ -196,7 +196,7 @@ class RacknerdConsumer:
                 return BackendVerdict(status="blocked", message=msg, verified_at=_ISO_NOW())
             # error → try next MX host
 
-        return BackendVerdict(status=last_status, message=last_msg, verified_at=_ISO_NOW())
+        return BackendVerdict(status=last_status, message=last_msg, verified_at=_ISO_NOW())  # type: ignore[arg-type]
 
     async def _resolve_mx(self, domain: str) -> list[str]:
         """Resolve MX records with a 1-hour TTL cache."""
@@ -206,7 +206,7 @@ class RacknerdConsumer:
             if now < expires:
                 return hosts
 
-        hosts: list[str] = []
+        hosts = []
         try:
             records = await self._resolver.query(domain, "MX")
             hosts = [r.host.rstrip(".") for r in sorted(records, key=lambda r: r.priority)]

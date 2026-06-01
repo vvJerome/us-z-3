@@ -64,4 +64,3 @@ FALLBACK_DOMAIN_BLOCKLIST: frozenset[str] = frozenset({
     # Maps / generic web
     "google.com", "mapquest.com",
 })
-

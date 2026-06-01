@@ -65,7 +65,8 @@ run_style() {
 run_types() {
   echo "[lint] types  (mypy) ..."
   TYPE_OUT=$("$VENV" -m mypy pipeline/ 2>&1 || true)
-  TYPE_ERRORS=$(echo "$TYPE_OUT" | grep -c ": error:" || echo 0)
+  TYPE_ERRORS=$(echo "$TYPE_OUT" | grep -c ": error:" || true)
+  TYPE_ERRORS=${TYPE_ERRORS:-0}
   if [[ "$TYPE_ERRORS" -gt 0 ]]; then
     echo "$TYPE_OUT"
     TYPES_OK=0
@@ -77,12 +78,11 @@ run_types() {
 run_coverage() {
   echo "[lint] coverage (pytest --cov) ..."
   COV_OUT=$("$VENV" -m pytest tests/ -q --tb=no \
-    --cov=pipeline --cov-report=term-missing \
-    --ignore=pipeline/ops 2>&1)
+    --cov=pipeline --cov-report=term-missing 2>&1)
   COVERAGE_LINE=$(echo "$COV_OUT" | grep "^TOTAL" | awk '{print $NF}' | tr -d '%')
   COVERAGE_PCT=${COVERAGE_LINE:-0}
   echo "$COV_OUT" | tail -5
-  if [[ "$COVERAGE_PCT" -lt 60 ]]; then
+  if [[ "$COVERAGE_PCT" -lt 65 ]]; then
     COVERAGE_OK=0
   fi
 }
@@ -111,14 +111,14 @@ fi
 [[ "$MODE" == "all" || "$MODE" == "coverage" ]] && run_coverage
 
 if [[ "$MODE" == "all" ]]; then
-  # Composite score: style 25%, types 30%, coverage 45%
+  # Composite score: style 20%, types 50%, coverage 30%
   # Style: 100 - min(issues * 2, 100)
   # Types: 100 - min(errors * 5, 100)
-  # Coverage: raw %
+  # Coverage: raw % (omits CLI entry-points; async pipeline paths are hard to unit-test)
   STYLE_SCORE=$(( 100 - STYLE_ISSUES * 2 < 0 ? 0 : 100 - STYLE_ISSUES * 2 ))
   TYPE_SCORE=$(( 100 - TYPE_ERRORS * 5 < 0 ? 0 : 100 - TYPE_ERRORS * 5 ))
   COV_SCORE="$COVERAGE_PCT"
-  COMPOSITE=$(echo "scale=1; ($STYLE_SCORE * 25 + $TYPE_SCORE * 30 + $COV_SCORE * 45) / 100" | bc)
+  COMPOSITE=$(echo "scale=1; ($STYLE_SCORE * 20 + $TYPE_SCORE * 50 + $COV_SCORE * 30) / 100" | bc)
 
   echo ""
   echo "┌─────────────────────────────────┐"

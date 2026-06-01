@@ -267,6 +267,7 @@ class ZuhalDispatcher:
             return
 
         t0 = time.monotonic()
+        status: str
         try:
             result = await self.zuhal.validate(email)
             status = result.verdict
