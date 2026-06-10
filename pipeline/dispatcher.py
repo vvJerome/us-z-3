@@ -423,21 +423,6 @@ class Dispatcher:
                 )
 
             if not result.should_write:
-                # Racknerd IP block: skip Zuhal (block is IP-level, not email verdict),
-                # re-queue so the record retries after the Spamhaus cooldown clears.
-                if rk_verdict.status == "blocked":
-                    # Count attempt only if bbops gave a definitive verdict — a blocked
-                    # Racknerd + bbops invalid is one real verdict; blocked + bbops error
-                    # is purely infra and should not consume the budget.
-                    any_real = bb_verdict.status in _DEFINITIVE
-                    async with self._write_lock:
-                        await db.requeue_record(
-                            self.conn, unique_id, increment_attempts=any_real, retry_after=None
-                        )
-                    self.stats["requeued"] += 1
-                    logger.debug("Re-queued %s (Racknerd blocked — IP-level rejection)", unique_id)
-                    return
-
                 # Count attempt only when at least one backend gave a definitive verdict.
                 # Both-error or error+not_run are pure infra and do not consume the budget.
                 any_real_verdict = (

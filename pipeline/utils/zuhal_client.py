@@ -185,7 +185,10 @@ class ZuhalClient:
             resp.raise_for_status()
             data = await resp.json()
 
-        job_id = data.get("job_id") or data.get("id") or data.get("file_id")
+        # API wraps the payload in a "data" envelope; fall back to top-level for
+        # older response shapes so both formats are handled transparently.
+        _payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        job_id = _payload.get("job_id") or _payload.get("id") or _payload.get("file_id")
         if not job_id:
             logger.warning("Zuhal bulk upload returned no job_id: %s", data)
             return {}
@@ -207,13 +210,15 @@ class ZuhalClient:
                 resp.raise_for_status()
                 status_data = await resp.json()
 
-            status = status_data.get("status", "")
-            pct = status_data.get("percentage_complete", 0)
+            _status_payload = status_data.get("data") if isinstance(status_data.get("data"), dict) else status_data
+            status = _status_payload.get("status", "")
+            pct = _status_payload.get("percentage_complete", 0)
             logger.info("Zuhal bulk %s: %s (%s%%)", job_id, status, pct)
 
-            if status == "Complete":
+            _status_lower = status.lower()
+            if _status_lower in ("complete", "completed"):
                 break
-            if status in ("Error", "Failed"):
+            if _status_lower in ("error", "failed"):
                 logger.warning("Zuhal bulk job %s failed: %s", job_id, status_data)
                 return {}
             if asyncio.get_running_loop().time() > deadline:
@@ -228,7 +233,8 @@ class ZuhalClient:
             resp.raise_for_status()
             download_data = await resp.json()
 
-        download_url = download_data.get("download_link") or download_data.get("url") or download_data.get("link")
+        _dl_payload = download_data.get("data") if isinstance(download_data.get("data"), dict) else download_data
+        download_url = _dl_payload.get("download_link") or _dl_payload.get("url") or _dl_payload.get("link")
         if not download_url:
             logger.warning("Zuhal bulk download returned no download_link for job %s: %s", job_id, download_data)
             return {}

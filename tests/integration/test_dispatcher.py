@@ -278,9 +278,10 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.COST_SKIPPED
         zuhal.validate.assert_not_called()
 
-    async def test_racknerd_blocked_requeues_and_increments_attempt(self, test_db, config):
-        """Racknerd blocked + bbops invalid: bbops gave a real verdict so dispatch_attempts
-        is incremented. Zuhal must not be called — the block is IP-level, not an email verdict."""
+    async def test_racknerd_blocked_hands_off_to_zuhal(self, test_db, config):
+        """Racknerd blocked + bbops invalid: reconcile returns unknown (blocked is inconclusive),
+        so the record is handed off to the Zuhal queue (NEEDS_ZUHAL). In decoupled mode the
+        ZuhalDispatcher handles it; dispatcher.validate is not called directly."""
         from unittest.mock import AsyncMock as AM
         from pipeline.utils.zuhal_client import ZuhalClient
 
@@ -301,8 +302,8 @@ class TestDispatcherReconciliation:
         ) as cur:
             row = await cur.fetchone()
 
-        assert row["record_state"] == State.DISCOVERED
-        assert row["dispatch_attempts"] == 1  # incremented to bound persistent-block loops
+        assert row["record_state"] == State.NEEDS_ZUHAL
+        assert row["dispatch_attempts"] == 0  # handoff does not consume the attempt budget
         zuhal.validate.assert_not_called()
 
     async def test_max_dispatch_attempts_terminates_loop(self, test_db, config):
