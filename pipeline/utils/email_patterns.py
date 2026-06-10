@@ -38,7 +38,7 @@ def _expand_personal(template: str, first: str, last: str, domain: str) -> str |
     if not first or not last or not domain:
         return None
     f = first[0]
-    l = last[0]
+    li = last[0]
     mapping = {
         "first.last": f"{first}.{last}@{domain}",
         "flast":      f"{f}{last}@{domain}",
@@ -46,11 +46,11 @@ def _expand_personal(template: str, first: str, last: str, domain: str) -> str |
         "first":      f"{first}@{domain}",
         "f.last":     f"{f}.{last}@{domain}",
         "first_last": f"{first}_{last}@{domain}",
-        "firstl":     f"{first}{l}@{domain}",
+        "firstl":     f"{first}{li}@{domain}",
         "last.first": f"{last}.{first}@{domain}",
         "lastfirst":  f"{last}{first}@{domain}",
-        "first.l":    f"{first}.{l}@{domain}",
-        "lfirst":     f"{l}{first}@{domain}",
+        "first.l":    f"{first}.{li}@{domain}",
+        "lfirst":     f"{li}{first}@{domain}",
         "last":       f"{last}@{domain}",
         "lastf":      f"{last}{f}@{domain}",
     }

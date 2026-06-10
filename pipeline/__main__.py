@@ -120,7 +120,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             else:
                 logger.info("Racknerd disabled (--no-racknerd) — bbops + Zuhal only")
                 tunnel = None
-                racknerd = _NullRacknerd()
+                racknerd = _NullRacknerd()  # type: ignore[assignment]
 
             # --- bbops async consumer ---
             bbops_consumer = BbopsAsyncConsumer(

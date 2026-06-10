@@ -16,7 +16,6 @@ cd "$ROOT"
 
 PYTHON="${ROOT}/.venv/bin/python"
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
 INPUT=""
 NAME=""
 WORKERS=4
@@ -42,7 +41,6 @@ done
 [[ -z "$NAME"  ]] && { echo "ERROR: --name is required"  >&2; exit 1; }
 [[ ! -f "$INPUT" ]] && { echo "ERROR: input file not found: $INPUT" >&2; exit 1; }
 
-# ── Work out chunk sizes ──────────────────────────────────────────────────────
 TOTAL=$(wc -l < "$INPUT")
 [[ -n "$LIMIT" ]] && TOTAL=$((LIMIT < TOTAL ? LIMIT : TOTAL))
 CHUNK=$(( (TOTAL + WORKERS - 1) / WORKERS ))
@@ -50,7 +48,6 @@ CHUNK=$(( (TOTAL + WORKERS - 1) / WORKERS ))
 echo "[run_parallel] input=$INPUT  total=$TOTAL  workers=$WORKERS  chunk=$CHUNK"
 [[ -n "$MAX_COST" ]] && echo "[run_parallel] max-cost=$MAX_COST per worker"
 
-# ── Launch workers ────────────────────────────────────────────────────────────
 PIDS=()
 WORKER_NAMES=()
 
@@ -79,7 +76,6 @@ done
 
 echo "[run_parallel] launched ${#PIDS[@]} workers: ${PIDS[*]}"
 
-# ── Wait for all workers ──────────────────────────────────────────────────────
 FAILED=0
 for idx in "${!PIDS[@]}"; do
   pid="${PIDS[$idx]}"
@@ -91,7 +87,6 @@ for idx in "${!PIDS[@]}"; do
   fi
 done
 
-# ── Merge valid_emails.csv ────────────────────────────────────────────────────
 MERGED="output/${NAME}_merged.csv"
 HEADER_WRITTEN=0
 TOTAL_ROWS=0

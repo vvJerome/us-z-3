@@ -1,14 +1,15 @@
-#!/usr/bin/env python3
-"""Rewrite summary_counts.csv with per-Part Confirmed/Valid/Catch-All counts."""
+"""Rewrite summary_counts.csv with per-Part Confirmed/Valid/Catch-All counts.
+
+Hardcoded to the May 2026 NC/MI run. Replace with a manifest-driven version
+once the manifest schema stabilises across states.
+"""
 from __future__ import annotations
 
 import csv
 from pathlib import Path
 
-OUT_CSV = Path(
-    "/Users/jeromegutierrez/Developer/viableview/us-z/us-z-3"
-    "/output/vps_backup_20260521/us_output/summary_counts.csv"
-)
+ROOT = Path(__file__).resolve().parents[2]
+OUT_CSV = ROOT / "output" / "vps_backup_20260521" / "us_output" / "summary_counts.csv"
 
 PIPELINE: list[tuple[str, int, int, int, int]] = [
     ("Sara (w/ Officer)",            287_083,  45_051,   8_578,  36_473),

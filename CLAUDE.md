@@ -55,11 +55,21 @@ us-z-3/
 │   ├── producer.py         # DNS probe + Serper enrichment → fills DISCOVERED queue
 │   ├── dispatcher.py       # Three-backend coordinator (Racknerd + bbops + Zuhal rescue)
 │   ├── db.py               # SQLite schema, State machine, all DB helpers
+│   ├── manifest.py         # SQLite email-state store + CSV ingest helpers
 │   ├── models.py           # InputRecord, EnrichmentResult, ValidationResult dataclasses
 │   ├── config.py           # PipelineConfig (pydantic-settings, reads .env)
 │   ├── cli.py              # argparse definitions
 │   ├── constants.py        # API costs, backoff params, DNS TLDs, fallback blocklist
 │   ├── metrics.py          # Prometheus /metrics endpoint (port 9090)
+│   ├── ops/                # Operator-facing tools (post-pipeline workflows)
+│   │   ├── manifest_init.py        # Backfill manifest from existing CSV outputs
+│   │   ├── passoff_watcher.py      # Drip-feed daemon: ingest results → append to combined CSV
+│   │   ├── zuhal_bulk.py           # Submit NEEDS_ZUHAL CSVs to Zuhal Bulk API
+│   │   ├── zb_zuhaled.py           # Submit /zuhaled CSVs to ZeroBounce
+│   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
+│   │   ├── normalize_zuhaled.py    # Upgrade legacy {Email,Status} zuhaled files
+│   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
+│   │   └── build_summary.py        # Write summary_counts.csv (hardcoded May 2026 run)
 │   ├── consumers/
 │   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
 │   │   └── bbops_async.py  # Async bbops.io batch verifier (Backend 2)
@@ -92,16 +102,28 @@ us-z-3/
 ├── input/                  # Source JSONL files
 ├── output/                 # Per-run output (pipeline.db, results.json, valid_emails.csv)
 ├── runs/                   # Orchestrator run directories (managed automatically)
-├── scripts/
+├── scripts/                # Shell entry points only — all logic lives in pipeline/ops/
+│   ├── _common.sh          # Shared SSH/rsync helpers (sourced by other scripts)
+│   ├── check.sh            # Snapshot of active pipeline run on VPS
 │   ├── clean.sh            # Delete stale output dirs (--force to actually delete)
 │   ├── deploy.sh           # rsync project to VPS + install deps
+│   ├── logs.sh             # Tail pipeline logs
+│   ├── manifest_init.sh    # → pipeline.ops.manifest_init
+│   ├── normalize_zuhaled.sh# → pipeline.ops.normalize_zuhaled
+│   ├── passoff_watcher.sh  # → pipeline.ops.passoff_watcher
+│   ├── requeue_zuhal_429_burns.sh # → pipeline.ops.requeue_zuhal_429_burns
 │   ├── reset.sh            # Re-queue failed records helper
 │   ├── run_checkpoints.sh  # 10×100-record batched run with interactive checkpoint reviews
+│   ├── run_il.sh           # Deploy + start Illinois pipeline run on VPS
+│   ├── run_parallel.sh     # Split input into N parallel workers + merge outputs
+│   ├── setup.sh            # Wipe and re-provision VPS from scratch
 │   ├── smoke-test.sh       # Quick wiring check (dry-run 10 records)
 │   ├── start.sh            # Launch orchestrator in tmux
+│   ├── status.sh           # Show DB status summary
 │   ├── stop.sh             # Kill orchestrator session
-│   ├── logs.sh             # Tail pipeline logs
-│   └── status.sh           # Show DB status summary
+│   ├── zb_zuhaled.sh       # → pipeline.ops.zb_zuhaled
+│   ├── zuhal_bulk.sh       # → pipeline.ops.zuhal_bulk
+│   └── zuhal_rescue.sh     # → pipeline.ops.zuhal_rescue
 ├── requirements.txt
 ├── pytest.ini
 └── .env.example

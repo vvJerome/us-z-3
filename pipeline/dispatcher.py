@@ -26,7 +26,6 @@ from pipeline import db
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
     compute_confidence_score,
-    confidence_tier,
     record_pattern,
 )
 
@@ -142,7 +141,7 @@ class Dispatcher:
         self.serper = serper
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
-        self._notify_reader = None
+        self._notify_reader: asyncio.StreamReader | None = None
         # Cached backpressure state — refreshed at most every 5 seconds
         self._bp_cached_count: int = 0
         self._bp_last_checked: float = 0.0
@@ -424,21 +423,6 @@ class Dispatcher:
                 )
 
             if not result.should_write:
-                # Racknerd IP block: skip Zuhal (block is IP-level, not email verdict),
-                # re-queue so the record retries after the Spamhaus cooldown clears.
-                if rk_verdict.status == "blocked":
-                    # Count attempt only if bbops gave a definitive verdict — a blocked
-                    # Racknerd + bbops invalid is one real verdict; blocked + bbops error
-                    # is purely infra and should not consume the budget.
-                    any_real = bb_verdict.status in _DEFINITIVE
-                    async with self._write_lock:
-                        await db.requeue_record(
-                            self.conn, unique_id, increment_attempts=any_real, retry_after=None
-                        )
-                    self.stats["requeued"] += 1
-                    logger.debug("Re-queued %s (Racknerd blocked — IP-level rejection)", unique_id)
-                    return
-
                 # Count attempt only when at least one backend gave a definitive verdict.
                 # Both-error or error+not_run are pure infra and do not consume the budget.
                 any_real_verdict = (
@@ -702,6 +686,7 @@ class Dispatcher:
 
     async def _zuhal_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()
+        status: str
         try:
             result = await self.zuhal.validate(email)  # type: ignore[union-attr]
             status = result.verdict

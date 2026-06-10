@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Drip-feed watcher: ingest new zuhaled/zerobounced CSVs into the manifest and
 append newly-confirmed rows to each operator's combined passoff CSV.
 
@@ -10,16 +9,12 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import os
 import signal
-import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from pipeline import manifest  # noqa: E402
-from scripts.manifest_init import (  # noqa: E402
+from pipeline import manifest
+from pipeline.manifest import (
     OPERATORS,
     eid_of,
     email_of,
@@ -28,7 +23,6 @@ from scripts.manifest_init import (  # noqa: E402
     is_zb_results_file,
     is_zuhal_results_file,
     normalize_zuhal_verdict,
-    part_from_filename,
 )
 
 logging.basicConfig(
@@ -38,6 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("passoff_watcher")
 
+ROOT = Path(__file__).resolve().parents[2]
 US_OUT = ROOT / "output" / "us_output"
 
 PASSOFF_COLS = [
@@ -72,7 +67,6 @@ def append_confirmed_from_zb(conn, src: Path, operator: str) -> int:
     out_path = passoff_path(operator)
     ensure_passoff_header(out_path)
 
-    appended = 0
     new_rows: list[dict] = []
     with src.open(encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
@@ -102,6 +96,7 @@ def append_confirmed_from_zb(conn, src: Path, operator: str) -> int:
     if not new_rows:
         return 0
 
+    appended = 0
     with out_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=PASSOFF_COLS)
         for r in new_rows:
@@ -119,7 +114,6 @@ def append_confirmed_from_zuhal(conn, src: Path, operator: str) -> int:
     out_path = passoff_path(operator)
     ensure_passoff_header(out_path)
 
-    appended = 0
     new_rows: list[dict] = []
     with src.open(encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
@@ -137,7 +131,7 @@ def append_confirmed_from_zuhal(conn, src: Path, operator: str) -> int:
                 continue
             new_rows.append({
                 "email": email,
-                "zb_status": "" if verdict == "valid" else "catch-all",
+                "zb_status": "valid" if verdict == "valid" else "catch-all",
                 "zb_sub_status": "",
                 "zb_free_email": "",
                 "zb_did_you_mean": "",
@@ -149,12 +143,11 @@ def append_confirmed_from_zuhal(conn, src: Path, operator: str) -> int:
                 "source": "zuhal_drip",
                 "eid": eid_of(row),
             })
-            if verdict == "valid":
-                new_rows[-1]["zb_status"] = "valid"
 
     if not new_rows:
         return 0
 
+    appended = 0
     with out_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=PASSOFF_COLS)
         for r in new_rows:

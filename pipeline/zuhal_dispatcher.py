@@ -267,6 +267,7 @@ class ZuhalDispatcher:
             return
 
         t0 = time.monotonic()
+        status: str
         try:
             result = await self.zuhal.validate(email)
             status = result.verdict
@@ -317,6 +318,18 @@ class ZuhalDispatcher:
 
         if status == "accept-all":
             status = "catch_all"
+
+        # "unknown" means Zuhal could not determine validity — not a confirmed
+        # failure. Re-queue for one more attempt; if it comes back unknown again
+        # (dispatch_attempts >= 1) fall through to VALIDATION_FAILED so the
+        # ZeroBounce pass can handle it.
+        if status == "unknown":
+            if (row["dispatch_attempts"] or 0) < 1:
+                async with self._write_lock:
+                    await db.requeue_zuhal(self.conn, unique_id)
+                self.stats["requeued"] += 1
+                logger.debug("Zuhal unknown — re-queued %s for second attempt", unique_id)
+                return
 
         terminal = status in ("valid", "catch_all")
         record_state = State.VALIDATED if terminal else State.VALIDATION_FAILED

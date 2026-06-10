@@ -1,12 +1,11 @@
-"""
-Standalone Zuhal rescue pass.
+"""Standalone Zuhal rescue pass.
 
 Reads VALIDATION_FAILED records where both SMTP backends returned 'invalid'
 and the zuhal_status is NULL or 'not_run', then calls Zuhal for each one.
 Upgrades VALIDATION_FAILED → VALIDATED when Zuhal confirms deliverable.
 
 Usage:
-    python scripts/zuhal_rescue.py --db runs/<run>/v2/pipeline.db
+    scripts/zuhal_rescue.sh --db runs/<run>/v2/pipeline.db
 
 Rate: 20 calls/hour by default (1 per 3 min). Runs until all eligible
 records are processed or Ctrl-C.
@@ -18,13 +17,9 @@ import asyncio
 import logging
 import os
 import sys
-from pathlib import Path
 
 import aiohttp
 import aiosqlite
-
-# Make the pipeline package importable from the repo root.
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.db import State
 from pipeline.utils.rate_limiter import TokenBucket
@@ -45,7 +40,7 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
     bucket = TokenBucket(
         capacity=rate_limit,
         refill_rate=rate_limit / 3600,
-        initial_tokens=0,  # no burst at startup
+        initial_tokens=0,
     )
 
     async with aiohttp.ClientSession() as session:
@@ -53,7 +48,7 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
             api_key, session, bucket,
             concurrency=1,
             dry_run=dry_run,
-            max_attempts=1,  # single attempt per record in this pass
+            max_attempts=1,
         )
 
         async with aiosqlite.connect(db_path) as conn:
@@ -61,8 +56,6 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
             await conn.execute("PRAGMA journal_mode=WAL")
 
             while True:
-                # Fetch one eligible VALIDATION_FAILED record at a time.
-                # Eligible: both backends said invalid, Zuhal not yet run.
                 async with conn.execute("""
                     SELECT unique_id, candidate_email,
                            racknerd_status, bbops_status, zuhal_status
@@ -88,7 +81,6 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
                     result = await client.validate(email)
                 except Exception as exc:
                     logger.warning("Zuhal error for %s: %s — skipping", email, exc)
-                    # Mark zuhal_status so we don't retry this record endlessly.
                     await conn.execute(
                         "UPDATE records SET zuhal_status = 'error' WHERE unique_id = ?",
                         (uid,),
@@ -97,7 +89,6 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
                     continue
 
                 status = result.status if hasattr(result, "status") else getattr(result, "verdict", "error")
-                # Normalise accept-all → catch_all
                 if status == "accept-all":
                     status = "catch_all"
 
@@ -111,7 +102,7 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
                             final_verdict = ?
                         WHERE unique_id = ?
                     """, (State.VALIDATED, status, status, uid))
-                    logger.info("  Upgraded to VALIDATED ✓")
+                    logger.info("  Upgraded to VALIDATED")
                 else:
                     await conn.execute(
                         "UPDATE records SET zuhal_status = ? WHERE unique_id = ?",

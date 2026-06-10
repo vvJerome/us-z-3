@@ -46,7 +46,7 @@ async def probe_domains(
     async def _probe_one(domain: str) -> tuple[str, str | None]:
         try:
             mx = await with_backoff(
-                lambda d=domain: _resolve_mx(_resolver, d),
+                lambda d=domain: _resolve_mx(_resolver, d),  # type: ignore[misc]
                 max_attempts=max_attempts,
                 base_delay=base,
                 max_delay=max_delay,
