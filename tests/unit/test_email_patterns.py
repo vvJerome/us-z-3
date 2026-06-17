@@ -3,11 +3,40 @@
 import pytest
 from pipeline.utils.email_patterns import (
     generate_ranked_candidates,
+    generate_personal_patterns,
+    generate_generic_patterns,
     email_to_template,
     _PERSONAL_TEMPLATES,
     _GENERIC_TEMPLATES,
     _expand_personal,
+    _surname_variants,
 )
+
+
+class TestGeneratePersonalPatterns:
+    def test_generates_all_templates(self):
+        result = generate_personal_patterns("john", "doe", "acme.com")
+        assert "john.doe@acme.com" in result
+        assert "jdoe@acme.com" in result
+
+    def test_missing_parts_returns_empty(self):
+        assert generate_personal_patterns("", "doe", "acme.com") == []
+
+
+class TestGenerateGenericPatterns:
+    def test_generates_generic(self):
+        result = generate_generic_patterns("acme.com")
+        assert "info@acme.com" in result
+
+    def test_no_domain_returns_empty(self):
+        assert generate_generic_patterns("") == []
+
+
+class TestWithoutStrategyReorder:
+    def test_rankings_reorder_generic_templates(self):
+        rankings = [{"template": "sales", "success_count": 9, "total_count": 10}]
+        result = generate_ranked_candidates("", "", "acme.com", "without", rankings=rankings)
+        assert result[0] == "sales@acme.com"  # high success rate floats to top
 
 
 class TestGenerateRankedCandidatesWithStrategy:
@@ -67,6 +96,38 @@ class TestPatternRankingReorder:
         last_idx = next(i for i, e in enumerate(result) if e == "doe@acme.com")
         # "last" template should be first because it has 100% success rate
         assert last_idx == 0
+
+
+class TestSurnameVariants:
+    def test_hyphenated_surname_splits(self):
+        assert _surname_variants("smith-jones") == ["smith", "jones"]
+
+    def test_spaced_compound_surname_splits(self):
+        assert _surname_variants("de la cruz") == ["de", "la", "cruz"]
+
+    def test_simple_surname_returns_empty(self):
+        assert _surname_variants("doe") == []
+
+    def test_empty_returns_empty(self):
+        assert _surname_variants("") == []
+
+
+class TestCompoundSurnameCandidates:
+    def test_compound_surname_injects_part_candidates(self):
+        result = generate_ranked_candidates("john", "smith-jones", "acme.com", "with", max_candidates=5)
+        # Both single-part surnames surface within the cap, not just the raw compound.
+        assert any(e.startswith("john.smith@") for e in result)
+        assert any(e.startswith("john.jones@") for e in result)
+
+    def test_simple_surname_unchanged(self):
+        # No compound → behaves exactly like before (first.last leads).
+        result = generate_ranked_candidates("john", "doe", "acme.com", "with", max_candidates=5)
+        assert result[0] == "john.doe@acme.com"
+
+    def test_result_deduplicated_and_capped(self):
+        result = generate_ranked_candidates("john", "smith-jones", "acme.com", "with", max_candidates=5)
+        assert len(result) == len(set(result))
+        assert len(result) <= 5
 
 
 class TestEmailToTemplate:

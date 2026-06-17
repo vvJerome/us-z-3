@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pipeline.constants import MAX_WITHOUT_CANDIDATES
@@ -57,6 +58,17 @@ def _expand_personal(template: str, first: str, last: str, domain: str) -> str |
     return mapping.get(template)
 
 
+def _surname_variants(last: str) -> list[str]:
+    """Single-part surnames from a compound/hyphenated last name, or [] if simple.
+
+    "smith-jones" -> ["smith", "jones"]; the raw form is handled by the caller.
+    """
+    if not last:
+        return []
+    parts = [p for p in re.split(r"[-\s]+", last) if p]
+    return parts if len(parts) > 1 else []
+
+
 def generate_personal_patterns(first: str, last: str, domain: str) -> list[str]:
     return [
         email
@@ -87,12 +99,22 @@ def generate_ranked_candidates(
     """
     if strategy == "with":
         templates = _reorder_personal(rankings)
-        candidates = [
+        # Compound surname ("smith-jones", "de la cruz"): companies usually pick one
+        # part or drop the separator. Lead with the top-ranked template for the raw
+        # surname AND each part, so every part surfaces within the cap before the
+        # lower-ranked templates of the raw surname fill the remaining slots.
+        surnames = [last, *_surname_variants(last)]
+        lead = [
             email
-            for t in templates
+            for sv in surnames
+            if (email := _expand_personal(templates[0], first, sv, domain)) is not None
+        ]
+        rest = [
+            email
+            for t in templates[1:]
             if (email := _expand_personal(t, first, last, domain)) is not None
         ]
-        return candidates[:max_candidates]
+        return list(dict.fromkeys(lead + rest))[:max_candidates]
     else:
         templates = _reorder_generic(rankings)
         if not domain:

@@ -323,9 +323,13 @@ class ProducerWorker:
                 result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
                 if serper_result.candidate_domain:
                     enrichment_domain = serper_result.candidate_domain
-                    result["discovery_source"] = "serper"
+                    # serper_fallback = first-organic guess, not a name/KG match — lower
+                    # domain confidence; the dispatcher reads this in pre_score().
                     if serper_result.is_fallback_domain:
+                        result["discovery_source"] = "serper_fallback"
                         self._record_fallback_domain(serper_result.candidate_domain)
+                    else:
+                        result["discovery_source"] = "serper"
                 elif serper_result.candidate_emails:
                     result["discovery_source"] = "serper"
 

@@ -525,3 +525,155 @@ class TestDispatcherReconciliation:
 
         rows = await db.fetch_pending_validation(test_db, limit=10)
         assert not any(r["unique_id"] == "rec1" for r in rows)
+
+
+def _mock_zuhal(verdict: str):
+    from pipeline.models import ValidationResult
+    z = MagicMock()
+    z.validate = AsyncMock(return_value=ValidationResult(
+        email="test@example.com", verdict=verdict, score=0.0,
+        is_disposable=False, raw_status="", http_status=200,
+    ))
+    return z
+
+
+async def _insert_with_candidates(conn, unique_id, candidates, *, discovery_source=None):
+    await conn.execute(
+        """
+        INSERT INTO records
+            (unique_id, business_name, agent_name, record_state,
+             candidate_emails, candidate_email, candidate_domain, strategy,
+             mx_provider, discovery_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            unique_id, "Test Corp", "John Doe", State.DISCOVERED,
+            json.dumps(candidates), candidates[0], "example.com", "with",
+            "gmail.com", discovery_source,
+        ),
+    )
+    await conn.commit()
+
+
+class TestCatchAllConfidenceGate:
+    async def test_catch_all_accepted_by_default(self, test_db, config):
+        """catch_all_min_confidence default 0.0 → catch_all accepted (unchanged behavior)."""
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("catch_all", "250 accepts all")
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["final_verdict"] == "catch_all"
+        bb.verify.assert_not_called()  # Racknerd catch_all short-circuits
+
+    async def test_catch_all_below_gate_not_validated(self, test_db, config):
+        """With the gate raised above the candidate's pre_score, a catch_all is not accepted."""
+        config = config.model_copy(update={"catch_all_min_confidence": 3.0})
+        await _insert_discovered(test_db, "rec1")  # pre_score ~2.0 < 3.0
+        rk = _mock_racknerd("catch_all", "250 accepts all")
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        bb.verify.assert_called_once()  # fell through to bbops for a second signal
+
+
+class TestZuhalConfidenceGate:
+    async def test_low_confidence_skips_decoupled_handoff(self, test_db, config):
+        """zuhal_min_confidence above pre_score → unknown re-queues instead of going to Zuhal."""
+        config = config.model_copy(update={"zuhal_min_confidence": 10.0})
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=_mock_zuhal("valid"))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.DISCOVERED  # re-queued, not handed off
+        assert dispatcher.stats["handed_off_to_zuhal"] == 0
+
+    async def test_default_confidence_hands_off_to_zuhal(self, test_db, config):
+        """Default 0.0 gate → unknown verdict still hands off to Zuhal queue."""
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=_mock_zuhal("valid"))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.NEEDS_ZUHAL
+        assert dispatcher.stats["handed_off_to_zuhal"] == 1
+
+    async def test_low_confidence_skips_both_invalid_rescue(self, test_db, config):
+        """zuhal_on_both_invalid rescue is skipped for low-confidence candidates."""
+        config = config.model_copy(update={
+            "zuhal_on_both_invalid": True, "zuhal_min_confidence": 10.0,
+        })
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("invalid", "550")
+        zuhal = _mock_zuhal("valid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=zuhal)
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        zuhal.validate.assert_not_called()
+
+
+class TestCandidateReorder:
+    async def test_higher_confidence_candidate_tried_first(self, test_db, config):
+        """Candidates are sorted by pre_score; the name-matching one is probed before the weak one."""
+        await _insert_with_candidates(
+            test_db, "rec1", ["zzz@example.com", "john.doe@example.com"]
+        )
+
+        async def verify(email):
+            status = "valid" if email == "john.doe@example.com" else "invalid"
+            return BackendVerdict(status=status, message="", verified_at="2026-05-04T00:00:00Z")
+
+        rk = MagicMock()
+        rk.verify = AsyncMock(side_effect=verify)
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, candidate_email FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["candidate_email"] == "john.doe@example.com"
+        assert rk.verify.call_count == 1  # strong candidate first → weak one never probed

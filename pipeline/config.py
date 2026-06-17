@@ -81,6 +81,11 @@ class PipelineConfig(BaseSettings):
     zuhal_concurrency_max: int = Field(default=50, ge=1)
     zuhal_on_both_invalid: bool = False
     zuhal_decoupled: bool = True
+    # Identity/deliverability gates (0.0 = disabled, current behavior).
+    # zuhal_min_confidence: candidates scoring below this skip paid Zuhal rescue.
+    # catch_all_min_confidence: catch-all verdicts below this are not auto-accepted.
+    zuhal_min_confidence: float = 0.0
+    catch_all_min_confidence: float = 0.0
     zuhal_poll_interval_s: float = 5.0
     zuhal_chunk_size: int = Field(default=20, ge=1)
     # Backpressure: pause SMTP handoffs when NEEDS_ZUHAL exceeds this (0 = disabled)

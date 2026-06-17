@@ -8,6 +8,7 @@ from pipeline._dispatch_helpers import (
     compute_confidence_score,
     confidence_tier,
     name_matches_email,
+    pre_score,
     record_pattern,
     GENERIC_PREFIXES,
 )
@@ -139,6 +140,29 @@ class TestConfidenceScoreWithoutStrategy:
             verdict="catch_all",
         )
         assert score == 2  # domain match + IS generic; no valid point
+
+
+class TestPreScore:
+    def test_drops_verdict_term_relative_to_full_score(self):
+        # pre_score == confidence score with no "valid" verdict point.
+        pre = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        full = compute_confidence_score("john.doe@acme.com", "acme.com", "with", "valid", "John Doe")
+        assert pre == float(full) - 1.0
+
+    def test_dns_source_adds_confidence(self):
+        base = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        dns = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", "dns")
+        assert dns == base + 1.0
+
+    def test_serper_fallback_source_penalized(self):
+        base = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        fallback = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", "serper_fallback")
+        assert fallback == base - 1.0
+
+    def test_strong_candidate_outranks_weak(self):
+        strong = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", "dns")
+        weak = pre_score("zzz@other.com", "acme.com", "with", "John Doe", "serper_fallback")
+        assert strong > weak
 
 
 class TestConfidenceTier:

@@ -70,6 +70,28 @@ def compute_confidence_score(
     return score
 
 
+def pre_score(
+    email: str,
+    candidate_domain: str | None,
+    strategy: str,
+    agent_name: str = "",
+    discovery_source: str | None = None,
+) -> float:
+    """Identity/deliverability confidence available BEFORE any verdict.
+
+    Same components as compute_confidence_score minus the verdict term (verdict
+    is unknown pre-validation), plus a domain-confidence weight from how the
+    domain was found: DNS-MX hit is strong, a Serper first-organic guess is weak.
+    Used to rank candidates and gate paid verification.
+    """
+    score = float(compute_confidence_score(email, candidate_domain, strategy, "pending", agent_name))
+    if discovery_source == "dns":
+        score += 1.0
+    elif discovery_source == "serper_fallback":
+        score -= 1.0
+    return score
+
+
 def confidence_tier(score: int) -> str:
     if score >= 3:
         return "high"

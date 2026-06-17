@@ -26,6 +26,7 @@ from pipeline import db
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
     compute_confidence_score,
+    pre_score,
     record_pattern,
 )
 
@@ -279,9 +280,16 @@ class Dispatcher:
         candidate_domain = row["candidate_domain"] or ""
         strategy = row["strategy"] or "without"
         agent_name = row["agent_name"] or ""
+        discovery_source = row["discovery_source"]
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
         serper_enriched = bool(row["serper_enriched"])
+
+        # Identity-first: try the strongest candidates before paid verification.
+        candidates.sort(
+            key=lambda e: pre_score(e, candidate_domain, strategy, agent_name, discovery_source),
+            reverse=True,
+        )
 
         pending_trace: list[dict] = []
         cost_skipped = False
@@ -302,6 +310,12 @@ class Dispatcher:
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
                 cost_skipped = True
                 break
+
+            candidate_score = pre_score(
+                email, candidate_domain, strategy, agent_name, discovery_source
+            )
+            # Low-confidence candidates don't earn paid Zuhal rescue (flag default 0.0 = off).
+            skip_paid = candidate_score < self.config.zuhal_min_confidence
 
             # MS probe pre-filter (free, only for Microsoft-managed domains)
             if use_ms_probe:
@@ -355,8 +369,13 @@ class Dispatcher:
             })
             last_rk = rk_verdict
 
-            # Racknerd valid/catch_all: bbops not needed
-            if rk_verdict.status in ("valid", "catch_all"):
+            # Racknerd valid: accept. catch_all: accept only if identity confidence
+            # clears the gate (flag default 0.0 = accept all, current behavior);
+            # below the gate, fall through to bbops for a second signal.
+            if rk_verdict.status == "valid" or (
+                rk_verdict.status == "catch_all"
+                and candidate_score >= self.config.catch_all_min_confidence
+            ):
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, rk_verdict.status, agent_name
                 )
@@ -436,7 +455,7 @@ class Dispatcher:
                 )
                 greylist_hold = _greylisting_retry_after() if rk_is_4xx else None
 
-                if self.zuhal is not None:
+                if self.zuhal is not None and not skip_paid:
                     if self.config.zuhal_decoupled:
                         # Backpressure: pause handoffs when Zuhal backlog is too deep.
                         # Count is cached for 5 seconds to avoid per-record DB queries.
@@ -541,7 +560,10 @@ class Dispatcher:
                         logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
                     return
 
-            if result.final_verdict in ("valid", "catch_all"):
+            if result.final_verdict == "valid" or (
+                result.final_verdict == "catch_all"
+                and candidate_score >= self.config.catch_all_min_confidence
+            ):
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, result.final_verdict, agent_name
                 )
@@ -571,7 +593,7 @@ class Dispatcher:
                 return
 
             # Both invalid — optional Zuhal rescue when zuhal_on_both_invalid is enabled
-            if self.zuhal is not None and self.config.zuhal_on_both_invalid:
+            if self.zuhal is not None and self.config.zuhal_on_both_invalid and not skip_paid:
                 if self.cost_tracker.ceiling_reached():
                     logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
                     await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
