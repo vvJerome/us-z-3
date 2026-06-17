@@ -48,3 +48,4 @@ local/
 # Data
 input/
 output/
+.coverage*
