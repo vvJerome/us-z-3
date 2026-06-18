@@ -53,19 +53,32 @@ us-z-3/
 ├── pipeline/               # Core async pipeline package
 │   ├── __main__.py         # Entry point: cmd_run / cmd_status / cmd_reset
 │   ├── producer.py         # DNS probe + Serper enrichment → fills DISCOVERED queue
-│   ├── dispatcher.py       # Three-backend coordinator (Racknerd + bbops + Zuhal rescue)
-│   ├── db.py               # SQLite schema, State machine, all DB helpers
+│   ├── dispatcher.py       # Backend coordinator: MS/Racknerd/bbops + candidate loop
+│   ├── reconcile.py        # OR-of-valids policy + greylisting (pure decision logic)
+│   ├── dispatch_probes.py  # Backend probe wrappers (ms/zuhal/serper/racknerd/bbops)
+│   ├── dispatch_verdicts.py# Zuhal-rescue verdict handling for the candidate loop
+│   ├── verdicts.py         # Canonical verdict vocabulary (normalize_verdict + sources)
+│   ├── db/                 # SQLite data layer, split by responsibility
+│   │   ├── __init__.py     # Re-exports the full surface (from pipeline import db)
+│   │   ├── schema.py       # DDL, migrations, State machine, init_db
+│   │   ├── records.py      # Record lifecycle + verdict writes (update_record_dual)
+│   │   ├── zuhal_queue.py  # NEEDS_ZUHAL handoff/claim/recover helpers
+│   │   ├── meta.py         # checkpoints, stats, failures, heartbeats, status summary
+│   │   ├── patterns.py     # pattern_stats read/write
+│   │   ├── enrichment.py   # enrichment_cache + serper_enriched flag
+│   │   └── bbops_jobs.py   # in-flight bbops batch job tracking
 │   ├── manifest.py         # SQLite email-state store + CSV ingest helpers
 │   ├── models.py           # InputRecord, EnrichmentResult, ValidationResult dataclasses
 │   ├── config.py           # PipelineConfig (pydantic-settings, reads .env)
 │   ├── cli.py              # argparse definitions
-│   ├── constants.py        # API costs, backoff params, DNS TLDs, fallback blocklist
+│   ├── constants.py        # API costs, backoff, DNS/Serper tuning, provider lists, blocklist
 │   ├── metrics.py          # Prometheus /metrics endpoint (port 9090)
 │   ├── ops/                # Operator-facing tools (post-pipeline workflows)
 │   │   ├── manifest_init.py        # Backfill manifest from existing CSV outputs
 │   │   ├── passoff_watcher.py      # Drip-feed daemon: ingest results → append to combined CSV
 │   │   ├── zuhal_bulk.py           # Submit NEEDS_ZUHAL CSVs to Zuhal Bulk API
-│   │   ├── zb_zuhaled.py           # Submit /zuhaled CSVs to ZeroBounce
+│   │   ├── zb_zuhaled.py           # Submit /zuhaled CSVs to ZeroBounce (--min-confidence gate)
+│   │   ├── ingest_zerobounce.py    # Join /zerobounced CSV back to records (ZB = ground truth)
 │   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
 │   │   ├── normalize_zuhaled.py    # Upgrade legacy {Email,Status} zuhaled files
 │   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
@@ -232,8 +245,25 @@ Cost ceiling before Zuhal → COST_SKIPPED
 | `valid` / `accept-all` | Zuhal rescue succeeded |
 | `invalid` / `error` | Zuhal also rejected or errored |
 | `circuit_open` | Zuhal circuit breaker open; record re-queued as DISCOVERED (auto-heal, no attempt burned) |
-| `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal did NOT run; encodes the SMTP reconciliation result |
+| `dual_valid` / `dual_catch_all` / `dual_invalid` | Zuhal did NOT run; encodes the SMTP reconciliation result (legacy; see `reconciliation_path`) |
 | `ms_valid` | MS probe short-circuited; Zuhal not called |
+
+### `canonical_status` (the standardized verdict — read this, not the per-service columns)
+
+Normalized in one place (`pipeline/verdicts.py`) across all services. One of:
+`valid`, `invalid`, `catch_all`, `unknown`, `do_not_mail`, `abuse`, `disposable`.
+
+| Column | Meaning |
+|---|---|
+| `canonical_status` | Single normalized verdict (`normalize_verdict()` collapses `accept-all`/`catch-all`→`catch_all`, `ms_valid`→`valid`, etc.) |
+| `canonical_source` | Which service set it: `zerobounce` (ground truth) > `zuhal` > `smtp` > `ms_probe` |
+| `canonical_sub_status` | Provider sub-status (mainly ZeroBounce's `role`/`toxic`/…) |
+| `reconciliation_path` | De-overloads `zuhal_status`: holds `dual_*`/`ms_valid` when Zuhal didn't run |
+| `domain_confidence` | 0–1 business-to-domain match confidence, computed at discovery |
+| `zb_status` / `zb_sub_status` | ZeroBounce verdict, ingested by `pipeline.ops.ingest_zerobounce` |
+
+ZeroBounce is the ground-truth final layer and runs as a separate script; its
+ingest overrides `canonical_status`/`canonical_source` for matched records.
 
 ---
 
@@ -269,11 +299,15 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `agent_name` | Registered agent / officer name |
 | `state` | State abbreviation (e.g. `NC`) |
 | `email` | Confirmed deliverable email address |
-| `final_verdict` | Reconciled verdict: `valid` or `catch_all` |
+| `canonical_status` | Standardized verdict (`valid`/`catch_all`/…); read this, not per-service columns |
+| `canonical_source` | Which service set canonical_status (`zerobounce`/`zuhal`/`smtp`/`ms_probe`) |
+| `final_verdict` | Reconciled SMTP/Zuhal verdict: `valid` or `catch_all` |
 | `confidence_tier` | `high` / `medium` / `low` (from `confidence_score`) |
 | `confidence_score` | Raw additive pattern score 0–4 |
+| `domain_confidence` / `domain_confidence_tier` | 0–1 business-to-domain match + its tier |
+| `zb_status` / `zb_sub_status` | ZeroBounce verdict (blank until the ZB ingest runs) |
 | `verified` | `True` if `valid` or `catch_all`; `False` otherwise |
-| `discovery_method` | How the email was found: `dns`, `serper`, `input` |
+| `discovery_method` | How the email was found: `dns`, `serper`, `serper_fallback`, `input` |
 | `validation_method` | Which backend validated: `ms_probe`, `smtp_both`, `smtp_racknerd`, `smtp_bbops`, `zuhal_rescue` |
 | `racknerd_verdict` | Racknerd SMTP verdict for this email |
 | `bbops_verdict` | bbops.io verdict for this email |
@@ -328,7 +362,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 250 tests
+.venv/bin/python -m pytest tests/ -q    # all 515 tests
 .venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```

@@ -13,7 +13,14 @@ import aiohttp
 import aiosqlite
 
 from pipeline.config import PipelineConfig
-from pipeline.constants import FALLBACK_DOMAIN_BLOCKLIST
+from pipeline.constants import (
+    DNS_RESOLVER_TIMEOUT_S,
+    DNS_RESOLVER_TRIES,
+    FALLBACK_DOMAIN_BLOCKLIST,
+    HEARTBEAT_INTERVAL_S,
+    SERPER_BUCKET_CAPACITY,
+    SERPER_BUCKET_REFILL_RATE,
+)
 from pipeline.models import InputRecord, PipelineHaltError
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.dns_probe import probe_domains
@@ -54,7 +61,7 @@ class ProducerWorker:
         self._enrichment_sem = asyncio.Semaphore(config.serper_concurrency)
         # Shared resolver: one c-ares context per producer → avoids per-record setup
         # overhead and enables negative-TTL caching across records.
-        self._dns_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+        self._dns_resolver = aiodns.DNSResolver(timeout=DNS_RESOLVER_TIMEOUT_S, tries=DNS_RESOLVER_TRIES)
 
         # Dynamic fallback domain blocklist.
         # Starts from the static seed; grows when a domain is seen as first-organic
@@ -65,8 +72,8 @@ class ProducerWorker:
 
         # 2 calls/second sustained, burst cap 5, starts empty to prevent startup burst.
         _serper_bucket = TokenBucket(
-            capacity=5,
-            refill_rate=2.0,
+            capacity=SERPER_BUCKET_CAPACITY,
+            refill_rate=SERPER_BUCKET_REFILL_RATE,
             initial_tokens=0,
         )
 
@@ -85,7 +92,7 @@ class ProducerWorker:
             except Exception as exc:
                 logger.debug("Producer heartbeat failed: %s", exc)
             try:
-                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
+                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=HEARTBEAT_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass
 

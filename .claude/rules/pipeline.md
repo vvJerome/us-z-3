@@ -52,6 +52,13 @@ Other rules:
 - `validation_method` values: `ms_probe`, `smtp_both`, `smtp_racknerd`, `smtp_bbops`, `zuhal_rescue`, `unknown`
 - Never use the old names `zuhal_score`, `racknerd+bbops`, `zuhal_fallback` — they are gone
 
+## Canonical verdicts
+
+- Read `canonical_status` for the standardized outcome — never branch on raw per-service values.
+- Normalize every provider status through `pipeline.verdicts.normalize_verdict()` (the single source of truth). Canonical set: `valid`, `invalid`, `catch_all`, `unknown`, `do_not_mail`, `abuse`, `disposable`.
+- `canonical_source` precedence: `zerobounce` (ground truth) > `zuhal` > `smtp` > `ms_probe`. `update_record_dual` sets it for every verdict write; `pipeline.ops.ingest_zerobounce` overrides it on ZB ingest.
+- The `dual_*`/`ms_valid` SMTP-reconciliation signal lives in `reconciliation_path`, not `zuhal_status`.
+
 ## Output
 
 - `valid_emails.csv` is written in `_write_outputs()` only — never written mid-run.

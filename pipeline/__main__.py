@@ -26,6 +26,12 @@ from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
+from pipeline.constants import (
+    DNS_RESOLVER_TIMEOUT_S,
+    DNS_RESOLVER_TRIES,
+    SERPER_BUCKET_CAPACITY,
+    SERPER_BUCKET_REFILL_RATE,
+)
 from pipeline.metrics import serve_metrics
 
 
@@ -82,7 +88,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
         if not config.producer_only:
             # --- Racknerd consumer setup ---
-            shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+            shared_resolver = aiodns.DNSResolver(timeout=DNS_RESOLVER_TIMEOUT_S, tries=DNS_RESOLVER_TRIES)
             rk_helo_kwargs: dict = {}
             if config.racknerd_helo_hostname:
                 rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
@@ -171,8 +177,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 api_key=config.serper_api_key,
                 session=session,
                 rate_limiter=TokenBucket(
-                    capacity=5,
-                    refill_rate=2.0,
+                    capacity=SERPER_BUCKET_CAPACITY,
+                    refill_rate=SERPER_BUCKET_REFILL_RATE,
                     initial_tokens=0,
                 ),
                 dry_run=config.dry_run,
