@@ -45,6 +45,28 @@ TUNNEL_BACKOFF_MAX_S: float = 60.0
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
 DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD: int = 3
 
+# MX-host substrings where a catch-all / accept-all result is least trustworthy:
+# providers that accept-all by default, and security gateways that answer 250 for
+# every address (Proofpoint, Mimecast, Barracuda). A catch-all from these needs
+# higher identity confidence before we accept it, and an `unknown` from them is
+# not worth a second paid verification credit (it will stay unknown).
+CATCHALL_UNTRUSTWORTHY_MX: tuple[str, ...] = (
+    "outlook.com", "protection.outlook.com",          # Microsoft 365 / EOP
+    "google.com", "googlemail.com",                   # Google Workspace
+    "pphosted.com", "ppe-hosted.com",                 # Proofpoint
+    "mimecast.com",                                    # Mimecast
+    "barracudanetworks.com", "barracuda.com",          # Barracuda
+)
+
+
+def is_untrustworthy_catchall_mx(mx_provider: str | None) -> bool:
+    """True if catch-all from this MX host should be treated skeptically."""
+    if not mx_provider:
+        return False
+    lp = mx_provider.lower()
+    return any(p in lp for p in CATCHALL_UNTRUSTWORTHY_MX)
+
+
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.
 # This list grows at runtime via ProducerWorker._fallback_blocklist when a domain

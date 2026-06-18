@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Literal, TYPE_CHECKING
 
+from rapidfuzz import fuzz
+
 from pipeline.constants import DOMAIN_STEM_MIN_LENGTH
 
 if TYPE_CHECKING:
@@ -123,6 +125,42 @@ def generate_domain_stems(business_name: str) -> list[str]:
             unique.append(s)
 
     return unique
+
+
+# How the domain was found, as a prior on correctness. DNS-MX hit on a business-name
+# stem is strong; a Serper first-organic guess is weak. Tuned, not learned —
+# ponytail: heuristic prior, replace with a learned calibration once delivery
+# outcomes are collected (CSV items 7/10).
+_DISCOVERY_PRIOR: dict[str, float] = {
+    "input": 0.6, "dns": 0.5, "serper": 0.35, "serper_fallback": 0.1,
+}
+
+
+def score_domain_confidence(
+    business_name: str, domain: str | None, discovery_source: str | None = None
+) -> float:
+    """Business-to-domain match confidence in [0, 1].
+
+    Combines how the domain was found (prior) with how well the domain stem agrees
+    with the business name (the strongest corroborating signal we hold). Phone/DBA/
+    social signals from the enhancement spec are not in our input data.
+    """
+    if not domain:
+        return 0.0
+    prior = _DISCOVERY_PRIOR.get(discovery_source or "", 0.3)
+    biz = normalize_business_name(business_name).replace(" ", "")
+    stem = (domain.rsplit(".", 1)[0] if "." in domain else domain).replace("-", "")
+    sim = max(fuzz.partial_ratio(stem, biz), fuzz.token_set_ratio(stem, biz)) / 100.0 if biz and stem else 0.0
+    return round(min(1.0, prior + 0.5 * sim), 3)
+
+
+def domain_confidence_tier(score: float) -> str:
+    """Tier a domain-confidence score — thresholds from the research (≥.7 / ≥.4 / low)."""
+    if score >= 0.7:
+        return "high"
+    if score >= 0.4:
+        return "medium"
+    return "low"
 
 
 def assign_email_strategy(record: InputRecord) -> Literal["with", "without"]:

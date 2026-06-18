@@ -25,6 +25,7 @@ from pipeline.utils.text import parse_name
 from pipeline import db
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
+    catch_all_confidence_floor,
     compute_confidence_score,
     pre_score,
     record_pattern,
@@ -280,14 +281,16 @@ class Dispatcher:
         candidate_domain = row["candidate_domain"] or ""
         strategy = row["strategy"] or "without"
         agent_name = row["agent_name"] or ""
-        discovery_source = row["discovery_source"]
+        domain_confidence = row["domain_confidence"]
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
         serper_enriched = bool(row["serper_enriched"])
+        # Catch-all acceptance bar, raised for providers where catch-all is the default.
+        catch_all_floor = catch_all_confidence_floor(self.config.catch_all_min_confidence, mx_provider)
 
         # Identity-first: try the strongest candidates before paid verification.
         candidates.sort(
-            key=lambda e: pre_score(e, candidate_domain, strategy, agent_name, discovery_source),
+            key=lambda e: pre_score(e, candidate_domain, strategy, agent_name, domain_confidence),
             reverse=True,
         )
 
@@ -312,7 +315,7 @@ class Dispatcher:
                 break
 
             candidate_score = pre_score(
-                email, candidate_domain, strategy, agent_name, discovery_source
+                email, candidate_domain, strategy, agent_name, domain_confidence
             )
             # Low-confidence candidates don't earn paid Zuhal rescue (flag default 0.0 = off).
             skip_paid = candidate_score < self.config.zuhal_min_confidence
@@ -374,7 +377,7 @@ class Dispatcher:
             # below the gate, fall through to bbops for a second signal.
             if rk_verdict.status == "valid" or (
                 rk_verdict.status == "catch_all"
-                and candidate_score >= self.config.catch_all_min_confidence
+                and candidate_score >= catch_all_floor
             ):
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, rk_verdict.status, agent_name
@@ -562,7 +565,7 @@ class Dispatcher:
 
             if result.final_verdict == "valid" or (
                 result.final_verdict == "catch_all"
-                and candidate_score >= self.config.catch_all_min_confidence
+                and candidate_score >= catch_all_floor
             ):
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, result.final_verdict, agent_name
