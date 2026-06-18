@@ -20,6 +20,19 @@ SERVICE_BACKOFF: dict[str, tuple[float, float]] = {
     "racknerd": (1.0, 32.0),
 }
 
+# --- DNS resolver (shared defaults; previously duplicated across producer/dns_probe/__main__) ---
+DNS_RESOLVER_TIMEOUT_S: int = 3
+DNS_RESOLVER_TRIES: int = 1
+
+# --- Serper token bucket: 2 calls/sec sustained, burst cap 5, starts empty ---
+SERPER_BUCKET_CAPACITY: int = 5
+SERPER_BUCKET_REFILL_RATE: float = 2.0
+
+# --- Heartbeats / IPC / metrics ---
+HEARTBEAT_INTERVAL_S: float = 30.0    # producer & dispatcher heartbeat loop wait
+NOTIFY_POLL_TIMEOUT_S: float = 30.0   # dispatcher notify-pipe read timeout
+METRICS_PORT: int = 9090
+
 # --- DNS ---
 DNS_TLDS: tuple[str, ...] = (".com", ".net", ".org", ".us", ".info")
 DNS_CONCURRENCY_DEFAULT: int = 100

@@ -11,6 +11,8 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
+    HEARTBEAT_INTERVAL_S,
+    NOTIFY_POLL_TIMEOUT_S,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
@@ -135,7 +137,7 @@ class Dispatcher:
 
                 if self._notify_reader:
                     try:
-                        await asyncio.wait_for(self._notify_reader.read(1), timeout=30.0)
+                        await asyncio.wait_for(self._notify_reader.read(1), timeout=NOTIFY_POLL_TIMEOUT_S)
                     except (asyncio.TimeoutError, asyncio.IncompleteReadError):
                         pass
                 else:
@@ -504,6 +506,6 @@ class Dispatcher:
             except Exception as exc:
                 logger.debug("Dispatcher heartbeat failed: %s", exc)
             try:
-                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
+                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=HEARTBEAT_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass

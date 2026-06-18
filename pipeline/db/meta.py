@@ -132,7 +132,7 @@ async def reset_failed_records(
         if record_state in (State.VALIDATION_FAILED, State.COST_SKIPPED):
             sql = """
                 UPDATE records SET record_state = 'DISCOVERED', dispatch_attempts = 0,
-                validation_attempts = 0, updated_at = datetime('now')
+                updated_at = datetime('now')
                 WHERE record_state = ?
             """
         else:

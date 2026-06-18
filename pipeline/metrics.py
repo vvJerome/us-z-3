@@ -13,9 +13,11 @@ import logging
 import aiohttp.web
 import aiosqlite
 
+from pipeline.constants import METRICS_PORT
+
 logger = logging.getLogger("pipeline.metrics")
 
-_PORT = 9090
+_PORT = METRICS_PORT
 
 
 async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
