@@ -407,7 +407,8 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         SELECT unique_id, business_name, agent_name, state,
                candidate_email, zuhal_status, confidence_score, domain_confidence,
                discovery_source, final_verdict,
-               racknerd_status, bbops_status
+               racknerd_status, bbops_status,
+               canonical_status, canonical_source, zb_status, zb_sub_status
           FROM records WHERE record_state = 'VALIDATED'
         """
     ) as cursor:
@@ -417,10 +418,12 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "unique_id", "business_name", "agent_name", "state",
-            "email", "final_verdict", "confidence_tier", "confidence_score",
+            "email", "canonical_status", "canonical_source",
+            "final_verdict", "confidence_tier", "confidence_score",
             "domain_confidence", "domain_confidence_tier", "verified",
             "discovery_method", "validation_method",
             "racknerd_verdict", "bbops_verdict", "zuhal_verdict",
+            "zb_status", "zb_sub_status",
         ])
         for row in rows:
             fv = row["final_verdict"] or row["zuhal_status"]
@@ -430,7 +433,9 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
             dc = row["domain_confidence"]
             writer.writerow([
                 row["unique_id"], row["business_name"], row["agent_name"],
-                row["state"], row["candidate_email"], fv,
+                row["state"], row["candidate_email"],
+                row["canonical_status"] or "", row["canonical_source"] or "",
+                fv,
                 confidence_tier(int(row["confidence_score"] or 0)),
                 int(row["confidence_score"] or 0),
                 round(dc, 3) if dc is not None else "",
@@ -441,6 +446,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
                 rk,
                 bb,
                 _zuhal_verdict(zs),
+                row["zb_status"] or "", row["zb_sub_status"] or "",
             ])
     logger.info("Wrote %d validated emails to %s", len(rows), csv_path)
 
