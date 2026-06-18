@@ -470,11 +470,9 @@ async def main() -> None:
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
-        "serper_rate_limit",
-        "max_attempts", "backoff_base_dns", "backoff_base_serper",
-        "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
-        "max_cost", "max_consecutive_errors", "max_dispatch_attempts", "max_requeue_count", "dry_run",
-        "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
+        "max_attempts", "backoff_jitter",
+        "max_cost", "max_dispatch_attempts", "max_requeue_count", "dry_run",
+        "ignore_cache", "run_id", "notify_pipe",
         "zuhal_concurrency", "zuhal_rate_limit", "zuhal_on_both_invalid",
     ]:
         val = getattr(args, field_name, None)
