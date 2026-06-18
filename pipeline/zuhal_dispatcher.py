@@ -10,6 +10,7 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
+    is_untrustworthy_catchall_mx,
 )
 from pipeline.models import PipelineHaltError
 from pipeline.utils.cost_tracker import CostTracker
@@ -324,7 +325,12 @@ class ZuhalDispatcher:
         # (dispatch_attempts >= 1) fall through to VALIDATION_FAILED so the
         # ZeroBounce pass can handle it.
         if status == "unknown":
-            if (row["dispatch_attempts"] or 0) < 1:
+            # Retry once for a possibly-transient unknown — but NOT on providers that
+            # accept-all / sit behind a gateway: those return unknown every time, so a
+            # second probe is a guaranteed wasted credit. Send them straight to
+            # VALIDATION_FAILED for the ZeroBounce pass.
+            retry = (row["dispatch_attempts"] or 0) < 1 and not is_untrustworthy_catchall_mx(mx_provider)
+            if retry:
                 async with self._write_lock:
                     await db.requeue_zuhal(self.conn, unique_id)
                 self.stats["requeued"] += 1

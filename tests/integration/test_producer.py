@@ -82,6 +82,34 @@ async def test_process_record_serper_domain_hit_discovered(worker):
     assert result["candidate_domain"] == "acmecorp.com"
 
 
+async def test_process_record_serper_fallback_domain_marks_source(worker):
+    """DNS miss + Serper first-organic fallback domain → discovery_source=serper_fallback."""
+    record = _make_record()
+
+    with patch("pipeline.producer.probe_domains", new=AsyncMock(return_value=(None, None))):
+        worker._serper.enrich = AsyncMock(return_value=EnrichmentResult(
+            candidate_domain="someguess.com",
+            candidate_emails=[],
+            is_fallback_domain=True,
+        ))
+        result = await worker._process_record(record)
+
+    assert result["record_state"] == State.DISCOVERED
+    assert result["discovery_source"] == "serper_fallback"
+
+
+async def test_process_record_sets_domain_confidence(worker):
+    """A DNS hit on a name-matching domain yields a high stored domain_confidence."""
+    record = _make_record(business_name="Acme Widgets")
+
+    with patch("pipeline.producer.probe_domains", new=AsyncMock(return_value=("acmewidgets.com", "mx1.google.com"))):
+        worker._serper.enrich = AsyncMock(return_value=EnrichmentResult())
+        result = await worker._process_record(record)
+
+    assert result["discovery_source"] == "dns"
+    assert result["domain_confidence"] is not None and result["domain_confidence"] >= 0.7
+
+
 async def test_process_record_serper_snippet_email_discovered(worker):
     """DNS miss + Serper finds email in snippet (no domain) → DISCOVERED, discovery_source=serper."""
     record = _make_record()

@@ -72,7 +72,6 @@ class PipelineConfig(BaseSettings):
     bbops_health_ok_threshold: int = Field(default=2, ge=1)
 
     # --- Rate limits (calls per hour) ---
-    serper_rate_limit: int = 500
     zuhal_rate_limit: int = 100
 
     # --- Zuhal fallback backend ---
@@ -81,6 +80,11 @@ class PipelineConfig(BaseSettings):
     zuhal_concurrency_max: int = Field(default=50, ge=1)
     zuhal_on_both_invalid: bool = False
     zuhal_decoupled: bool = True
+    # Identity/deliverability gates (0.0 = disabled, current behavior).
+    # zuhal_min_confidence: candidates scoring below this skip paid Zuhal rescue.
+    # catch_all_min_confidence: catch-all verdicts below this are not auto-accepted.
+    zuhal_min_confidence: float = 0.0
+    catch_all_min_confidence: float = 0.0
     zuhal_poll_interval_s: float = 5.0
     zuhal_chunk_size: int = Field(default=20, ge=1)
     # Backpressure: pause SMTP handoffs when NEEDS_ZUHAL exceeds this (0 = disabled)
@@ -93,24 +97,18 @@ class PipelineConfig(BaseSettings):
     zuhal_bulk_concurrent_jobs: int = Field(default=1, ge=1)
     zuhal_bulk_stale_timeout_minutes: int = Field(default=120, ge=5)
 
-    # --- Backoff ---
+    # --- Backoff (per-service base/max delays live in constants.SERVICE_BACKOFF) ---
     max_attempts: int = 3
-    backoff_base_dns: float = 0.5
-    backoff_base_serper: float = 1.0
-    backoff_max_dns: float = 8.0
-    backoff_max_serper: float = 32.0
     backoff_jitter: float = 0.2
 
     # --- Cost / safety ---
     max_cost: float | None = None
     dry_run: bool = False
-    max_consecutive_errors: int = Field(default=10, ge=1)
     max_discovery_retries: int = Field(default=3, ge=0)
     max_dispatch_attempts: int = Field(default=5, ge=1)
     max_requeue_count: int = Field(default=15, ge=1)
 
     # --- Enrichment ---
-    enrichment_source: Literal["serper"] = "serper"
     ignore_cache: bool = False
 
     # --- Run identity ---

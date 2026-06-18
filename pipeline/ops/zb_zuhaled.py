@@ -56,6 +56,7 @@ ZUHALED = ROOT / "output" / "backup" / "us_output" / "zuhaled"
 ZEROBOUNCED = ROOT / "output" / "backup" / "us_output" / "zerobounced"
 
 EMAIL_KEYS = ("Email", "email", "email_address", "candidate_email")
+CONFIDENCE_KEYS = ("confidence_score", "domain_confidence")
 
 _PART_RE = re.compile(r"(part\d|w_officer|wo_officer|part1)", re.IGNORECASE)
 
@@ -67,6 +68,17 @@ def email_of(row: dict) -> str:
             if v:
                 return v
     return ""
+
+
+def confidence_of(row: dict) -> float | None:
+    """Read a confidence score from the row, or None if no confidence column present."""
+    for k in CONFIDENCE_KEYS:
+        if k in row and str(row[k]).strip():
+            try:
+                return float(row[k])
+            except ValueError:
+                return None
+    return None
 
 
 def batch_id_for(path: Path) -> tuple[str, str, str]:
@@ -82,14 +94,23 @@ def batch_id_for(path: Path) -> tuple[str, str, str]:
     return f"{operator or 'na'}_{path.stem}_{stamp}", operator, part
 
 
-def build_upload_csv(rows: list[dict], skip: set[str]) -> tuple[bytes, list[str]]:
+def build_upload_csv(
+    rows: list[dict], skip: set[str], min_confidence: float = 0.0
+) -> tuple[bytes, list[str]]:
     seen = set(skip)
     unique: list[str] = []
     for r in rows:
         e = email_of(r)
-        if e and e not in seen:
-            seen.add(e)
-            unique.append(e)
+        if not e or e in seen:
+            continue
+        # Don't spend a ZeroBounce credit on a low-confidence address. Rows without a
+        # confidence column are always submitted (can't gate what we can't read).
+        if min_confidence > 0.0:
+            conf = confidence_of(r)
+            if conf is not None and conf < min_confidence:
+                continue
+        seen.add(e)
+        unique.append(e)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["email_address"])
@@ -142,6 +163,7 @@ async def process_one(
     operator: str = "",
     part: str = "",
     seen_emails: set[str] | None = None,
+    min_confidence: float = 0.0,
 ) -> None:
     with input_path.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -160,7 +182,7 @@ async def process_one(
         else:
             skip = seen_emails if seen_emails is not None else manifest.seen_by_zb(conn)
             log.info("[%s] Dedup pool: %d emails", input_path.name, len(skip))
-            csv_bytes, unique = build_upload_csv(rows, skip)
+            csv_bytes, unique = build_upload_csv(rows, skip, min_confidence)
             log.info(
                 "[%s] Submitting %d unique new emails (skipped %d)",
                 input_path.name, len(unique), len(rows) - len(unique),
@@ -212,6 +234,11 @@ async def main_async() -> None:
     parser.add_argument(
         "--db", type=Path, default=manifest.DEFAULT_DB_PATH,
         help=f"Manifest DB (default: {manifest.DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
+        "--min-confidence", type=float, default=0.0,
+        help="Skip rows whose confidence_score/domain_confidence is below this "
+             "(0.0 = submit everything). Saves ZeroBounce credits on weak candidates.",
     )
     args = parser.parse_args()
 
@@ -278,6 +305,7 @@ async def main_async() -> None:
             resume_file_id=args.file_id,
             batch_id=bid, operator=operator, part=part,
             seen_emails=seen,
+            min_confidence=args.min_confidence,
         ))
 
     if len(tasks) == 1:

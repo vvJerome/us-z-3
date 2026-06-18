@@ -16,6 +16,7 @@ from pipeline.consumers.bbops_async import BbopsAsyncConsumer
 from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
 from pipeline.dispatcher import Dispatcher
 from pipeline._dispatch_helpers import confidence_tier
+from pipeline.utils.text import domain_confidence_tier
 from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
@@ -404,7 +405,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
     async with conn.execute(
         """
         SELECT unique_id, business_name, agent_name, state,
-               candidate_email, zuhal_status, confidence_score,
+               candidate_email, zuhal_status, confidence_score, domain_confidence,
                discovery_source, final_verdict,
                racknerd_status, bbops_status
           FROM records WHERE record_state = 'VALIDATED'
@@ -416,7 +417,8 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "unique_id", "business_name", "agent_name", "state",
-            "email", "final_verdict", "confidence_tier", "confidence_score", "verified",
+            "email", "final_verdict", "confidence_tier", "confidence_score",
+            "domain_confidence", "domain_confidence_tier", "verified",
             "discovery_method", "validation_method",
             "racknerd_verdict", "bbops_verdict", "zuhal_verdict",
         ])
@@ -425,11 +427,14 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
             rk = row["racknerd_status"] or ""
             bb = row["bbops_status"] or ""
             zs = row["zuhal_status"]
+            dc = row["domain_confidence"]
             writer.writerow([
                 row["unique_id"], row["business_name"], row["agent_name"],
                 row["state"], row["candidate_email"], fv,
                 confidence_tier(int(row["confidence_score"] or 0)),
                 int(row["confidence_score"] or 0),
+                round(dc, 3) if dc is not None else "",
+                domain_confidence_tier(dc) if dc is not None else "",
                 _is_verified(fv),
                 row["discovery_source"] or "unknown",
                 _validation_method(rk, bb, zs),
@@ -470,11 +475,9 @@ async def main() -> None:
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
-        "serper_rate_limit",
-        "max_attempts", "backoff_base_dns", "backoff_base_serper",
-        "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
-        "max_cost", "max_consecutive_errors", "max_dispatch_attempts", "max_requeue_count", "dry_run",
-        "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
+        "max_attempts", "backoff_jitter",
+        "max_cost", "max_dispatch_attempts", "max_requeue_count", "dry_run",
+        "ignore_cache", "run_id", "notify_pipe",
         "zuhal_concurrency", "zuhal_rate_limit", "zuhal_on_both_invalid",
     ]:
         val = getattr(args, field_name, None)

@@ -20,7 +20,7 @@ from pipeline.utils.dns_probe import probe_domains
 from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
-from pipeline.utils.text import assign_email_strategy, is_org_agent, parse_name
+from pipeline.utils.text import assign_email_strategy, is_org_agent, parse_name, score_domain_confidence
 from pipeline.utils.notify import create_notify_pipe, signal_consumer
 from pipeline import db
 from pipeline.db import State
@@ -323,9 +323,13 @@ class ProducerWorker:
                 result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
                 if serper_result.candidate_domain:
                     enrichment_domain = serper_result.candidate_domain
-                    result["discovery_source"] = "serper"
+                    # serper_fallback = first-organic guess, not a name/KG match — lower
+                    # domain confidence; the dispatcher reads this in pre_score().
                     if serper_result.is_fallback_domain:
+                        result["discovery_source"] = "serper_fallback"
                         self._record_fallback_domain(serper_result.candidate_domain)
+                    else:
+                        result["discovery_source"] = "serper"
                 elif serper_result.candidate_emails:
                     result["discovery_source"] = "serper"
 
@@ -364,6 +368,9 @@ class ProducerWorker:
 
         effective_domain = domain or enrichment_domain
         result["discovery_attempts"] = 1
+        result["domain_confidence"] = score_domain_confidence(
+            record.business_name, effective_domain, result["discovery_source"]
+        )
 
         if all_candidates:
             result["candidate_emails"] = json.dumps(all_candidates)
@@ -416,6 +423,7 @@ class ProducerWorker:
             "strategy": strategy,
             "is_org_agent": org_agent,
             "mx_provider": None,
+            "domain_confidence": None,
             "record_state": State.RAW,
             "_trace": [],
         }

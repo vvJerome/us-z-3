@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS records (
     strategy            TEXT,
     is_org_agent        INTEGER DEFAULT 0,
     mx_provider         TEXT,
+    domain_confidence   REAL,
 
     -- Reconciliation path (encodes which backends ran and what Zuhal did)
     zuhal_status        TEXT,
@@ -201,6 +202,12 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v9
+_V9_MIGRATIONS: list[str] = [
+    # domain_confidence: 0–1 business-to-domain match confidence computed at discovery.
+    "ALTER TABLE records ADD COLUMN domain_confidence REAL",
+]
+
 # Migration statements for schema v8
 _V8_MIGRATIONS: list[str] = [
     # requeue_count: total re-queues (including infra transients) — safety valve against
@@ -216,8 +223,8 @@ INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
     position_type, name_entity_type, candidate_email, candidate_emails,
     subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
-    strategy, is_org_agent, mx_provider, record_state, process_trace, serper_enriched
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    strategy, is_org_agent, mx_provider, domain_confidence, record_state, process_trace, serper_enriched
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_CHECKPOINT_SQL = """
@@ -257,6 +264,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (6, _V4_MIGRATIONS),
         (7, _V7_MIGRATIONS),
         (8, _V8_MIGRATIONS),
+        (9, _V9_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -321,6 +329,7 @@ async def insert_records_batch(
                     r.get("strategy"),
                     1 if r.get("is_org_agent") else 0,
                     r.get("mx_provider"),
+                    r.get("domain_confidence"),
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
                     1 if r.get("serper_enriched") else 0,
@@ -390,7 +399,7 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
                record_state = ?, candidate_email = ?, candidate_emails = ?,
                subdomain_emails = ?, candidate_domain = ?,
                discovery_source = ?, discovery_attempts = ?,
-               mx_provider = ?,
+               mx_provider = ?, domain_confidence = ?,
                updated_at = datetime('now')
            WHERE unique_id = ?""",
         (
@@ -402,6 +411,7 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
             result.get("discovery_source"),
             result.get("discovery_attempts", 1),
             result.get("mx_provider"),
+            result.get("domain_confidence"),
             result["unique_id"],
         ),
     )
