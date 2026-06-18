@@ -7,7 +7,35 @@ from pipeline.utils.text import (
     generate_domain_stems,
     assign_email_strategy,
     is_org_agent,
+    score_domain_confidence,
+    domain_confidence_tier,
 )
+
+
+class TestScoreDomainConfidence:
+    def test_no_domain_is_zero(self):
+        assert score_domain_confidence("Acme Corp", None) == 0.0
+
+    def test_dns_hit_with_name_match_is_high(self):
+        assert score_domain_confidence("Acme Widgets", "acmewidgets.com", "dns") >= 0.7
+
+    def test_fallback_with_unrelated_domain_is_low(self):
+        assert score_domain_confidence("Acme Widgets", "randomguess.com", "serper_fallback") < 0.4
+
+    def test_better_source_scores_higher(self):
+        dns = score_domain_confidence("Acme Widgets", "acmewidgets.com", "dns")
+        fb = score_domain_confidence("Acme Widgets", "acmewidgets.com", "serper_fallback")
+        assert dns > fb
+
+    def test_clamped_to_one(self):
+        assert score_domain_confidence("Acme Widgets", "acmewidgets.com", "input") <= 1.0
+
+
+class TestDomainConfidenceTier:
+    def test_tiers(self):
+        assert domain_confidence_tier(0.8) == "high"
+        assert domain_confidence_tier(0.5) == "medium"
+        assert domain_confidence_tier(0.2) == "low"
 
 
 def _rec(**kwargs) -> InputRecord:

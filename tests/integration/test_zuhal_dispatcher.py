@@ -55,6 +55,7 @@ async def _seed_needs_zuhal(
     *,
     rk_status: str = "error",
     bb_status: str = "error",
+    mx_provider: str = "gmail.com",
 ) -> None:
     await conn.execute(
         """
@@ -68,7 +69,7 @@ async def _seed_needs_zuhal(
         (
             unique_id, "Test Corp", "John Doe",
             State.NEEDS_ZUHAL,
-            json.dumps([email]), email, "example.com", "with", "gmail.com",
+            json.dumps([email]), email, "example.com", "with", mx_provider,
             rk_status, "smtp error", bb_status, "smtp error",
         ),
     )
@@ -146,6 +147,43 @@ class TestZuhalDispatcherTerminalVerdicts:
 
         assert row["record_state"] == State.VALIDATION_FAILED
         assert row["final_verdict"] == "invalid"
+
+
+class TestZuhalUnknownCreditGuard:
+    async def test_unknown_on_catchall_provider_does_not_retry(self, test_db, config):
+        """Credit guard: an unknown from an accept-all/gateway provider goes straight to
+        VALIDATION_FAILED — no second paid Zuhal call (it would just return unknown again)."""
+        await _seed_needs_zuhal(test_db, mx_provider="aspmx.l.google.com")
+        zuhal = _mock_zuhal("unknown")
+        cost = CostTracker(None)
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        assert worker.stats["requeued"] == 0          # not re-queued for a 2nd attempt
+        assert cost.counts.get("zuhal", 0) == 1        # charged exactly once
+
+    async def test_unknown_on_normal_provider_retries_once(self, test_db, config):
+        """A normal provider's unknown is retried once (could be transient)."""
+        await _seed_needs_zuhal(test_db, mx_provider="mx.privatehost.example")
+        zuhal = _mock_zuhal("unknown")
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.NEEDS_ZUHAL  # re-queued for a 2nd attempt
+        assert worker.stats["requeued"] == 1
 
 
 class TestZuhalDispatcherFailureModes:

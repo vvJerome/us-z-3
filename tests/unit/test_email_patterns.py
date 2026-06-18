@@ -10,7 +10,28 @@ from pipeline.utils.email_patterns import (
     _GENERIC_TEMPLATES,
     _expand_personal,
     _surname_variants,
+    _nickname_variants,
 )
+
+
+class TestNicknameVariants:
+    def test_known_nickname_expands_both_directions(self):
+        assert "bob" in _nickname_variants("robert")
+        assert "robert" in _nickname_variants("bob")
+
+    def test_unknown_name_returns_empty(self):
+        assert _nickname_variants("zebediah") == []
+
+    def test_case_insensitive(self):
+        assert "bob" in _nickname_variants("Robert")
+
+    def test_nickname_candidates_included_within_cap(self):
+        result = generate_ranked_candidates("robert", "smith", "acme.com", "with", max_candidates=5)
+        assert any(e.startswith("bob.smith@") for e in result)
+
+    def test_no_nickname_leaves_simple_name_unchanged(self):
+        result = generate_ranked_candidates("zebediah", "smith", "acme.com", "with", max_candidates=5)
+        assert result[0] == "zebediah.smith@acme.com"
 
 
 class TestGeneratePersonalPatterns:
