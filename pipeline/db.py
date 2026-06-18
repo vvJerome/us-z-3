@@ -6,9 +6,11 @@ from pathlib import Path
 
 import aiosqlite
 
+from pipeline.verdicts import canonical_from_smtp, canonical_from_zuhal
+
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,19 @@ CREATE TABLE IF NOT EXISTS records (
     bbops_verified_at   TEXT,
     final_verdict       TEXT,
     dispatch_attempts   INTEGER DEFAULT 0,
+
+    -- ZeroBounce (ground-truth final layer, ingested by a separate script)
+    zb_status           TEXT,
+    zb_sub_status       TEXT,
+    zb_verified_at      TEXT,
+
+    -- Canonical verdict: one normalized status everything reads (see pipeline/verdicts.py).
+    -- canonical_source: which service set it (zerobounce > zuhal > smtp > ms_probe).
+    -- reconciliation_path: de-overloads zuhal_status (dual_*/ms_valid live here now).
+    canonical_status    TEXT,
+    canonical_sub_status TEXT,
+    canonical_source    TEXT,
+    reconciliation_path TEXT,
 
     -- Enrichment tracking
     serper_enriched     INTEGER DEFAULT 0,
@@ -202,6 +217,27 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v10 — verdict-field standardization (additive).
+_V10_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN zb_status TEXT",
+    "ALTER TABLE records ADD COLUMN zb_sub_status TEXT",
+    "ALTER TABLE records ADD COLUMN zb_verified_at TEXT",
+    "ALTER TABLE records ADD COLUMN canonical_status TEXT",
+    "ALTER TABLE records ADD COLUMN canonical_sub_status TEXT",
+    "ALTER TABLE records ADD COLUMN canonical_source TEXT",
+    "ALTER TABLE records ADD COLUMN reconciliation_path TEXT",
+    # Best-effort backfill of existing rows (no ZeroBounce history available):
+    # canonical_status from final_verdict, normalized to the canonical set.
+    "UPDATE records SET canonical_status = "
+    "  CASE WHEN final_verdict IN ('valid','invalid','catch_all') THEN final_verdict END, "
+    "       canonical_source = CASE WHEN final_verdict IS NOT NULL THEN 'smtp' END "
+    " WHERE canonical_status IS NULL AND final_verdict IS NOT NULL",
+    # Move the dual_*/ms_valid overload off zuhal_status into reconciliation_path.
+    "UPDATE records SET reconciliation_path = zuhal_status "
+    " WHERE reconciliation_path IS NULL AND zuhal_status IN "
+    "       ('dual_valid','dual_catch_all','dual_invalid','ms_valid')",
+]
+
 # Migration statements for schema v9
 _V9_MIGRATIONS: list[str] = [
     # domain_confidence: 0–1 business-to-domain match confidence computed at discovery.
@@ -265,6 +301,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (7, _V7_MIGRATIONS),
         (8, _V8_MIGRATIONS),
         (9, _V9_MIGRATIONS),
+        (10, _V10_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -527,6 +564,24 @@ async def update_record_dual(
     if confidence_score is not None:
         sets.append("confidence_score = ?")
         values.append(confidence_score)
+
+    # Canonical verdict — computed once here so every caller populates it. ZeroBounce
+    # (ground truth) overrides this later via the ingest script; until then the source
+    # is whichever backend produced this verdict.
+    if zuhal_status_override is not None:
+        canonical_status, canonical_source = canonical_from_zuhal(zuhal_status_override)
+        recon_path = None
+    else:
+        ms = racknerd_status == "ms_valid"
+        canonical_status, canonical_source = canonical_from_smtp(final_verdict, ms_probe=ms)
+        recon_path = "ms_valid" if ms else f"dual_{final_verdict}"
+    sets.append("canonical_status = ?")
+    values.append(canonical_status)
+    sets.append("canonical_source = ?")
+    values.append(canonical_source)
+    if recon_path is not None:
+        sets.append("reconciliation_path = ?")
+        values.append(recon_path)
 
     values.append(unique_id)
     sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
