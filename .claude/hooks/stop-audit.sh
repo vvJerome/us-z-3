@@ -9,9 +9,9 @@ set -uo pipefail
 echo "=== Session audit: $(date -u '+%Y-%m-%d %H:%M:%S UTC') ===" >&2
 
 # --- Full test suite (only when Python changed this session) ---
-PY_DIRTY=$(git diff --name-only 2>/dev/null | grep -E '\.py$' || true)
-PY_STAGED=$(git diff --cached --name-only 2>/dev/null | grep -E '\.py$' || true)
-if [[ -n "$PY_DIRTY$PY_STAGED" && -x ".venv/bin/python" ]]; then
+# --porcelain catches staged, unstaged, AND untracked .py (e.g. a new test file).
+PY_CHANGED=$(git status --porcelain 2>/dev/null | grep -E '\.py$' || true)
+if [[ -n "$PY_CHANGED" && -x ".venv/bin/python" ]]; then
   echo "Running test suite (Python changed this session)…" >&2
   if ! .venv/bin/python -m pytest tests/ -q >/tmp/stop-pytest.log 2>&1; then
     echo "❌ TESTS FAILING — do not consider the task done:" >&2
