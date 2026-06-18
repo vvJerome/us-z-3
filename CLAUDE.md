@@ -322,7 +322,6 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
 | `--racknerd-direct` | off | Skip SOCKS5 tunnel; connect directly to MX servers (use when running on the egress VPS) |
 | `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
-| `--max-consecutive-errors N` | 10 | Halt after N consecutive producer errors |
 
 ---
 
