@@ -41,3 +41,10 @@
 
 - No comments that describe WHAT the code does — only WHY (non-obvious constraint, workaround, invariant).
 - No multi-line docstrings on internal helpers — one line max.
+
+## Modularization
+
+- **Hard limit: no file may exceed 600 LOC.** The `post-edit-lint.sh` hook flags any file over it.
+- Split by **responsibility**, never by "head/tail". When a module grows past the limit, break it into a package whose modules each own one concern, and re-export the public surface from `__init__.py` so call sites stay unchanged. Reference splits: `pipeline/db/` (schema / records / zuhal_queue / meta / patterns / enrichment / bbops_jobs) and the dispatcher (`dispatcher` + `reconcile` + `dispatch_probes` + `dispatch_verdicts`).
+- A single function should not carry the whole flow — extract cohesive helpers (pure logic to its own module, side-effecting steps to named functions) rather than letting one method sprawl.
+- Prefer many small, single-purpose files over one large one. Shared physics/protocol constants live in `constants.py`; operator-tunable values in `config.py` — never inline a value that is duplicated across files.

@@ -21,6 +21,17 @@ You are a Python refactoring specialist focused on async clarity and minimal sur
 - `try/except Exception: pass` without logging → add `logger.debug(...)` or remove the try entirely
 - `if x is not None: return x` patterns in short functions → use `x or default`
 - Long `if/elif` chains dispatching on string literals → consider a dict lookup
+- Literals duplicated across files → hoist to `constants.py` (physics/protocol) or `config.py` (tunable)
+
+## Modularization (hard rule)
+
+- **No file may exceed 600 LOC.** If one does, split it by **responsibility** — never head/tail.
+  Make it a package with a re-exporting `__init__.py` so call sites stay unchanged
+  (pattern: `pipeline/db/`), or extract cohesive concerns to sibling modules
+  (pattern: `dispatcher` → `reconcile` / `dispatch_probes` / `dispatch_verdicts`).
+- A method carrying an entire flow (hundreds of lines) is a smell — lift pure logic to its
+  own module and side-effecting steps to named helpers. This is the one case where
+  single-use extraction IS warranted (it overrides "don't extract single-use helpers" below).
 
 ## What NOT to change
 

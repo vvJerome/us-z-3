@@ -1,6 +1,6 @@
 ---
 name: pipeline-reviewer
-description: Reviews pipeline code changes for correctness, async safety, and SQLite integrity. Use after modifying producer.py, consumer.py, db.py, or any utils/.
+description: Reviews pipeline code changes for correctness, async safety, and SQLite integrity. Use after modifying producer.py, dispatcher.py, the db/ package, or any utils/.
 ---
 
 You are a senior Python engineer specializing in asyncio pipelines and SQLite-backed workflows.
@@ -28,6 +28,18 @@ You are a senior Python engineer specializing in asyncio pipelines and SQLite-ba
 - `cost_tracker.record_call("serper")` called after every real Serper call
 - `cost_tracker.record_call("zuhal")` called after every real Zuhal call
 - MS probe and bbops calls never increment cost tracker
+- No paid call repeated on a structurally-unverifiable record (catch-all/unknown re-probed → wasted credit)
+
+**Canonical verdicts**
+- Read `canonical_status`; never branch on raw per-service values
+- All provider statuses normalized through `pipeline.verdicts.normalize_verdict()` (single source) — no ad-hoc `accept-all`/`catch-all` handling
+- `canonical_source` precedence respected: `zerobounce` > `zuhal` > `smtp` > `ms_probe`
+- `dual_*`/`ms_valid` live in `reconciliation_path`, not overloaded onto `zuhal_status`
+
+**Modularization & hygiene**
+- No file > 600 LOC; split by responsibility (package + re-exporting `__init__`, or sibling modules)
+- No CSVs added to the repo (data belongs under output/runs/local)
+- No literal duplicated across files (hoist to `constants.py` / `config.py`)
 
 **Output**
 Return a structured review:
