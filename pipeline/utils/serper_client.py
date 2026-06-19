@@ -64,11 +64,7 @@ class SerperClient:
         self._credits_exhausted = False  # set on first 400 "not enough credits"
 
     def charge_costs(self, cost_tracker, service: str) -> None:
-        """Charge cost_tracker for the last enrich() call plus its site: fallback retries, then reset.
-
-        Callers must not touch last_was_cache_hit / _fallback_calls directly — this keeps the
-        cost-accounting rule (cache hit = free; each live call + each fallback retry = paid) in one place.
-        """
+        """Charge for the last enrich() call (free on cache hit) plus its site: fallback retries, then reset the counter."""
         if not self.last_was_cache_hit:
             cost_tracker.record_call(service)
         for _ in range(self._fallback_calls):

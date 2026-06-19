@@ -182,11 +182,7 @@ class Dispatcher:
         self.stats["validation_failed"] += 1
 
     async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
-        """Check the dispatch budget and parse candidate_emails.
-
-        Returns the candidate list, or None after marking the record VALIDATION_FAILED when it
-        can't proceed (attempt/requeue budget exhausted, or missing/corrupt candidate JSON).
-        """
+        """Check dispatch budget and parse candidate_emails; mark VALIDATION_FAILED and return None if it can't proceed."""
         unique_id = row["unique_id"]
         # dispatch_attempts counts only re-queues where a real verdict was obtained.
         # requeue_count counts every re-queue including infra transients — the safety valve
@@ -251,11 +247,7 @@ class Dispatcher:
     async def _inject_serper_fallback(
         self, unique_id: str, row: aiosqlite.Row, candidates: list[str], original_count: int
     ) -> bool:
-        """Inject Serper enrichment after pattern candidates are exhausted.
-
-        Serper was skipped in the producer (DNS hit) — call it now as a fallback so we only
-        pay $0.001 when patterns actually fail, not upfront. Returns True if cost-skipped.
-        """
+        """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
         if self.cost_tracker.ceiling_reached():
             logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
             await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
