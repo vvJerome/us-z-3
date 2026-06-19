@@ -76,6 +76,53 @@ async def _insert_discovered(conn, unique_id: str, email: str = "test@example.co
 
 
 class TestDispatcherReconciliation:
+    async def test_harvest_fallback_validates_scraped_email(self, test_db, config):
+        """With --harvest, after patterns fail SMTP a harvested email is tried and validates."""
+        from pipeline.harvest import HarvestResult
+
+        await test_db.execute(
+            """
+            INSERT INTO records
+                (unique_id, business_name, agent_name, record_state,
+                 candidate_emails, candidate_email, candidate_domain,
+                 strategy, mx_provider, serper_enriched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                "rec1", "Acme Co", "John Doe", State.DISCOVERED,
+                json.dumps(["guess@acme.com"]), "guess@acme.com", "acme.com",
+                "with", "gmail.com",
+            ),
+        )
+        await test_db.commit()
+
+        # Racknerd: the pattern guess fails, the harvested address validates.
+        async def rk_verify(email, *a, **k):
+            ok = email == "owner@acme.com"
+            return BackendVerdict("valid" if ok else "invalid", "", "2026-05-04T00:00:00Z")
+        rk = MagicMock()
+        rk.verify = AsyncMock(side_effect=rk_verify)
+        bb = _mock_bbops("invalid", "550")
+
+        harvest_cfg = config.model_copy(update={"harvest_enabled": True})
+        dispatcher = Dispatcher(harvest_cfg, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        with patch(
+            "pipeline.dispatcher.harvest",
+            AsyncMock(return_value=HarvestResult(emails=["owner@acme.com"])),
+        ):
+            await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, candidate_email, racknerd_status "
+            "FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["candidate_email"] == "owner@acme.com"  # the harvested address won
+        assert row["racknerd_status"] == "valid"
+
     async def test_racknerd_valid_skips_bbops(self, test_db, config):
         """Racknerd valid short-circuits: bbops is skipped (sequential flow)."""
         await _insert_discovered(test_db, "rec1")

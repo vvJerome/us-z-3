@@ -41,10 +41,20 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 7. `email_to_template()` called after every terminal verdict to update `pattern_stats`
 
 Other rules:
+- Fallback order when pattern candidates are exhausted: **free harvest first, then paid Serper.** `_inject_harvest_fallback` runs only when `harvest_enabled`; `fb_boundary` moves out as it injects so harvested candidates are tried before Serper is called. Serper only fires when harvest adds nothing.
 - `recover_stale_validating()` called at startup before the poll loop.
 - `cost_tracker.ceiling_reached()` checked before the Zuhal rescue call, not before SMTP backends.
 - Racknerd and bbops do NOT increment the cost tracker — only Zuhal does.
 - `last_rk` / `last_bb` tracked throughout the candidate loop so the final write always reflects the last actual backend verdict, not NULL.
+
+## Harvest (`pipeline/harvest/`)
+
+- Opt-in only (`--harvest` / `config.harvest_enabled`). Off by default — never fetches a site unless enabled.
+- `extract.py` is pure (no I/O) — all network lives in `fetch.py`. Keep it that way so extraction stays unit-testable without mocks.
+- Harvest spends **no** API budget — never call `cost_tracker.record_call` from the harvest path.
+- Always go through `urllib.robotparser` (fail-open: a missing/erroring robots.txt means proceed) and the shared global `TokenBucket`. Never bypass the rate limiter.
+- curl_cffi fingerprint is `constants.HARVEST_IMPERSONATE`; paths are `constants.HARVEST_PATHS`. Don't inline either.
+- `infer_templates` normalizes scraped names with `.lower()` before `email_to_template` — `parse_name` output is lowercase and the reverse-map is case-sensitive.
 
 ## Field naming
 
