@@ -69,6 +69,7 @@ Other rules:
 - Normalize every provider status through `pipeline.verdicts.normalize_verdict()` (the single source of truth). Canonical set: `valid`, `invalid`, `catch_all`, `unknown`, `do_not_mail`, `abuse`, `disposable`.
 - `canonical_source` precedence: `zerobounce` (ground truth) > `zuhal` > `smtp` > `ms_probe`. `update_record_dual` sets it for every verdict write; `pipeline.ops.ingest_zerobounce` overrides it on ZB ingest.
 - The `dual_*`/`ms_valid` SMTP-reconciliation signal lives in `reconciliation_path`, not `zuhal_status`.
+- `ingest_zerobounce` feeds ground-truth `valid`/`invalid` back into `pattern_stats` via `_feed_pattern_stats` (continuous learning). Only those two canonical outcomes count — `catch_all`/`unknown`/`do_not_mail`/`abuse`/`disposable` are inconclusive for the local-part convention and are skipped. The verdict write is idempotent; the pattern feedback is not — ingest each ZB CSV once.
 
 ## Output
 

@@ -101,10 +101,11 @@ class TestZeroBounceIngest:
             w.writerow(["email", "unique_id", "zb_status", "zb_sub_status", "zb_processed_at"])
             w.writerow(["john@acme.com", "IL-000123", "do_not_mail", "role_based", "2026-06-18"])
 
-        matched, skipped = ingest(tmp_path / "test.db", zb_csv)
+        matched, skipped, learned = ingest(tmp_path / "test.db", zb_csv)
 
         row = await _canonical(test_db, "IL-000123")
         assert matched == 1
+        assert learned == 0  # do_not_mail is inconclusive for pattern learning
         assert row["zb_status"] == "do_not_mail"
         assert row["canonical_status"] == "do_not_mail"   # ZB overrides the SMTP 'valid'
         assert row["canonical_source"] == "zerobounce"
@@ -116,5 +117,30 @@ class TestZeroBounceIngest:
             w = csv.writer(f)
             w.writerow(["email", "unique_id", "zb_status"])
             w.writerow(["x@y.com", "IL-999999", "valid"])
-        matched, skipped = ingest(tmp_path / "test.db", zb_csv)
-        assert matched == 0 and skipped == 1
+        matched, skipped, learned = ingest(tmp_path / "test.db", zb_csv)
+        assert matched == 0 and skipped == 1 and learned == 0
+
+    async def test_ingest_feeds_valid_verdict_into_pattern_stats(self, test_db, tmp_path):
+        # Record with a parseable name + mx_provider so a template can be derived.
+        await test_db.execute(
+            "INSERT INTO records (unique_id, candidate_email, candidate_domain, agent_name, "
+            "mx_provider, strategy, record_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("IL-1", "john.smith@acme.com", "acme.com", "John Smith", "google.com", "with", State.VALIDATED),
+        )
+        await test_db.commit()
+        zb_csv = tmp_path / "zb.csv"
+        with zb_csv.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["email", "unique_id", "zb_status"])
+            w.writerow(["john.smith@acme.com", "IL-1", "valid"])
+
+        matched, skipped, learned = ingest(tmp_path / "test.db", zb_csv)
+        assert matched == 1 and learned == 1
+
+        async with test_db.execute(
+            "SELECT template, success_count, total_count FROM pattern_stats WHERE mx_provider = ?",
+            ("google.com",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["template"] == "first.last"
+        assert row["success_count"] == 1 and row["total_count"] == 1
