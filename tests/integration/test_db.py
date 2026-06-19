@@ -1,6 +1,5 @@
 """Integration tests for database operations using in-memory SQLite."""
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -69,6 +68,33 @@ class TestInitDb:
         assert "idx_records_unique_id" in indexes
 
         await conn.close()
+
+    async def test_migration_v10_to_v11_adds_owner_confidence(self, tmp_path: Path):
+        """An existing v10 DB (no owner_confidence) gains the column via the v11 ALTER migration."""
+        db_path = tmp_path / "old.db"
+        # Build a real v11 DB, then roll it back to a pre-v11 state: drop the column and the version.
+        conn = await db.init_db(db_path)
+        await conn.execute("INSERT INTO records (unique_id, record_state) VALUES ('r1', 'RAW')")
+        await conn.execute("ALTER TABLE records DROP COLUMN owner_confidence")
+        await conn.execute("PRAGMA user_version = 10")
+        await conn.commit()
+        await conn.close()
+
+        # Re-open: init_db must run _V11_MIGRATIONS and re-add the column.
+        conn = await db.init_db(db_path)
+        try:
+            async with conn.execute("PRAGMA table_info(records)") as cur:
+                cols = {r[1] for r in await cur.fetchall()}
+            assert "owner_confidence" in cols
+            async with conn.execute("PRAGMA user_version") as cur:
+                assert (await cur.fetchone())[0] == 11
+            # Existing row survived the migration; new column defaults to NULL.
+            async with conn.execute(
+                "SELECT owner_confidence FROM records WHERE unique_id = 'r1'"
+            ) as cur:
+                assert (await cur.fetchone())[0] is None
+        finally:
+            await conn.close()
 
 
 class TestCheckpoints:
