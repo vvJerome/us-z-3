@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import re
 
-from rapidfuzz import fuzz
-
 from pipeline.constants import COMMERCIAL_AGENT_NAMES, OWNER_ROLE_KEYWORDS
 from pipeline.models import InputRecord
 from pipeline.utils.text import is_org_agent, normalize_business_name, parse_name
@@ -22,22 +20,12 @@ def is_commercial_agent(agent_name: str) -> bool:
     """True when the agent name is a known commercial registered-agent service."""
     # Light normalize only — normalize_business_name strips "corporation"/"company",
     # which would erase the very service names we're matching against.
-    norm = _NON_ALNUM.sub(" ", agent_name.lower())
-    norm = " ".join(norm.split())
+    norm = " ".join(_NON_ALNUM.sub(" ", agent_name.lower()).split())
     return any(svc in norm for svc in COMMERCIAL_AGENT_NAMES)
 
 
 def _is_owner_role(position_type: str) -> bool:
     return any(kw in position_type.lower() for kw in OWNER_ROLE_KEYWORDS)
-
-
-def _name_overlaps_business(last: str, business_name: str) -> bool:
-    biz = normalize_business_name(business_name)
-    if not last or not biz:
-        return False
-    if last.lower() in biz.split():
-        return True
-    return fuzz.partial_ratio(last.lower(), biz) >= 85
 
 
 def score_owner_confidence(record: InputRecord, has_website: bool) -> float:
@@ -56,7 +44,9 @@ def score_owner_confidence(record: InputRecord, has_website: bool) -> float:
         return 0.1  # unparseable / not a person
 
     score = _BASE_INDIVIDUAL
-    if _name_overlaps_business(last, record.business_name):
+    # Exact surname-token match against the (suffix-stripped) business name — precise,
+    # no fuzzy match: a 3-char surname against a long name invites false positives.
+    if last.lower() in normalize_business_name(record.business_name).split():
         score += _W_NAME_OVERLAP
     if _is_owner_role(record.position_type):
         score += _W_OWNER_ROLE
