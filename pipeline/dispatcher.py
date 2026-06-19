@@ -22,7 +22,10 @@ from pipeline.models import BackendVerdict, PipelineHaltError
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.ms_verify import is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
+from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.text import parse_name
+from pipeline.harvest import harvest, infer_templates
 from pipeline import db
 from pipeline import dispatch_probes as dp
 from pipeline import dispatch_verdicts as dv
@@ -80,6 +83,12 @@ class Dispatcher:
         self.stop_event = stop_event or asyncio.Event()
         self.zuhal = zuhal
         self.serper = serper
+        self.harvest_enabled = config.harvest_enabled
+        # ponytail: one global bucket throttles ALL harvests combined (no burst); swap for
+        # per-host buckets only if a single global RPS becomes the throughput bottleneck.
+        self._harvest_rl = TokenBucket(
+            capacity=1, refill_rate=config.harvest_rps, initial_tokens=0,
+        ) if config.harvest_enabled else None
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
         self._notify_reader: asyncio.StreamReader | None = None
@@ -244,15 +253,51 @@ class Dispatcher:
         self.stats["validated"] += 1
         logger.info(log_msg, *log_args)
 
+    async def _inject_harvest_fallback(
+        self, unique_id: str, candidates: list[str], first: str, last: str,
+        strategy: str, mx_provider: str | None, domain: str,
+    ) -> int:
+        """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
+        try:
+            result = await harvest(
+                domain, rate_limiter=self._harvest_rl, timeout_s=self.config.harvest_timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
+            return 0
+        existing = set(candidates)
+        new: list[str] = []
+        # House convention first: a scraped name paired to a harvested email reveals the
+        # template, so generate OUR officer's address with it (synthetic top-ranked pattern).
+        templates = infer_templates(result.emails, result.officers, domain)
+        if templates:
+            rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
+            # strategy is always "with"/"without" from the row; mypy sees only str.
+            for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
+                if c not in existing:
+                    new.append(c)
+                    existing.add(c)
+        for e in result.emails:  # then the literal harvested addresses
+            if e not in existing:
+                new.append(e)
+                existing.add(e)
+        candidates.extend(new)
+        logger.info(
+            "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
+            unique_id, domain, len(result.emails), len(result.officers), len(new),
+            " [BLOCKED]" if result.blocked else "",
+        )
+        return len(new)
+
     async def _inject_serper_fallback(
-        self, unique_id: str, row: aiosqlite.Row, candidates: list[str], original_count: int
+        self, unique_id: str, row: aiosqlite.Row, candidates: list[str]
     ) -> bool:
         """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
         if self.cost_tracker.ceiling_reached():
             logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
             await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
             return True
-        existing = set(candidates[:original_count])
+        existing = set(candidates)
         raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
         new_emails = [e for e in raw_emails if e not in existing]
         try:
@@ -296,6 +341,9 @@ class Dispatcher:
         pending_trace: list[dict] = []
         cost_skipped = False
         original_count = len(candidates)
+        # fb_boundary moves out as harvest injects candidates, so they're tried before paid Serper.
+        fb_boundary = original_count
+        harvested = False
         i = 0
         last_rk: BackendVerdict | None = None
         last_bb: BackendVerdict | None = None
@@ -470,12 +518,21 @@ class Dispatcher:
                 email, unique_id, result.final_verdict,
             )
 
-            # After exhausting original pattern candidates, inject Serper enrichment.
-            if i == original_count and not serper_enriched and self.serper and candidate_domain:
-                serper_enriched = True  # prevent re-injection on subsequent loops
-                if await self._inject_serper_fallback(unique_id, row, candidates, original_count):
-                    cost_skipped = True
-                    break
+            # Patterns exhausted: free harvest first, then paid Serper if harvest is empty.
+            if i == fb_boundary and candidate_domain:
+                if self.harvest_enabled and not harvested:
+                    harvested = True
+                    added = await self._inject_harvest_fallback(
+                        unique_id, candidates, _first, _last, strategy, mx_provider, candidate_domain,
+                    )
+                    if added:
+                        fb_boundary += added
+                        continue  # try harvested candidates before paying for Serper
+                if not serper_enriched and self.serper:
+                    serper_enriched = True  # prevent re-injection on subsequent loops
+                    if await self._inject_serper_fallback(unique_id, row, candidates):
+                        cost_skipped = True
+                        break
 
         if cost_skipped:
             return

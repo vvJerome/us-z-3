@@ -58,6 +58,11 @@ us-z-3/
 │   ├── dispatch_probes.py  # Backend probe wrappers (ms/zuhal/serper/racknerd/bbops)
 │   ├── dispatch_verdicts.py# Zuhal-rescue verdict handling for the candidate loop
 │   ├── verdicts.py         # Canonical verdict vocabulary (normalize_verdict + sources)
+│   ├── harvest/            # Website harvester: free email/officer scrape (--harvest)
+│   │   ├── __init__.py     # harvest(domain) → HarvestResult orchestration
+│   │   ├── fetch.py        # curl_cffi AsyncSession + robots.txt + rate limit
+│   │   ├── extract.py      # PURE: email/officer extraction + house-convention inference
+│   │   └── models.py       # HarvestResult dataclass
 │   ├── db/                 # SQLite data layer, split by responsibility
 │   │   ├── __init__.py     # Re-exports the full surface (from pipeline import db)
 │   │   ├── schema.py       # DDL, migrations, State machine, init_db
@@ -185,9 +190,21 @@ InputRecord (RAW)
         circuit_open       → re-queue, no burn (auto-heal)
         else               → try next candidate
 
+All pattern candidates fail → harvest (free, --harvest) → Serper fallback (paid) → more candidates
 All candidates exhausted → VALIDATION_FAILED
 Cost ceiling before Zuhal → COST_SKIPPED
 ```
+
+### Website harvesting (`--harvest`, opt-in)
+
+When every generated pattern candidate fails SMTP, the dispatcher scrapes the business's
+own domain (`pipeline/harvest/`) **before** paying for the Serper fallback — free local work
+first. It fetches `HARVEST_PATHS` (homepage + contact/about/team/…) via curl_cffi with a
+browser TLS fingerprint, respects `robots.txt`, and is throttled by one global rate bucket.
+
+- **Convention learning (item 2):** a scraped name paired to a harvested address (e.g. `john.smith@acme.com` + "John Smith") reveals the house template (`first.last`), which then generates *our* officer's address as a top-ranked candidate.
+- **Officers (item 4):** names found near role keywords (Owner/Founder/President/…) feed extra candidates.
+- Harvest spends no API budget; its candidates are tried before Serper, which is only called if harvest finds nothing.
 
 ### OR-of-valids reconciliation conditions
 
@@ -348,6 +365,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--producer-only` | off | Run discovery only (no SSH tunnel, no Racknerd) |
 | `--consumer-only` | off | Run dispatcher only |
 | `--ignore-cache` | off | Bypass Serper enrichment cache (forces live API call) |
+| `--harvest` | off | Scrape the business website for emails/officers (free) before the paid Serper fallback |
 | `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |
 | `--dispatch-concurrency N` | 20 | Parallel dispatcher workers |

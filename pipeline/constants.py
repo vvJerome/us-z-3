@@ -99,3 +99,19 @@ FALLBACK_DOMAIN_BLOCKLIST: frozenset[str] = frozenset({
     # Maps / generic web
     "google.com", "mapquest.com",
 })
+
+# --- Website harvest (pipeline.harvest) ---
+# Paths fetched on the candidate domain, in order. "" is the homepage. Kept short:
+# a known address on any one of these reveals the house email convention.
+HARVEST_PATHS: tuple[str, ...] = (
+    "", "contact", "about", "about-us", "team", "leadership", "staff", "people",
+)
+
+# curl_cffi TLS fingerprint used for every harvest fetch.
+HARVEST_IMPERSONATE: str = "chrome131"
+
+# Visible-text tokens that flag a nearby name as an officer/decision-maker (item 4).
+HARVEST_ROLE_KEYWORDS: frozenset[str] = frozenset({
+    "owner", "founder", "co-founder", "president", "ceo", "cfo", "coo", "cto",
+    "principal", "partner", "director", "manager", "proprietor", "officer",
+})

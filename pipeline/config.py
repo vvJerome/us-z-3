@@ -97,6 +97,11 @@ class PipelineConfig(BaseSettings):
     zuhal_bulk_concurrent_jobs: int = Field(default=1, ge=1)
     zuhal_bulk_stale_timeout_minutes: int = Field(default=120, ge=5)
 
+    # --- Website harvest (pipeline.harvest) — free fallback before paid Serper ---
+    harvest_enabled: bool = False  # opt-in via --harvest
+    harvest_timeout_s: float = 8.0  # per-request cap
+    harvest_rps: float = Field(default=2.0, gt=0)  # global politeness throttle across all harvests
+
     # --- Backoff (per-service base/max delays live in constants.SERVICE_BACKOFF) ---
     max_attempts: int = 3
     backoff_jitter: float = 0.2
