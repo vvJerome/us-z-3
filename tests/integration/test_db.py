@@ -125,6 +125,21 @@ class TestInsertRecords:
         assert row["business_name"] == "Acme Corp"
         assert row["agent_name"] == "John Doe"
 
+    async def test_insert_persists_owner_confidence(self, test_db):
+        """owner_confidence (schema v11) round-trips through insert_records_batch."""
+        records = [{
+            "unique_id": "oc1", "business_name": "Smith Plumbing LLC",
+            "agent_name": "John Smith", "state": "NC",
+            "owner_confidence": 0.9, "record_state": State.DISCOVERED,
+        }]
+        await db.insert_records_batch(test_db, records, new_offset=1)
+
+        async with test_db.execute(
+            "SELECT owner_confidence FROM records WHERE unique_id = ?", ("oc1",)
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row["owner_confidence"] == 0.9
+
     async def test_insert_batch(self, test_db):
         """Multiple records inserted atomically."""
         records = [

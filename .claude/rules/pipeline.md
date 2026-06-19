@@ -27,6 +27,7 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 - Serper enrichment_cache is keyed by `(business_name_norm, agent_name_norm, state, provider)` — normalize with `.lower().strip()` before any cache lookup or write.
 - Fallback domain blocklist: any domain that appears as first-organic fallback for 2+ different businesses is promoted to `_fallback_blocklist` at runtime. Static seed is in `constants.FALLBACK_DOMAIN_BLOCKLIST`.
 - `process_trace` must have an entry for every stage that ran: `dns`, `patterns`, `serper`, and (if applicable) `input`.
+- `owner_confidence` (registered-agent → owner likelihood) is computed at discovery via `owner_inference.score_owner_confidence(record, has_website=bool(effective_domain))` and written like `domain_confidence`. It's a heuristic baseline, not ML — commercial-agent detection uses a light normalize (never `normalize_business_name`, which strips the very service-name tokens).
 
 ## Dispatcher
 

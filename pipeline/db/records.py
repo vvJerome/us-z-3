@@ -40,6 +40,7 @@ async def insert_records_batch(
                     1 if r.get("is_org_agent") else 0,
                     r.get("mx_provider"),
                     r.get("domain_confidence"),
+                    r.get("owner_confidence"),
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
                     1 if r.get("serper_enriched") else 0,
@@ -109,7 +110,7 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
                record_state = ?, candidate_email = ?, candidate_emails = ?,
                subdomain_emails = ?, candidate_domain = ?,
                discovery_source = ?, discovery_attempts = ?,
-               mx_provider = ?, domain_confidence = ?,
+               mx_provider = ?, domain_confidence = ?, owner_confidence = ?,
                updated_at = datetime('now')
            WHERE unique_id = ?""",
         (
@@ -122,6 +123,7 @@ async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> N
             result.get("discovery_attempts", 1),
             result.get("mx_provider"),
             result.get("domain_confidence"),
+            result.get("owner_confidence"),
             result["unique_id"],
         ),
     )

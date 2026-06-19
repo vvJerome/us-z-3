@@ -10,7 +10,7 @@ _log = logging.getLogger("pipeline.db")
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS records (
     is_org_agent        INTEGER DEFAULT 0,
     mx_provider         TEXT,
     domain_confidence   REAL,
+    owner_confidence    REAL,
 
     -- Reconciliation path (encodes which backends ran and what Zuhal did)
     zuhal_status        TEXT,
@@ -217,6 +218,13 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v11
+_V11_MIGRATIONS: list[str] = [
+    # owner_confidence: 0–1 likelihood the registered agent is the business owner,
+    # computed at discovery (pipeline.utils.owner_inference).
+    "ALTER TABLE records ADD COLUMN owner_confidence REAL",
+]
+
 # Migration statements for schema v10 — verdict-field standardization (additive).
 _V10_MIGRATIONS: list[str] = [
     "ALTER TABLE records ADD COLUMN zb_status TEXT",
@@ -259,8 +267,9 @@ INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
     position_type, name_entity_type, candidate_email, candidate_emails,
     subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
-    strategy, is_org_agent, mx_provider, domain_confidence, record_state, process_trace, serper_enriched
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    strategy, is_org_agent, mx_provider, domain_confidence, owner_confidence,
+    record_state, process_trace, serper_enriched
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_CHECKPOINT_SQL = """
@@ -302,6 +311,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (8, _V8_MIGRATIONS),
         (9, _V9_MIGRATIONS),
         (10, _V10_MIGRATIONS),
+        (11, _V11_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:

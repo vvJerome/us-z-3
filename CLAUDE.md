@@ -305,6 +305,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `confidence_tier` | `high` / `medium` / `low` (from `confidence_score`) |
 | `confidence_score` | Raw additive pattern score 0–4 |
 | `domain_confidence` / `domain_confidence_tier` | 0–1 business-to-domain match + its tier |
+| `owner_confidence` / `owner_confidence_tier` | 0–1 likelihood the agent is the business owner + its tier (computed at discovery) |
 | `zb_status` / `zb_sub_status` | ZeroBounce verdict (blank until the ZB ingest runs) |
 | `verified` | `True` if `valid` or `catch_all`; `False` otherwise |
 | `discovery_method` | How the email was found: `dns`, `serper`, `serper_fallback`, `input` |
@@ -319,6 +320,14 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 - Strategy `with`: name match (+1), not a generic prefix (+1), verdict=`valid` (+1)
 - Strategy `without`: IS a generic prefix (+1), verdict=`valid` (+1)
 - High ≥ 3, medium = 2, low ≤ 1
+
+**Owner-confidence scoring** (`pipeline/utils/owner_inference.py`, additive, capped at 1.0):
+
+- Commercial registered-agent service (`constants.COMMERCIAL_AGENT_NAMES`) → `0.0` (never the owner)
+- Organization agent (`is_org_agent`) → `0.1`
+- Otherwise a named individual: base `0.2` + surname∈business name (+0.4) + owner-ish `position_type` (+0.3) + has website (+0.1)
+- Tiers: high ≥ 0.6, medium ≥ 0.3, low < 0.3
+- Heuristic baseline (no ML); principal-address match from the spec is omitted — not in the NC input.
 
 ---
 
