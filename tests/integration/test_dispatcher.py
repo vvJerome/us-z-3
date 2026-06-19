@@ -356,9 +356,10 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"  # bbops verdict surfaces as final
 
-    async def test_dispatcher_serper_fallback_calls_reset_and_costed(self, test_db, config):
-        """When the Serper 4th fallback fires inside the dispatcher, _fallback_calls is
-        reset after each record and the extra API call is charged to cost_tracker."""
+    async def test_dispatcher_serper_fallback_charges_via_charge_costs(self, test_db, config):
+        """After patterns are exhausted the dispatcher delegates cost accounting to
+        SerperClient.charge_costs (which owns the cache-hit/fallback math, unit-tested
+        separately) rather than reaching into its private counters."""
         from pipeline.utils.serper_client import SerperClient
         from pipeline.models import EnrichmentResult
 
@@ -387,17 +388,15 @@ class TestDispatcherReconciliation:
             candidate_emails=[], candidate_domain=None,
         ))
         serper.last_was_cache_hit = False
-        serper._fallback_calls = 1  # simulate 4th fallback having fired
 
         cost_tracker = CostTracker(max_cost=10.0)
         dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, serper=serper)
         rows = await db.fetch_pending_validation(test_db, limit=10)
         await dispatcher._process_record(rows[0])
 
-        # 1 primary call + 1 fallback call = 2 serper_dispatcher charges
-        assert cost_tracker.counts.get("serper_dispatcher", 0) == 2
-        # _fallback_calls must be reset so subsequent records start clean
-        assert serper._fallback_calls == 0
+        # The dispatcher must hand cost accounting to charge_costs with its own service tag,
+        # exactly once — never charge the tracker directly or peek at private counters.
+        serper.charge_costs.assert_called_once_with(cost_tracker, "serper_dispatcher")
 
     async def test_cost_ceiling_before_serper_fallback_marks_cost_skipped(self, test_db, config):
         """Cost ceiling hit after all patterns fail but before Serper fallback → COST_SKIPPED."""
@@ -516,7 +515,7 @@ class TestDispatcherReconciliation:
 
         await _insert_discovered(test_db, "rec1")
         future = (
-            datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
         ).strftime("%Y-%m-%d %H:%M:%S")
         await test_db.execute(
             "UPDATE records SET retry_after = ? WHERE unique_id = 'rec1'", (future,)

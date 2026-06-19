@@ -69,7 +69,8 @@ class ValidationResult:
 # Dual-backend verdict types
 # ---------------------------------------------------------------------------
 
-BackendStatus = Literal["valid", "invalid", "catch_all", "blocked", "error", "not_run"]
+# "ms_valid" is written into racknerd_status when the MS HTTP probe short-circuits SMTP.
+BackendStatus = Literal["valid", "invalid", "catch_all", "blocked", "error", "not_run", "ms_valid"]
 
 
 @dataclass

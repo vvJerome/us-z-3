@@ -32,7 +32,7 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 
 `_process_record()` order per email candidate:
 1. MS probe pre-filter (free) — only when `is_microsoft_mx(mx_provider)` is True; short-circuits on `valid`/`invalid`, falls through on `error`/`unknown`
-2. Fan out: Racknerd SMTP + bbops concurrently via `asyncio.gather`
+2. Racknerd SMTP first; on `valid`/`catch_all` (catch_all gated by confidence) return immediately with `bbops_status=not_run`. bbops runs **only** when Racknerd returns `blocked`/`error`/`invalid` — sequential and lazy, not a concurrent fan-out, so a confirmed Racknerd hit never spends a bbops call.
 3. OR-of-valids reconciliation (`reconcile()`) → `valid`, `catch_all`, `invalid`, or `unknown`
 4. If `unknown` (tunnel down / both inconclusive) → re-queue as DISCOVERED without burning `dispatch_attempts`
 5. If `invalid` and `self.zuhal is not None` → Zuhal rescue (sequential, paid)
