@@ -74,5 +74,5 @@ def reconcile(
 
 def greylisting_retry_after(minutes: int = 30) -> str:
     """Return an ISO timestamp N minutes from now for a greylisting hold."""
-    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
