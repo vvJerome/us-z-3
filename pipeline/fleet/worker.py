@@ -32,6 +32,8 @@ class FleetWorker:
     tunnel: object | None = None      # SshSocksTunnel | None (opaque here to avoid the import)
     concurrency: int = 10
     server_id: int | None = None
+    managed: bool = True              # False = pre-existing box; never deleted by auto-heal/scale-down
+    is_reserve: bool = False          # cross-region failover worker (item 6); kept on scale-down
     draining: bool = False
     inflight: int = 0
     _cooldown_until: float = 0.0
