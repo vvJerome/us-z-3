@@ -81,6 +81,12 @@ class PipelineConfig(BaseSettings):
     fleet_autoscale: bool = False
     fleet_monitor_interval_s: float = 15.0
 
+    # --- Durable state backup (item 2; off by default) ---
+    backup_enabled: bool = False
+    backup_dir: str = ""  # local dir; optional alongside R2
+    backup_r2_endpoint: str = ""  # S3-compatible R2 endpoint incl. bucket; creds via env
+    backup_interval_s: float = 300.0
+
     # --- bbops async backend ---
     bbops_base_url: str = "https://email-verifier.bbops.io"
     bbops_batch_size: int = Field(default=500, ge=1)

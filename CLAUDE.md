@@ -360,10 +360,51 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 |---|---|---|
 | `SERPER_API_KEY` | Yes | — |
 | `ZUHAL_API_KEY` | Yes (dispatcher) | — |
-| `RACKNERD_HOST` | Yes (dispatcher) | — |
+| `RACKNERD_HOST` | Yes* (dispatcher) | — |
 | `RACKNERD_SSH_USER` | No | `egress` |
 | `RACKNERD_SSH_KEY` | No | `~/.ssh/racknerd_egress` |
 | `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
+| `CHERRY_AUTH_TOKEN` | Yes (fleet) | — |
+| `CHERRY_PROJECT_ID` / `CHERRY_TEAM_ID` | Yes (fleet) | — |
+| `BACKUP_R2_ENDPOINT` + `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | No | — |
+
+\* `RACKNERD_HOST` is not required when `--cherry-enabled` or `--smtp-hosts` is set.
+
+---
+
+## Cherry Servers SMTP fleet (migration)
+
+The SMTP layer migrated from a single RackNerd VPS to a **self-managing fleet of Cherry
+Servers** (hourly, API-provisioned). Architecture: a central coordinator opens one SSH
+SOCKS5 tunnel per worker; **each worker is just a stateless SMTP egress IP** (sshd +
+outbound port 25). All authoritative state stays in the coordinator's `pipeline.db`, so
+no state lives on any VPS (item 2). The fleet implements the same `verify(email)`
+dispatcher seam, so the rest of the pipeline is unchanged.
+
+- **Two co-equal checkers:** the Cherry fleet and bbops run **concurrently** under
+  OR-of-valids — bbops is not a fallback. RackNerd is retained only as an optional
+  failover worker. Zuhal rescue is unchanged.
+- **Live self-management** (`pipeline/fleet/control.py`): monitors each worker's
+  IP-reputation/health and **auto-heals** a degraded worker (drain → terminate →
+  reprovision a fresh IP → reattach) without pausing the run; **load-balances** to the
+  least-loaded healthy worker; **scales** via `scale_to` / a control file. Guards: a
+  credit floor and a per-run reprovision cap.
+- **Per-(worker, provider) telemetry** in `smtp_outcomes` drives provider-aware routing
+  and reroute-on-block (item 5).
+
+```bash
+# Provision a 4-worker fleet (last one in a reserve region for item 6)
+python -m pipeline.fleet provision --count 4 --reserve-region US-Chicago
+python -m pipeline.fleet status
+# Run the pipeline against the fleet
+python -m pipeline run -i input/<file> --cherry-enabled
+# Scale mid-run / tear down
+echo '{"scale_to": 6}' > output/fleet/control.json
+python -m pipeline.fleet teardown --yes        # deletes only fleet-provisioned servers
+```
+
+Fleet package: `pipeline/fleet/` (cherry_client, provisioner, worker, health, balancer,
+manager, control, wiring). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3).
 
 ---
 

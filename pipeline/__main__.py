@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import os
 import signal
 import time
 from pathlib import Path
@@ -81,6 +82,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
     tunnel: SshSocksTunnel | None = None
     bbops_consumer: BbopsAsyncConsumer | None = None
     fleet_ctx = None
+    backup_worker = None
 
     try:
         if not config.consumer_only:
@@ -232,6 +234,21 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     config.zuhal_concurrency,
                 )
 
+        if config.backup_enabled and (config.backup_dir or config.backup_r2_endpoint):
+            from pipeline.storage import R2Client, SnapshotWorker
+            r2 = None
+            if config.backup_r2_endpoint:
+                ak, sk = os.environ.get("R2_ACCESS_KEY_ID", ""), os.environ.get("R2_SECRET_ACCESS_KEY", "")
+                if ak and sk:
+                    r2 = R2Client(config.backup_r2_endpoint, ak, sk, session=session)
+                else:
+                    logger.warning("backup_r2_endpoint set but R2 credentials missing — local backup only")
+            backup_worker = SnapshotWorker(
+                conn, backup_dir=config.backup_dir, interval_s=config.backup_interval_s, r2_client=r2
+            )
+            tasks.append(asyncio.create_task(backup_worker.run(stop_event), name="backup"))
+            logger.info("State backup enabled (dir=%s, r2=%s)", config.backup_dir or "-", r2 is not None)
+
         if not tasks:
             logger.error("No workers to run — check flags")
             return
@@ -257,6 +274,11 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             await tunnel.stop()
         if fleet_ctx is not None:
             await fleet_ctx.aclose()
+        if backup_worker is not None:
+            try:
+                await backup_worker.snapshot_once()
+            except Exception as exc:
+                logger.warning("final state snapshot failed: %s", exc)
 
         # Write final stats
         status_counts: dict[str, int] = {}
