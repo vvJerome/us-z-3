@@ -50,6 +50,14 @@ REAL_CALL_IDS_SQL = f"""
        AND zuhal_status NOT IN ({", ".join("?" for _ in _NO_CALL_PLACEHOLDERS)})
 """
 
+REAL_CALL_EMAILS_SQL = f"""
+    SELECT candidate_email
+      FROM records
+     WHERE zuhal_status IS NOT NULL
+       AND zuhal_status NOT IN ({", ".join("?" for _ in _NO_CALL_PLACEHOLDERS)})
+       AND candidate_email IS NOT NULL
+"""
+
 
 def live_zuhal_breakdown(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute(REAL_CALLS_SQL, _NO_CALL_PLACEHOLDERS).fetchall()
@@ -59,6 +67,11 @@ def live_zuhal_breakdown(conn: sqlite3.Connection) -> dict[str, int]:
 def live_zuhal_ids(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute(REAL_CALL_IDS_SQL, _NO_CALL_PLACEHOLDERS).fetchall()
     return {uid for (uid,) in rows}
+
+
+def live_zuhal_emails(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(REAL_CALL_EMAILS_SQL, _NO_CALL_PLACEHOLDERS).fetchall()
+    return {email.strip().lower() for (email,) in rows if email and email.strip()}
 
 
 def bulk_csv_emails(path: Path) -> set[str]:
@@ -73,6 +86,10 @@ def bulk_csv_emails(path: Path) -> set[str]:
 
 
 def bulk_csv_unique_ids(path: Path) -> set[str]:
+    """Empty when the CSV has no unique_id column — e.g. a plain email-list
+    export uploaded by hand through Zuhal's dashboard (no zuhal_bulk.py metadata).
+    Callers must fall back to matching by email in that case.
+    """
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if "unique_id" not in (reader.fieldnames or []):
@@ -95,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     breakdown = live_zuhal_breakdown(conn)
     live_total = sum(breakdown.values())
     live_ids = live_zuhal_ids(conn)
+    live_emails = live_zuhal_emails(conn)
     conn.close()
 
     print(f"Live dispatcher Zuhal calls: {live_total:,}")
@@ -103,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
 
     per_file_unique: list[set[str]] = []
     grand_unique: set[str] = set()
-    overlap_ids: set[str] = set()
+    overlap: set[str] = set()
     for csv_path in args.bulk_csv:
         if not csv_path.exists():
             print(f"warning: bulk csv not found: {csv_path}", file=sys.stderr)
@@ -111,7 +129,12 @@ def main(argv: list[str] | None = None) -> int:
         emails = bulk_csv_emails(csv_path)
         per_file_unique.append(emails)
         grand_unique |= emails
-        overlap_ids |= bulk_csv_unique_ids(csv_path) & live_ids
+        file_ids = bulk_csv_unique_ids(csv_path)
+        # ponytail: dashboard-upload exports carry no unique_id, only an email
+        # column — fall back to matching by email so overlap detection isn't
+        # silently a no-op on that format. Upgrade: drop once every bulk export
+        # path is required to carry unique_id.
+        overlap |= (file_ids & live_ids) if file_ids else (emails & live_emails)
         print(f"\nBulk submission {csv_path.name}: {len(emails):,} unique emails uploaded")
 
     bulk_raw_total = sum(len(s) for s in per_file_unique)
@@ -120,8 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nBulk submissions across {len(per_file_unique)} file(s): "
           f"{bulk_raw_total:,} raw (counts re-submissions), "
           f"{len(grand_unique):,} unique emails")
-    if overlap_ids:
-        print(f"warning: {len(overlap_ids):,} record(s) have BOTH a live Zuhal verdict "
+    if overlap:
+        print(f"warning: {len(overlap):,} record(s) have BOTH a live Zuhal verdict "
               f"and appear in a bulk CSV — verify they weren't billed twice")
 
     raw_total = live_total + bulk_raw_total
