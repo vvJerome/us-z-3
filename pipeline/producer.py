@@ -28,6 +28,7 @@ from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.text import assign_email_strategy, is_org_agent, parse_name, score_domain_confidence
+from pipeline.utils.owner_inference import score_owner_confidence
 from pipeline.utils.notify import create_notify_pipe, signal_consumer
 from pipeline import db
 from pipeline.db import State
@@ -378,6 +379,7 @@ class ProducerWorker:
         result["domain_confidence"] = score_domain_confidence(
             record.business_name, effective_domain, result["discovery_source"]
         )
+        result["owner_confidence"] = score_owner_confidence(record, has_website=bool(effective_domain))
 
         if all_candidates:
             result["candidate_emails"] = json.dumps(all_candidates)
@@ -431,6 +433,7 @@ class ProducerWorker:
             "is_org_agent": org_agent,
             "mx_provider": None,
             "domain_confidence": None,
+            "owner_confidence": None,
             "record_state": State.RAW,
             "_trace": [],
         }

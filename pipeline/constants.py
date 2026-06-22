@@ -99,3 +99,24 @@ FALLBACK_DOMAIN_BLOCKLIST: frozenset[str] = frozenset({
     # Maps / generic web
     "google.com", "mapquest.com",
 })
+
+# --- Registered-agent → owner inference (pipeline.utils.owner_inference) ---
+# Normalized substrings of commercial registered-agent services. When the agent name
+# matches one, the agent is a paid service, never the business owner. Grows as new
+# services surface in the data.
+COMMERCIAL_AGENT_NAMES: frozenset[str] = frozenset({
+    "ct corporation", "c t corporation", "corporation service company",
+    "cogency global", "national registered agents", "registered agents inc",
+    "registered agent solutions", "registered agent inc", "northwest registered agent",
+    "a registered agent", "legalzoom", "incorp services", "vcorp services",
+    "harbor compliance", "zenbusiness", "united states corporation agents",
+    "capitol corporate services", "capitol services", "paracorp",
+    "interstate agent services", "spiegel utrera", "business filings", "blumberg",
+})
+
+# position_type / filing-role tokens that imply a business principal (not an agent-of-record).
+OWNER_ROLE_KEYWORDS: frozenset[str] = frozenset({
+    "owner", "member", "manager", "president", "ceo", "cfo", "coo", "principal",
+    "partner", "director", "incorporator", "organizer", "officer", "treasurer",
+    "secretary", "founder", "proprietor", "chairman",
+})

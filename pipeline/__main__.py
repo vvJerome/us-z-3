@@ -17,6 +17,7 @@ from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
 from pipeline.dispatcher import Dispatcher
 from pipeline._dispatch_helpers import confidence_tier
 from pipeline.utils.text import domain_confidence_tier
+from pipeline.utils.owner_inference import owner_confidence_tier
 from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
@@ -412,7 +413,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         """
         SELECT unique_id, business_name, agent_name, state,
                candidate_email, zuhal_status, confidence_score, domain_confidence,
-               discovery_source, final_verdict,
+               owner_confidence, discovery_source, final_verdict,
                racknerd_status, bbops_status,
                canonical_status, canonical_source, zb_status, zb_sub_status
           FROM records WHERE record_state = 'VALIDATED'
@@ -426,7 +427,8 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
             "unique_id", "business_name", "agent_name", "state",
             "email", "canonical_status", "canonical_source",
             "final_verdict", "confidence_tier", "confidence_score",
-            "domain_confidence", "domain_confidence_tier", "verified",
+            "domain_confidence", "domain_confidence_tier",
+            "owner_confidence", "owner_confidence_tier", "verified",
             "discovery_method", "validation_method",
             "racknerd_verdict", "bbops_verdict", "zuhal_verdict",
             "zb_status", "zb_sub_status",
@@ -437,6 +439,7 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
             bb = row["bbops_status"] or ""
             zs = row["zuhal_status"]
             dc = row["domain_confidence"]
+            oc = row["owner_confidence"]
             writer.writerow([
                 row["unique_id"], row["business_name"], row["agent_name"],
                 row["state"], row["candidate_email"],
@@ -446,6 +449,8 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
                 int(row["confidence_score"] or 0),
                 round(dc, 3) if dc is not None else "",
                 domain_confidence_tier(dc) if dc is not None else "",
+                round(oc, 3) if oc is not None else "",
+                owner_confidence_tier(oc) if oc is not None else "",
                 _is_verified(fv),
                 row["discovery_source"] or "unknown",
                 _validation_method(rk, bb, zs),

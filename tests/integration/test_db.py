@@ -1,6 +1,5 @@
 """Integration tests for database operations using in-memory SQLite."""
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -70,6 +69,33 @@ class TestInitDb:
 
         await conn.close()
 
+    async def test_migration_v10_to_v11_adds_owner_confidence(self, tmp_path: Path):
+        """An existing v10 DB (no owner_confidence) gains the column via the v11 ALTER migration."""
+        db_path = tmp_path / "old.db"
+        # Build a real v11 DB, then roll it back to a pre-v11 state: drop the column and the version.
+        conn = await db.init_db(db_path)
+        await conn.execute("INSERT INTO records (unique_id, record_state) VALUES ('r1', 'RAW')")
+        await conn.execute("ALTER TABLE records DROP COLUMN owner_confidence")
+        await conn.execute("PRAGMA user_version = 10")
+        await conn.commit()
+        await conn.close()
+
+        # Re-open: init_db must run _V11_MIGRATIONS and re-add the column.
+        conn = await db.init_db(db_path)
+        try:
+            async with conn.execute("PRAGMA table_info(records)") as cur:
+                cols = {r[1] for r in await cur.fetchall()}
+            assert "owner_confidence" in cols
+            async with conn.execute("PRAGMA user_version") as cur:
+                assert (await cur.fetchone())[0] == 11
+            # Existing row survived the migration; new column defaults to NULL.
+            async with conn.execute(
+                "SELECT owner_confidence FROM records WHERE unique_id = 'r1'"
+            ) as cur:
+                assert (await cur.fetchone())[0] is None
+        finally:
+            await conn.close()
+
 
 class TestCheckpoints:
     """Test checkpoint get/set operations."""
@@ -124,6 +150,21 @@ class TestInsertRecords:
         assert row is not None
         assert row["business_name"] == "Acme Corp"
         assert row["agent_name"] == "John Doe"
+
+    async def test_insert_persists_owner_confidence(self, test_db):
+        """owner_confidence (schema v11) round-trips through insert_records_batch."""
+        records = [{
+            "unique_id": "oc1", "business_name": "Smith Plumbing LLC",
+            "agent_name": "John Smith", "state": "NC",
+            "owner_confidence": 0.9, "record_state": State.DISCOVERED,
+        }]
+        await db.insert_records_batch(test_db, records, new_offset=1)
+
+        async with test_db.execute(
+            "SELECT owner_confidence FROM records WHERE unique_id = ?", ("oc1",)
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row["owner_confidence"] == 0.9
 
     async def test_insert_batch(self, test_db):
         """Multiple records inserted atomically."""
