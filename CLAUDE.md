@@ -282,7 +282,11 @@ Normalized in one place (`pipeline/verdicts.py`) across all services. One of:
 | `zb_status` / `zb_sub_status` | ZeroBounce verdict, ingested by `pipeline.ops.ingest_zerobounce` |
 
 ZeroBounce is the ground-truth final layer and runs as a separate script; its
-ingest overrides `canonical_status`/`canonical_source` for matched records.
+ingest overrides `canonical_status`/`canonical_source` for matched records, and
+feeds its unambiguous `valid`/`invalid` verdicts back into `pattern_stats`
+(continuous learning) — `catch_all`/`unknown`/`do_not_mail`/etc. are skipped as
+inconclusive for the naming convention. Ingest a given ZB CSV once (the pattern
+feedback is not idempotent).
 
 ---
 
