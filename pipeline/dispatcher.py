@@ -174,46 +174,106 @@ class Dispatcher:
                 return
             await self._process_record(row)
 
+    async def _fail(self, unique_id: str, reason: str, *args: object) -> None:
+        """Terminal VALIDATION_FAILED write + stats bump. `reason` is a %-format string."""
+        logger.warning("Record %s: " + reason + " — marking VALIDATION_FAILED", unique_id, *args)
+        async with self._write_lock:
+            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+        self.stats["validation_failed"] += 1
+
+    async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
+        """Check dispatch budget and parse candidate_emails; mark VALIDATION_FAILED and return None if it can't proceed."""
+        unique_id = row["unique_id"]
+        # dispatch_attempts counts only re-queues where a real verdict was obtained.
+        # requeue_count counts every re-queue including infra transients — the safety valve
+        # that terminates records stuck in a permanent infra failure loop.
+        attempts = row["dispatch_attempts"] or 0
+        requeues = row["requeue_count"] or 0
+        if attempts >= self.config.max_dispatch_attempts:
+            await self._fail(unique_id, "hit max dispatch attempts (%d)", attempts)
+            return None
+        if requeues >= self.config.max_requeue_count:
+            await self._fail(unique_id, "hit max requeue count (%d)", requeues)
+            return None
+        raw_candidates = row["candidate_emails"]
+        if not raw_candidates:
+            await self._fail(unique_id, "no candidate_emails")
+            return None
+        try:
+            return json.loads(raw_candidates)
+        except (json.JSONDecodeError, TypeError):
+            await self._fail(unique_id, "invalid candidate_emails JSON")
+            return None
+
+    async def _write_validated(
+        self,
+        unique_id: str,
+        email: str,
+        rk: BackendVerdict,
+        bb: BackendVerdict,
+        final_verdict: str,
+        score: float,
+        attempts_delta: int,
+        pending_trace: list[dict],
+        first: str,
+        last: str,
+        candidate_domain: str,
+        mx_provider: str | None,
+        log_msg: str,
+        *log_args: object,
+    ) -> None:
+        """Single VALIDATED write path: dual-verdict + trace flush + pattern learning + stats + log."""
+        async with self._write_lock:
+            await db.update_record_dual(
+                self.conn,
+                unique_id,
+                State.VALIDATED,
+                racknerd_status=rk.status,
+                racknerd_message=rk.message,
+                racknerd_verified_at=rk.verified_at,
+                bbops_status=bb.status,
+                bbops_message=bb.message,
+                bbops_verified_at=bb.verified_at,
+                final_verdict=final_verdict,
+                candidate_email=email,
+                confidence_score=float(score),
+                dispatch_attempts_delta=attempts_delta,
+            )
+            await db.flush_process_trace(self.conn, unique_id, pending_trace)
+        await record_pattern(self.conn, email, first, last, candidate_domain, mx_provider, success=True)
+        self.stats["validated"] += 1
+        logger.info(log_msg, *log_args)
+
+    async def _inject_serper_fallback(
+        self, unique_id: str, row: aiosqlite.Row, candidates: list[str], original_count: int
+    ) -> bool:
+        """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
+        if self.cost_tracker.ceiling_reached():
+            logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
+            await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+            return True
+        existing = set(candidates[:original_count])
+        raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
+        new_emails = [e for e in raw_emails if e not in existing]
+        try:
+            await db.mark_serper_enriched(self.conn, unique_id)
+        except Exception as exc:
+            logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
+        self.serper.charge_costs(self.cost_tracker, "serper_dispatcher")
+        if new_emails:
+            candidates.extend(new_emails)
+            logger.info(
+                "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
+                unique_id, len(new_emails), self.serper.last_was_cache_hit,
+            )
+        else:
+            logger.debug("Serper fallback for %s: no candidates found", unique_id)
+        return False
+
     async def _process_record(self, row: aiosqlite.Row) -> None:
         unique_id = row["unique_id"]
-        raw_candidates = row["candidate_emails"]
-
-        # dispatch_attempts counts only re-queues where a real verdict was obtained.
-        # requeue_count counts every re-queue including infra transients — it is the
-        # safety valve that terminates records stuck in permanent infra failure loops.
-        dispatch_attempts = row["dispatch_attempts"] or 0
-        requeue_count = row["requeue_count"] or 0
-        if dispatch_attempts >= self.config.max_dispatch_attempts:
-            logger.warning(
-                "Record %s hit max dispatch attempts (%d) — marking VALIDATION_FAILED",
-                unique_id, dispatch_attempts,
-            )
-            async with self._write_lock:
-                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
-            self.stats["validation_failed"] += 1
-            return
-        if requeue_count >= self.config.max_requeue_count:
-            logger.warning(
-                "Record %s hit max requeue count (%d) — marking VALIDATION_FAILED",
-                unique_id, requeue_count,
-            )
-            async with self._write_lock:
-                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
-            self.stats["validation_failed"] += 1
-            return
-
-        if not raw_candidates:
-            logger.warning("No candidate_emails for %s — marking failed", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
-            self.stats["validation_failed"] += 1
-            return
-
-        try:
-            candidates: list[str] = json.loads(raw_candidates)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Invalid candidate_emails JSON for %s", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
-            self.stats["validation_failed"] += 1
+        candidates = await self._load_candidates(row)
+        if candidates is None:
             return
 
         mx_provider = row["mx_provider"]
@@ -266,26 +326,15 @@ class Dispatcher:
 
                 if ms_status == "valid":
                     score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name)
-                    async with self._write_lock:
-                        await db.update_record_dual(
-                            self.conn,
-                            unique_id,
-                            State.VALIDATED,
-                            racknerd_status="ms_valid",
-                            racknerd_message="MS GetCredentialType probe",
-                            racknerd_verified_at=None,
-                            bbops_status="not_run",
-                            bbops_message="skipped — MS probe hit",
-                            bbops_verified_at=None,
-                            final_verdict="valid",
-                            candidate_email=email,
-                            confidence_score=float(score),
-                            dispatch_attempts_delta=0,  # MS probe is free, don't count
-                        )
-                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                    self.stats["validated"] += 1
-                    logger.info("MS-validated (no SMTP): %s → %s", unique_id, email)
+                    await self._write_validated(
+                        unique_id, email,
+                        BackendVerdict("ms_valid", "MS GetCredentialType probe", None),
+                        BackendVerdict("not_run", "skipped — MS probe hit", None),
+                        "valid", score,
+                        0,  # MS probe is free, don't count against dispatch_attempts
+                        pending_trace, _first, _last, candidate_domain, mx_provider,
+                        "MS-validated (no SMTP): %s → %s", unique_id, email,
+                    )
                     return
 
                 if ms_status == "invalid":
@@ -321,26 +370,15 @@ class Dispatcher:
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, rk_verdict.status, agent_name
                 )
-                async with self._write_lock:
-                    await db.update_record_dual(
-                        self.conn,
-                        unique_id,
-                        State.VALIDATED,
-                        racknerd_status=rk_verdict.status,
-                        racknerd_message=rk_verdict.message,
-                        racknerd_verified_at=rk_verdict.verified_at,
-                        bbops_status="not_run",
-                        bbops_message="skipped — Racknerd hit",
-                        bbops_verified_at=None,
-                        final_verdict=rk_verdict.status,
-                        candidate_email=email,
-                        confidence_score=float(score),
-                        dispatch_attempts_delta=1,
-                    )
-                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                self.stats["validated"] += 1
-                logger.info("Racknerd-validated (bbops skipped): %s → %s", unique_id, email)
+                await self._write_validated(
+                    unique_id, email,
+                    rk_verdict,
+                    BackendVerdict("not_run", "skipped — Racknerd hit", None),
+                    rk_verdict.status, score,
+                    1,
+                    pending_trace, _first, _last, candidate_domain, mx_provider,
+                    "Racknerd-validated (bbops skipped): %s → %s", unique_id, email,
+                )
                 return
 
             # Tunnel down: pure infra, re-queue without burning dispatch_attempts
@@ -401,26 +439,11 @@ class Dispatcher:
                 score = compute_confidence_score(
                     email, candidate_domain, strategy, result.final_verdict, agent_name
                 )
-                async with self._write_lock:
-                    await db.update_record_dual(
-                        self.conn,
-                        unique_id,
-                        State.VALIDATED,
-                        racknerd_status=rk_verdict.status,
-                        racknerd_message=rk_verdict.message,
-                        racknerd_verified_at=rk_verdict.verified_at,
-                        bbops_status=bb_verdict.status,
-                        bbops_message=bb_verdict.message,
-                        bbops_verified_at=bb_verdict.verified_at,
-                        final_verdict=result.final_verdict,
-                        candidate_email=email,
-                        confidence_score=float(score),
-                        dispatch_attempts_delta=1,
-                    )
-                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                self.stats["validated"] += 1
-                logger.info(
+                await self._write_validated(
+                    unique_id, email, rk_verdict, bb_verdict,
+                    result.final_verdict, score,
+                    1,
+                    pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Validated %s → %s [rk=%s bb=%s]",
                     unique_id, email, rk_verdict.status, bb_verdict.status,
                 )
@@ -448,35 +471,11 @@ class Dispatcher:
             )
 
             # After exhausting original pattern candidates, inject Serper enrichment.
-            # Serper was skipped in the producer (DNS hit) — call it now as a fallback
-            # so we only pay $0.001 when patterns actually fail, not upfront.
             if i == original_count and not serper_enriched and self.serper and candidate_domain:
-                if self.cost_tracker.ceiling_reached():
-                    logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
-                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+                serper_enriched = True  # prevent re-injection on subsequent loops
+                if await self._inject_serper_fallback(unique_id, row, candidates, original_count):
                     cost_skipped = True
                     break
-                serper_enriched = True  # prevent re-injection on subsequent loops
-                existing = set(candidates[:original_count])
-                raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
-                new_emails = [e for e in raw_emails if e not in existing]
-                try:
-                    await db.mark_serper_enriched(self.conn, unique_id)
-                except Exception as exc:
-                    logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
-                if not self.serper.last_was_cache_hit:
-                    self.cost_tracker.record_call("serper_dispatcher")
-                for _ in range(self.serper._fallback_calls):
-                    self.cost_tracker.record_call("serper_dispatcher")
-                self.serper._fallback_calls = 0
-                if new_emails:
-                    candidates.extend(new_emails)
-                    logger.info(
-                        "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
-                        unique_id, len(new_emails), self.serper.last_was_cache_hit,
-                    )
-                else:
-                    logger.debug("Serper fallback for %s: no candidates found", unique_id)
 
         if cost_skipped:
             return

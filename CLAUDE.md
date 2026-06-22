@@ -171,8 +171,10 @@ InputRecord (RAW)
         invalid → skip candidate
         unknown → continue
 
-[2] Racknerd SMTP + bbops.io  (asyncio.gather, concurrent)
-        reconcile():
+[2] Racknerd SMTP first; bbops only when Racknerd can't decide (sequential, lazy)
+        Racknerd valid / catch_all          → VALIDATED ✓ (bbops skipped, bbops_status=not_run)
+        Racknerd tunnel down                → re-queue, no burn
+        else (blocked/error/invalid)        → run bbops, then reconcile():
           valid / catch_all (either backend) → VALIDATED  ✓
           blocked (Racknerd)                 → re-queue, no burn (IP block, not email verdict)
           both invalid                        → [3]

@@ -317,12 +317,7 @@ class ProducerWorker:
                         fallback_blocklist=self._fallback_blocklist,
                         conn=self.conn,
                     )
-                    if not self._serper.last_was_cache_hit:
-                        self.cost_tracker.record_call("serper_producer")
-                    # Record any extra cost from site: fallback retries
-                    for _ in range(self._serper._fallback_calls):
-                        self.cost_tracker.record_call("serper_producer")
-                    self._serper._fallback_calls = 0
+                    self._serper.charge_costs(self.cost_tracker, "serper_producer")
 
                 result["serper_enriched"] = 1
                 _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms

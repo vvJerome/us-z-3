@@ -30,7 +30,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -90,7 +90,7 @@ def batch_id_for(path: Path) -> tuple[str, str, str]:
         operator = ""
     m = _PART_RE.search(path.stem.lower())
     part = m.group(1).lower() if m else ""
-    stamp = datetime.utcnow().strftime("%Y%m%d")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return f"{operator or 'na'}_{path.stem}_{stamp}", operator, part
 
 
