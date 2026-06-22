@@ -80,6 +80,29 @@ def is_untrustworthy_catchall_mx(mx_provider: str | None) -> bool:
     return any(p in lp for p in CATCHALL_UNTRUSTWORTHY_MX)
 
 
+# --- Mail provider classification (item 5: per-provider SMTP routing/limits) ---
+# Ordered MX-host substring → canonical provider label. First match wins, so order
+# matters when a host carries more than one brand token. Anything unmatched is
+# PROVIDER_OTHER. Security gateways (Proofpoint/Mimecast/Barracuda) are kept distinct
+# because they need their own concurrency/retry treatment, not the mailbox default.
+PROVIDER_MX_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("microsoft",    ("mail.protection.outlook.com", "protection.outlook", "outlook.com",
+                      "hotmail.com", "microsoft.com", "office365")),
+    ("google",       ("aspmx.l.google.com", "google.com", "googlemail.com", "gmail.com",
+                      "psmtp.com")),
+    ("yahoo",        ("yahoodns.net", "yahoo.com", "yahoo.net")),
+    ("zoho",         ("zoho.com", "zoho.eu", "zohomail")),
+    ("proofpoint",   ("pphosted.com", "ppe-hosted.com", "proofpoint")),
+    ("mimecast",     ("mimecast.com", "mimecast.co")),
+    ("barracuda",    ("barracudanetworks.com", "barracuda.com")),
+    ("icloud",       ("icloud.com", "me.com", "apple.com")),
+    ("amazon",       ("amazonaws.com", "awsapps.com")),
+    ("secureserver", ("secureserver.net",)),
+    ("yandex",       ("yandex",)),
+)
+PROVIDER_OTHER: str = "other"
+
+
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.
 # This list grows at runtime via ProducerWorker._fallback_blocklist when a domain
