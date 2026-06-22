@@ -60,6 +60,27 @@ class PipelineConfig(BaseSettings):
     racknerd_smtp_timeout_s: float = 8.0
     racknerd_helo_hostname: str | None = None  # override SMTP EHLO/MAIL FROM domain; falls back to _default_helo_hostname()
 
+    # --- Cherry Servers SMTP fleet (Improve-Existing items 1/5/6) ---
+    cherry_enabled: bool = False
+    cherry_project_id: int = 0
+    cherry_team_id: int = 0
+    cherry_plan: str = "B2-1-1gb-20s-shared"
+    cherry_region: str = "EU-Nord-1"
+    cherry_failover_region: str = "US-Chicago"
+    cherry_image: str = "ubuntu_22_04"
+    cherry_fleet_size: int = Field(default=4, ge=1)
+    cherry_ssh_user: str = "root"
+    cherry_ssh_key: str = "~/.ssh/cherry_fleet"
+    smtp_hosts: list[str] = Field(default_factory=list)  # explicit worker IPs; else read inventory
+    fleet_block_cooldown_s: float = 300.0
+    fleet_max_reroutes: int = Field(default=2, ge=0)
+    fleet_credit_floor_eur: float = 0.10
+    fleet_max_reprovisions: int = Field(default=10, ge=0)
+    fleet_scale_min: int = Field(default=1, ge=1)
+    fleet_scale_max: int = Field(default=10, ge=1)
+    fleet_autoscale: bool = False
+    fleet_monitor_interval_s: float = 15.0
+
     # --- bbops async backend ---
     bbops_base_url: str = "https://email-verifier.bbops.io"
     bbops_batch_size: int = Field(default=500, ge=1)
@@ -139,10 +160,14 @@ class PipelineConfig(BaseSettings):
         if self.producer_only and self.consumer_only:
             raise ValueError("--producer-only and --consumer-only are mutually exclusive")
 
-        if self.racknerd_enabled and not self.racknerd_direct and not self.racknerd_host and not self.producer_only:
+        if (
+            self.racknerd_enabled and not self.racknerd_direct and not self.racknerd_host
+            and not self.producer_only and not self.cherry_enabled and not self.smtp_hosts
+        ):
             raise ValueError(
                 "RACKNERD_HOST must be set when racknerd_enabled=True (not direct mode). "
-                "Set RACKNERD_HOST in .env, pass --racknerd-host, or use --racknerd-direct."
+                "Set RACKNERD_HOST in .env, pass --racknerd-host, --smtp-hosts, "
+                "--cherry-enabled, or use --racknerd-direct."
             )
 
         if self.ignore_checkpoint and self.start_offset == 0:

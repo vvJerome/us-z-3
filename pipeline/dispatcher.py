@@ -398,7 +398,7 @@ class Dispatcher:
             timeout = self.config.dispatch_backend_timeout_s
             t_smtp = time.monotonic()
             rk_res, bb_res = await asyncio.gather(
-                asyncio.wait_for(dp.safe_racknerd(self.racknerd, email), timeout=timeout),
+                asyncio.wait_for(dp.safe_racknerd(self.racknerd, email, mx_provider), timeout=timeout),
                 asyncio.wait_for(dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout),
                 return_exceptions=True,
             )

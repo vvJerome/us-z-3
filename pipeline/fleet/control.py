@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pipeline.fleet.cherry_client import CherryAPIError, CherryClient
@@ -25,7 +25,7 @@ from pipeline.fleet.worker import FleetWorker
 
 logger = logging.getLogger("pipeline.fleet.control")
 
-WorkerFactory = Callable[[FleetHost], FleetWorker]
+WorkerFactory = Callable[[FleetHost], Awaitable[FleetWorker]]
 DEFAULT_CONTROL = Path("output/fleet/control.json")
 
 
@@ -96,7 +96,7 @@ class FleetSupervisor:
         host = await self.provisioner.provision_one(
             self.key_ids, f"{self.name_prefix}-r{self._spawn_seq}",
         )
-        worker = self.worker_factory(host)
+        worker = await self.worker_factory(host)
         self.manager.add_worker(worker)
         self.provisioner.write_inventory([host])
         return worker
@@ -112,12 +112,18 @@ class FleetSupervisor:
             return
         self._reprovisions += 1
         self.manager.remove_worker(worker.worker_id)
+        await self._stop_tunnel(worker)
         if worker.server_id is not None:
             try:
                 await self.client.delete_server(worker.server_id)
             except CherryAPIError as exc:
                 logger.error("could not delete old server %s: %s", worker.server_id, exc)
         logger.info("auto-healed %s -> %s (fresh IP)", worker.worker_id, new.worker_id)
+
+    @staticmethod
+    async def _stop_tunnel(worker: FleetWorker) -> None:
+        if worker.tunnel is not None and hasattr(worker.tunnel, "stop"):
+            await worker.tunnel.stop()
 
     async def scale_to(self, target: int) -> None:
         """Grow or shrink the pool toward `target`, clamped to [scale_min, scale_max]."""
@@ -129,9 +135,9 @@ class FleetSupervisor:
                     break
                 await self._spawn()
         elif target < current:
-            self._scale_down(current - target)
+            await self._scale_down(current - target)
 
-    def _scale_down(self, n: int) -> None:
+    async def _scale_down(self, n: int) -> None:
         removable = sorted(
             (w for w in self.manager.workers if w.managed and not w.is_reserve),
             key=lambda w: w.inflight,
@@ -139,6 +145,7 @@ class FleetSupervisor:
         for worker in removable:
             worker.draining = True
             self.manager.remove_worker(worker.worker_id)
+            await self._stop_tunnel(worker)
             logger.info("scaled down: removed worker %s", worker.worker_id)
 
     async def check_control_file(self) -> None:

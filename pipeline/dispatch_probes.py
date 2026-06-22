@@ -65,9 +65,9 @@ async def serper_enrich(serper, conn: aiosqlite.Connection, unique_id: str, row:
         return []
 
 
-async def safe_racknerd(racknerd, email: str) -> BackendVerdict:
+async def safe_racknerd(racknerd, email: str, mx_provider: str | None = None) -> BackendVerdict:
     try:
-        return await racknerd.verify(email)
+        return await racknerd.verify(email, mx_provider)
     except Exception as exc:
         return BackendVerdict(status="error", message=str(exc), verified_at="")
 

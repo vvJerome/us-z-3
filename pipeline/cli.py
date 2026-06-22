@@ -98,6 +98,17 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="SMTP EHLO/MAIL FROM domain (overrides RACKNERD_HELO_HOSTNAME env). "
                              "Use a real FQDN; IP literals are rejected by most MX servers.")
 
+    # Cherry Servers SMTP fleet
+    parser.add_argument("--cherry-enabled", action="store_true", default=None,
+                        help="Use the Cherry Servers SMTP fleet as the SMTP backend")
+    parser.add_argument("--smtp-hosts", nargs="*", default=None,
+                        help="Explicit SMTP worker IPs (overrides single --racknerd-host)")
+    parser.add_argument("--cherry-project-id", type=int, default=None, help="Cherry project id")
+    parser.add_argument("--cherry-region", default=None, help="Cherry region slug")
+    parser.add_argument("--cherry-fleet-size", type=int, default=None, help="Target fleet size")
+    parser.add_argument("--fleet-autoscale", dest="fleet_autoscale", action="store_true", default=None,
+                        help="Enable queue-depth autoscaling of the fleet")
+
     # bbops
     parser.add_argument("--bbops-base-url", default=None, help="bbops.io base URL")
     parser.add_argument("--bbops-batch-size", type=int, default=500, help="Emails per batch")

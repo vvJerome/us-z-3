@@ -156,8 +156,8 @@ class RacknerdConsumer:
         # MX cache: domain → (mx_hosts, expires_at)
         self._mx_cache: dict[str, tuple[list[str], float]] = {}
 
-    async def verify(self, email: str) -> BackendVerdict:
-        """Probe `email` via SOCKS5 SMTP. Returns a BackendVerdict."""
+    async def verify(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
+        """Probe `email` via SOCKS5 SMTP. `mx_provider` is accepted for fleet-seam parity (unused)."""
         async with self._sem:
             return await self._verify_inner(email)
 

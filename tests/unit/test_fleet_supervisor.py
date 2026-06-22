@@ -40,7 +40,7 @@ class _FakeClient:
         self.deleted.append(sid)
 
 
-def _factory(host):
+async def _factory(host):
     return FleetWorker(worker_id=host.worker_id, verifier=_Stub(), server_id=host.server_id,
                        managed=host.managed, is_reserve=host.is_reserve)
 

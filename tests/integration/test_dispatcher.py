@@ -704,7 +704,7 @@ class TestCandidateReorder:
             test_db, "rec1", ["zzz@example.com", "john.doe@example.com"]
         )
 
-        async def verify(email):
+        async def verify(email, mx_provider=None):
             status = "valid" if email == "john.doe@example.com" else "invalid"
             return BackendVerdict(status=status, message="", verified_at="2026-05-04T00:00:00Z")
 

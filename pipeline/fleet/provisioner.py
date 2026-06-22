@@ -30,6 +30,14 @@ class FleetHost:
     managed: bool = True       # False = pre-existing box; never torn down by this tool
 
 
+def read_inventory(path: Path = DEFAULT_INVENTORY) -> list[FleetHost]:
+    """Load the fleet inventory JSON; empty list if it does not exist."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    return [FleetHost(**d) for d in json.loads(path.read_text())]
+
+
 def _key_body(public_key: str) -> str:
     """The base64 body of an SSH public key, ignoring the trailing comment."""
     parts = public_key.split()
@@ -130,9 +138,7 @@ class FleetProvisioner:
         return hosts
 
     def load_inventory(self) -> list[FleetHost]:
-        if not self.inventory_path.exists():
-            return []
-        return [FleetHost(**d) for d in json.loads(self.inventory_path.read_text())]
+        return read_inventory(self.inventory_path)
 
     def write_inventory(self, hosts: list[FleetHost], *, merge: bool = True) -> None:
         by_id = {h.worker_id: h for h in (self.load_inventory() if merge else [])}

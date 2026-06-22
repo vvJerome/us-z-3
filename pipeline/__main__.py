@@ -38,7 +38,7 @@ from pipeline.metrics import serve_metrics
 
 class _NullRacknerd:
     """Stub used when --no-racknerd is set; always returns not_run so bbops handles validation."""
-    async def verify(self, email: str):
+    async def verify(self, email: str, mx_provider: str | None = None):
         from pipeline.models import BackendVerdict
         return BackendVerdict(status="not_run", message="racknerd disabled", verified_at="")
 
@@ -80,6 +80,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
     tasks: list[asyncio.Task] = []
     tunnel: SshSocksTunnel | None = None
     bbops_consumer: BbopsAsyncConsumer | None = None
+    fleet_ctx = None
 
     try:
         if not config.consumer_only:
@@ -94,7 +95,14 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             if config.racknerd_helo_hostname:
                 rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
 
-            if config.racknerd_enabled and config.racknerd_direct:
+            # Polymorphic SMTP backend: fleet manager, single Racknerd consumer, or null.
+            racknerd: object
+            if config.cherry_enabled or config.smtp_hosts:
+                from pipeline.fleet.wiring import build_fleet
+                fleet_ctx = await build_fleet(config, conn, stop_event, resolver=shared_resolver)
+                racknerd = fleet_ctx.manager
+                logger.info("SMTP backend: Cherry fleet (%d workers)", len(fleet_ctx.manager.workers))
+            elif config.racknerd_enabled and config.racknerd_direct:
                 logger.info("Racknerd in direct mode (no SOCKS5 tunnel)")
                 tunnel = None
                 rk_config = RacknerdConfig(
@@ -128,7 +136,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             else:
                 logger.info("Racknerd disabled (--no-racknerd) — bbops + Zuhal only")
                 tunnel = None
-                racknerd = _NullRacknerd()  # type: ignore[assignment]
+                racknerd = _NullRacknerd()
 
             # --- bbops async consumer ---
             bbops_consumer = BbopsAsyncConsumer(
@@ -191,7 +199,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             dispatcher = Dispatcher(
                 config=config,
                 conn=conn,
-                racknerd=racknerd,
+                racknerd=racknerd,  # type: ignore[arg-type]
                 bbops=bbops_consumer,
                 cost_tracker=cost_tracker,
                 stop_event=stop_event,
@@ -247,6 +255,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             await bbops_consumer.stop()
         if tunnel:
             await tunnel.stop()
+        if fleet_ctx is not None:
+            await fleet_ctx.aclose()
 
         # Write final stats
         status_counts: dict[str, int] = {}
@@ -491,6 +501,8 @@ async def main() -> None:
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
+        "cherry_enabled", "smtp_hosts", "cherry_project_id", "cherry_region",
+        "cherry_fleet_size", "fleet_autoscale",
         "harvest_enabled",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
         "max_attempts", "backoff_jitter",
