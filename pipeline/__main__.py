@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import logging
 import signal
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.logger import setup_logging, get_logger
+from pipeline.utils.logger import setup_logging
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.zuhal_client import ZuhalClient
@@ -49,7 +50,7 @@ class _NullRacknerd:
 async def cmd_run(args, config: PipelineConfig) -> None:
     """Execute the pipeline (producer + dispatcher or one of them)."""
     setup_logging(config)
-    logger = get_logger("pipeline")
+    logger = logging.getLogger("pipeline")
 
     conn = await db.init_db(config.db_path)
     logger.info("Database initialized: %s", config.db_path)
@@ -403,7 +404,7 @@ def _zuhal_verdict(zuhal_status: str | None) -> str:
 
 
 async def _write_outputs(conn, config: PipelineConfig) -> None:
-    logger = get_logger("pipeline")
+    logger = logging.getLogger("pipeline")
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
