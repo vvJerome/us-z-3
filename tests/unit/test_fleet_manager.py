@@ -1,5 +1,7 @@
 """Unit tests for FleetManager routing, reroute-on-block, and attribution."""
 
+import asyncio
+
 from pipeline.fleet.manager import FleetManager
 from pipeline.fleet.worker import FleetWorker
 from pipeline.models import BackendVerdict
@@ -92,6 +94,23 @@ async def test_add_and_remove_worker():
     assert {w.worker_id for w in mgr.workers} == {"w1", "w2"}
     mgr.remove_worker("w1")
     assert {w.worker_id for w in mgr.workers} == {"w2"}
+
+
+async def test_per_domain_concurrency_is_capped():
+    peak = {"now": 0, "max": 0}
+
+    class _Slow:
+        async def verify(self, email):
+            peak["now"] += 1
+            peak["max"] = max(peak["max"], peak["now"])
+            await asyncio.sleep(0.02)
+            peak["now"] -= 1
+            return BackendVerdict("valid", "", "t")
+
+    workers = [FleetWorker(worker_id=f"w{i}", verifier=_Slow(), concurrency=100) for i in range(5)]
+    mgr = FleetManager(workers, domain_concurrency=2)
+    await asyncio.gather(*[mgr.verify(f"u{i}@same.com") for i in range(12)])
+    assert peak["max"] <= 2  # never more than 2 concurrent probes to one recipient domain
 
 
 async def test_same_email_sticks_to_its_worker():

@@ -114,7 +114,8 @@ async def build_fleet(
         await db.record_smtp_outcome(conn, worker_id, provider, status)
 
     manager = FleetManager(workers, block_cooldown_s=config.fleet_block_cooldown_s,
-                           max_reroutes=config.fleet_max_reroutes, on_outcome=_on_outcome)
+                           max_reroutes=config.fleet_max_reroutes, on_outcome=_on_outcome,
+                           domain_concurrency=config.fleet_domain_concurrency)
     ctx = FleetContext(manager=manager)
     logger.info("SMTP fleet up with %d worker(s)", len(workers))
 

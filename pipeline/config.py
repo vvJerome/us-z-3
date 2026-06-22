@@ -74,6 +74,7 @@ class PipelineConfig(BaseSettings):
     smtp_hosts: list[str] = Field(default_factory=list)  # explicit worker IPs; else read inventory
     fleet_block_cooldown_s: float = 300.0
     fleet_max_reroutes: int = Field(default=2, ge=0)
+    fleet_domain_concurrency: int = Field(default=3, ge=1)  # max concurrent probes per recipient domain
     fleet_credit_floor_eur: float = 0.10
     fleet_max_reprovisions: int = Field(default=10, ge=0)
     fleet_scale_min: int = Field(default=1, ge=1)

@@ -8,6 +8,7 @@ Live health monitoring / auto-heal / elastic scaling layer on in C7.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import time
@@ -38,12 +39,17 @@ class FleetManager:
         block_cooldown_s: float = 300.0,
         max_reroutes: int = 2,
         on_outcome: OutcomeHook | None = None,
+        domain_concurrency: int = 3,
     ) -> None:
         self._workers = list(workers)
         self._by_id = {w.worker_id: w for w in self._workers}
         self._block_cooldown_s = block_cooldown_s
         self._max_reroutes = max_reroutes
         self._on_outcome = on_outcome
+        # Cap concurrent probes per RECIPIENT domain across the whole fleet so we don't trip
+        # provider rate limits (421 4.7.x). One semaphore per domain, created lazily.
+        self._domain_concurrency = max(1, domain_concurrency)
+        self._domain_sems: dict[str, asyncio.Semaphore] = {}
         # email -> worker_id: a greylisted record must retry from the same worker so the
         # (IP, MAIL FROM, RCPT) triplet matches and the greylist clears instead of re-deferring.
         self._affinity: dict[str, str] = {}
@@ -87,6 +93,16 @@ class FleetManager:
         return pick_worker(self._snapshot(now, tried))
 
     async def verify(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
+        """Probe `email`, capped to domain_concurrency concurrent probes per recipient domain."""
+        domain = email.rsplit("@", 1)[-1].lower()
+        sem = self._domain_sems.get(domain)
+        if sem is None:
+            sem = asyncio.Semaphore(self._domain_concurrency)
+            self._domain_sems[domain] = sem
+        async with sem:
+            return await self._verify_inner(email, mx_provider)
+
+    async def _verify_inner(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
         """Probe `email` via the least-loaded healthy worker, rerouting on IP blocks."""
         provider = classify_provider(mx_provider)
         tried: set[str] = set()
