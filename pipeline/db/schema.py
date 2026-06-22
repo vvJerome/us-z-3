@@ -10,7 +10,7 @@ _log = logging.getLogger("pipeline.db")
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS records (
     canonical_sub_status TEXT,
     canonical_source    TEXT,
     reconciliation_path TEXT,
+
+    -- SMTP fleet telemetry (item 5): worker/IP that ran the terminal SMTP probe
+    -- and the recipient's classified mail provider (pipeline.utils.providers).
+    probe_host          TEXT,
+    smtp_provider       TEXT,
 
     -- Enrichment tracking
     serper_enriched     INTEGER DEFAULT 0,
@@ -164,12 +169,27 @@ CREATE TABLE IF NOT EXISTS bbops_jobs (
     PRIMARY KEY (record_id, email)
 );
 
+-- Per-(worker, provider) SMTP outcome counters — drives provider-aware routing,
+-- IP-reputation degradation detection, and failover (Improve-Existing item 5).
+CREATE TABLE IF NOT EXISTS smtp_outcomes (
+    worker_id   TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    valid       INTEGER DEFAULT 0,
+    invalid     INTEGER DEFAULT 0,
+    catch_all   INTEGER DEFAULT 0,
+    blocked     INTEGER DEFAULT 0,
+    error       INTEGER DEFAULT 0,
+    updated_at  TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (worker_id, provider)
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(record_state);
 CREATE INDEX IF NOT EXISTS idx_records_unique_id ON records(unique_id);
 CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
 CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business_name_norm, agent_name_norm, state, provider);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
+CREATE INDEX IF NOT EXISTS idx_smtp_outcomes_worker ON smtp_outcomes(worker_id);
 """
 
 # Migration statements from schema v3 → v4
@@ -216,6 +236,26 @@ _V7_MIGRATIONS: list[str] = [
     # before v3.25 and we want this to be idempotent on any existing DB.
     "ALTER TABLE records ADD COLUMN confidence_score REAL",
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
+]
+
+# Migration statements for schema v12 — SMTP fleet telemetry (additive).
+_V12_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN probe_host TEXT",
+    "ALTER TABLE records ADD COLUMN smtp_provider TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS smtp_outcomes (
+        worker_id   TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        valid       INTEGER DEFAULT 0,
+        invalid     INTEGER DEFAULT 0,
+        catch_all   INTEGER DEFAULT 0,
+        blocked     INTEGER DEFAULT 0,
+        error       INTEGER DEFAULT 0,
+        updated_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (worker_id, provider)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_smtp_outcomes_worker ON smtp_outcomes(worker_id)",
 ]
 
 # Migration statements for schema v11
@@ -312,6 +352,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (9, _V9_MIGRATIONS),
         (10, _V10_MIGRATIONS),
         (11, _V11_MIGRATIONS),
+        (12, _V12_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
