@@ -87,6 +87,7 @@ us-z-3/
 │   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
 │   │   ├── normalize_zuhaled.py    # Upgrade legacy {Email,Status} zuhaled files
 │   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
+│   │   ├── zuhal_usage_report.py   # Real Zuhal credit/cost usage: live verdicts + bulk CSV submissions
 │   │   └── build_summary.py        # Write summary_counts.csv (hardcoded May 2026 run)
 │   ├── consumers/
 │   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
@@ -141,7 +142,8 @@ us-z-3/
 │   ├── stop.sh             # Kill orchestrator session
 │   ├── zb_zuhaled.sh       # → pipeline.ops.zb_zuhaled
 │   ├── zuhal_bulk.sh       # → pipeline.ops.zuhal_bulk
-│   └── zuhal_rescue.sh     # → pipeline.ops.zuhal_rescue
+│   ├── zuhal_rescue.sh     # → pipeline.ops.zuhal_rescue
+│   └── zuhal_usage_report.sh # → pipeline.ops.zuhal_usage_report
 ├── requirements.txt
 ├── pytest.ini
 └── .env.example
