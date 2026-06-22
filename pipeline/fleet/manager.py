@@ -44,6 +44,9 @@ class FleetManager:
         self._block_cooldown_s = block_cooldown_s
         self._max_reroutes = max_reroutes
         self._on_outcome = on_outcome
+        # email -> worker_id: a greylisted record must retry from the same worker so the
+        # (IP, MAIL FROM, RCPT) triplet matches and the greylist clears instead of re-deferring.
+        self._affinity: dict[str, str] = {}
 
     @property
     def workers(self) -> list[FleetWorker]:
@@ -73,6 +76,16 @@ class FleetManager:
             if w.worker_id not in exclude
         ]
 
+    def _pick(self, email: str, now: float, tried: set[str]) -> str | None:
+        # Stick to the worker that last handled this email (greylist triplet stability) when
+        # it's still routable with capacity; otherwise balance across the fleet.
+        affined = self._affinity.get(email)
+        if affined and affined not in tried:
+            worker = self._by_id.get(affined)
+            if worker is not None and worker.is_routable(now) and worker.available_slots(now) > 0:
+                return affined
+        return pick_worker(self._snapshot(now, tried))
+
     async def verify(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
         """Probe `email` via the least-loaded healthy worker, rerouting on IP blocks."""
         provider = classify_provider(mx_provider)
@@ -80,11 +93,12 @@ class FleetManager:
         last: BackendVerdict | None = None
         for _ in range(self._max_reroutes + 1):
             now = time.monotonic()
-            wid = pick_worker(self._snapshot(now, tried))
+            wid = self._pick(email, now, tried)
             if wid is None:
                 break
             worker = self._by_id[wid]
             tried.add(wid)
+            self._affinity[email] = wid
             verdict = await self._probe(worker, email)
             verdict.probe_host = wid
             worker.record(verdict.status)

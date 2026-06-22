@@ -1,7 +1,5 @@
 """Unit tests for OR-of-valids reconciliation logic."""
 
-import pytest
-
 from pipeline.dispatcher import reconcile
 from pipeline.models import BackendVerdict
 
@@ -72,6 +70,15 @@ class TestReconcileOrOfValids:
         result = reconcile(_v("error", "tunnel not up"), _v("valid"))
         assert result.final_verdict == "valid"
         assert result.should_write is True
+
+
+def test_greylisting_retry_after_is_future_within_jitter():
+    import datetime
+    from pipeline.reconcile import greylisting_retry_after
+    ts = greylisting_retry_after(minutes=15.0, jitter=0.4)
+    dt = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    delta_min = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
+    assert 8.0 <= delta_min <= 22.0  # 15 ± 40%, with margin
 
     def test_not_run_backends(self):
         result = reconcile(_v("not_run"), _v("not_run"))

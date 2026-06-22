@@ -92,3 +92,14 @@ async def test_add_and_remove_worker():
     assert {w.worker_id for w in mgr.workers} == {"w1", "w2"}
     mgr.remove_worker("w1")
     assert {w.worker_id for w in mgr.workers} == {"w2"}
+
+
+async def test_same_email_sticks_to_its_worker():
+    # Greylist retry must hit the same worker (triplet) even if another is less loaded.
+    mgr = FleetManager([_worker("w1", "valid", concurrency=10), _worker("w2", "valid", concurrency=10)])
+    first = (await mgr.verify("a@b.com")).probe_host
+    other = "w2" if first == "w1" else "w1"
+    mgr._by_id[first].inflight = 8   # affined worker busier but still has capacity
+    mgr._by_id[other].inflight = 0   # load-balancer alone would prefer this one
+    second = (await mgr.verify("a@b.com")).probe_host
+    assert second == first

@@ -7,6 +7,7 @@ from the Dispatcher so the policy is testable and the dispatcher stays small.
 from __future__ import annotations
 
 import datetime
+import random
 
 from pipeline.models import BackendVerdict, ReconcileResult
 
@@ -74,7 +75,12 @@ def reconcile(
     return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
 
-def greylisting_retry_after(minutes: int = 30) -> str:
-    """Return an ISO timestamp N minutes from now for a greylisting hold."""
-    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+def greylisting_retry_after(minutes: float = 15.0, jitter: float = 0.4) -> str:
+    """Return an ISO timestamp ~`minutes` from now (±jitter) for a greylisting hold.
+
+    Greylisters accept the retry once a min-age passes (commonly ~5 min); jitter keeps a
+    batch of deferrals from retrying in lockstep (RFC 6647).
+    """
+    delay = minutes * (1.0 + random.uniform(-jitter, jitter))
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=delay)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
