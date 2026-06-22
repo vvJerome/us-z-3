@@ -244,7 +244,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 else:
                     logger.warning("backup_r2_endpoint set but R2 credentials missing — local backup only")
             backup_worker = SnapshotWorker(
-                conn, backup_dir=config.backup_dir, interval_s=config.backup_interval_s, r2_client=r2
+                config.db_path, backup_dir=config.backup_dir,
+                interval_s=config.backup_interval_s, r2_client=r2,
             )
             tasks.append(asyncio.create_task(backup_worker.run(stop_event), name="backup"))
             logger.info("State backup enabled (dir=%s, r2=%s)", config.backup_dir or "-", r2 is not None)

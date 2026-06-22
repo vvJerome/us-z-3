@@ -1,7 +1,9 @@
 """Consistent SQLite snapshots + inventory backup to a durable directory.
 
-Uses SQLite's online backup API (via aiosqlite) so the copy is consistent even while
-the pipeline writes. The destination is any directory path — a local disk, or an
+Uses SQLite's online backup API so the copy is consistent even while the pipeline writes.
+The backup runs on its OWN short-lived sqlite3 connections in a worker thread — never the
+pipeline's live aiosqlite connection — so it can't serialize behind (or deadlock) the
+dispatcher's writes. The destination is any directory path — a local disk, or an
 rclone/s3fs mount backed by R2/S3 for offsite durability (item 2).
 """
 from __future__ import annotations
@@ -9,25 +11,38 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
-
-import aiosqlite
 
 from pipeline.storage.r2 import R2Client
 
 logger = logging.getLogger("pipeline.storage")
 
 
-async def snapshot_db(conn: aiosqlite.Connection, dest_path: Path | str) -> None:
-    """Write a consistent copy of the live DB to dest_path via the SQLite backup API."""
+async def snapshot_db(src_path: Path | str, dest_path: Path | str) -> None:
+    """Copy the DB file at src_path to dest_path via SQLite's online backup API.
+
+    Opens its own sqlite3 connections (not the pipeline's live aiosqlite connection) and
+    runs the blocking backup in a thread, so concurrent dispatcher writes are never blocked.
+    WAL mode lets the separate reader take a consistent snapshot while writes continue.
+    """
+    src = Path(src_path)
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    target = await aiosqlite.connect(str(dest))
-    try:
-        await conn.backup(target)
-    finally:
-        await target.close()
+
+    def _backup() -> None:
+        source = sqlite3.connect(str(src))
+        try:
+            target = sqlite3.connect(str(dest))
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+
+    await asyncio.to_thread(_backup)
 
 
 class SnapshotWorker:
@@ -35,7 +50,7 @@ class SnapshotWorker:
 
     def __init__(
         self,
-        conn: aiosqlite.Connection,
+        db_path: Path | str,
         *,
         backup_dir: Path | str = "",
         db_name: str = "pipeline.db",
@@ -44,7 +59,7 @@ class SnapshotWorker:
         r2_client: R2Client | None = None,
         r2_prefix: str = "",
     ) -> None:
-        self.conn = conn
+        self.db_path = Path(db_path)
         self.backup_dir = Path(backup_dir) if backup_dir else None
         self.db_name = db_name
         self.inventory_path = Path(inventory_path)
@@ -55,12 +70,12 @@ class SnapshotWorker:
     async def snapshot_once(self) -> None:
         workdir = self.backup_dir or Path(tempfile.gettempdir()) / "ecc_snapshot"
         workdir.mkdir(parents=True, exist_ok=True)
-        db_path = workdir / self.db_name
-        await snapshot_db(self.conn, db_path)
+        dest_db = workdir / self.db_name
+        await snapshot_db(self.db_path, dest_db)
         if self.backup_dir is not None and self.inventory_path.exists():
             shutil.copy2(self.inventory_path, self.backup_dir / self.inventory_path.name)
         if self.r2_client is not None:
-            await self.r2_client.put_object(f"{self.r2_prefix}{self.db_name}", db_path.read_bytes())
+            await self.r2_client.put_object(f"{self.r2_prefix}{self.db_name}", dest_db.read_bytes())
             if self.inventory_path.exists():
                 await self.r2_client.put_object(
                     f"{self.r2_prefix}{self.inventory_path.name}", self.inventory_path.read_bytes()
