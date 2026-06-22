@@ -491,6 +491,7 @@ async def main() -> None:
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
+        "harvest_enabled",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
         "max_attempts", "backoff_jitter",
         "max_cost", "max_dispatch_attempts", "max_requeue_count", "dry_run",
