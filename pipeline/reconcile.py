@@ -40,16 +40,18 @@ def reconcile(
     rk = racknerd.status if racknerd else "not_run"
     bb = bbops.status if bbops else "not_run"
 
-    # Tunnel-down special case: don't burn attempt
-    if rk == "error" and (racknerd and "tunnel not up" in racknerd.message):
-        return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
-
-    # OR-of-valids
+    # OR-of-valids: a positive from EITHER co-equal checker wins — even if the other
+    # backend's infra is down (tunnel not up). Checked before the tunnel-down short-circuit
+    # so a definitive bbops verdict is never discarded when Racknerd is unreachable.
     if rk == "valid" or bb == "valid":
         return ReconcileResult(final_verdict="valid", should_write=True, is_terminal=True)
 
     if rk == "catch_all" or bb == "catch_all":
         return ReconcileResult(final_verdict="catch_all", should_write=True, is_terminal=True)
+
+    # Tunnel-down with no positive signal: pure infra, re-queue without burning attempt.
+    if rk == "error" and (racknerd and "tunnel not up" in racknerd.message):
+        return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
 
     # Both definitively invalid (no errors mixed in)
     if rk == "invalid" and bb == "invalid":

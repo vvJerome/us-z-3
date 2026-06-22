@@ -67,6 +67,12 @@ class TestReconcileOrOfValids:
         assert result.final_verdict == "unknown"
         assert result.should_write is False
 
+    def test_bbops_valid_overrides_tunnel_down(self):
+        # Co-equal: a positive bbops verdict is honored even when Racknerd's tunnel is down.
+        result = reconcile(_v("error", "tunnel not up"), _v("valid"))
+        assert result.final_verdict == "valid"
+        assert result.should_write is True
+
     def test_not_run_backends(self):
         result = reconcile(_v("not_run"), _v("not_run"))
         assert result.final_verdict == "unknown"
