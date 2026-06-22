@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,10 +63,23 @@ async def _make_worker(
                         socks_port=socks_port, autorestart=True)
     tunnel = SshSocksTunnel(tcfg)
     await tunnel.start(ready_timeout_s=30.0)
+    # HELO/MAIL FROM with the worker's own rDNS (PTR) so it matches the connecting IP — the
+    # forward-confirmed check receivers run before honoring RCPT. Explicit config wins; else
+    # fall back to the RacknerdConfig default if the IP has no PTR.
+    rk_kwargs: dict = {}
+    if config.racknerd_helo_hostname:
+        rk_kwargs["helo_hostname"] = config.racknerd_helo_hostname
+    else:
+        try:
+            ptr = (await asyncio.to_thread(socket.gethostbyaddr, host.ip))[0]
+            if ptr and "." in ptr:
+                rk_kwargs["helo_hostname"] = ptr
+        except OSError:
+            pass
     consumer = RacknerdConsumer(
         tunnel,
         RacknerdConfig(socks_port=socks_port, concurrency=config.racknerd_concurrency,
-                       smtp_timeout_s=config.racknerd_smtp_timeout_s),
+                       smtp_timeout_s=config.racknerd_smtp_timeout_s, **rk_kwargs),
         resolver=resolver,
     )
     return FleetWorker(worker_id=host.worker_id, verifier=consumer, tunnel=tunnel,
