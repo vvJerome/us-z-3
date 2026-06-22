@@ -41,6 +41,18 @@ _INVALID_KEYWORDS: tuple[str, ...] = (
 _ISO_NOW = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
 
 
+def _mx_provider(mx_host: str) -> str:
+    """Extract root domain from an MX hostname for per-provider guard keying.
+
+    aspmx.l.google.com → google.com
+    mx1.pphosted.com   → pphosted.com
+    """
+    parts = mx_host.rstrip(".").lower().split(".")
+    if len(parts) >= 2:
+        return f"{parts[-2]}.{parts[-1]}"
+    return mx_host
+
+
 def _default_helo_hostname() -> str:
     """Return a valid FQDN for SMTP EHLO/HELO, or an IP literal fallback (with warning)."""
     fqdn = socket.getfqdn()
@@ -108,21 +120,22 @@ class RacknerdConfig:
 class _SpamhausGuard:
     """Sliding-window block counter. Triggers cooldown when threshold exceeded."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "") -> None:
+        self._name = name or "global"
         self._events: deque[float] = deque()
         self._cooldown_until: float = 0.0
 
     def record_block(self) -> None:
         now = time.monotonic()
         self._events.append(now)
-        # Evict events outside the window
         cutoff = now - RACKNERD_SPAMHAUS_WINDOW_S
         while self._events and self._events[0] < cutoff:
             self._events.popleft()
         if len(self._events) >= RACKNERD_SPAMHAUS_THRESHOLD:
             self._cooldown_until = now + RACKNERD_SPAMHAUS_COOLDOWN_S
             _log.warning(
-                "SpamhausGuard: %d blocks in %ds — cooling down for %.0fs",
+                "SpamhausGuard[%s]: %d blocks in %ds — cooling down for %.0fs",
+                self._name,
                 len(self._events),
                 RACKNERD_SPAMHAUS_WINDOW_S,
                 RACKNERD_SPAMHAUS_COOLDOWN_S,
@@ -135,7 +148,7 @@ class _SpamhausGuard:
     async def wait_if_cooling(self) -> None:
         remaining = self._cooldown_until - time.monotonic()
         if remaining > 0:
-            _log.info("SpamhausGuard cooldown: waiting %.0fs", remaining)
+            _log.info("SpamhausGuard[%s] cooldown: waiting %.0fs", self._name, remaining)
             await asyncio.sleep(remaining)
 
 
@@ -152,9 +165,14 @@ class RacknerdConsumer:
         self.config = config or RacknerdConfig()
         self._resolver = resolver or aiodns.DNSResolver(timeout=3, tries=1)
         self._sem = asyncio.Semaphore(self.config.concurrency)
-        self._guard = _SpamhausGuard()
+        self._guards: dict[str, _SpamhausGuard] = {}
         # MX cache: domain → (mx_hosts, expires_at)
         self._mx_cache: dict[str, tuple[list[str], float]] = {}
+
+    def _guard_for(self, provider: str) -> _SpamhausGuard:
+        if provider not in self._guards:
+            self._guards[provider] = _SpamhausGuard(name=provider)
+        return self._guards[provider]
 
     async def verify(self, email: str) -> BackendVerdict:
         """Probe `email` via SOCKS5 SMTP. Returns a BackendVerdict."""
@@ -164,8 +182,6 @@ class RacknerdConsumer:
     async def _verify_inner(self, email: str) -> BackendVerdict:
         if self.tunnel is not None and not self.tunnel.is_up():
             return BackendVerdict(status="error", message="tunnel not up", verified_at=_ISO_NOW())
-
-        await self._guard.wait_if_cooling()
 
         if not _EMAIL_RE.match(email):
             return BackendVerdict(status="error", message="invalid email format", verified_at=_ISO_NOW())
@@ -182,6 +198,9 @@ class RacknerdConsumer:
         last_msg = "no hosts probed"
 
         for mx_host in mx_hosts[:RACKNERD_MX_MAX_HOSTS]:
+            provider = _mx_provider(mx_host)
+            await self._guard_for(provider).wait_if_cooling()
+
             status, msg = await self._probe_mx(email, mx_host)
             last_status, last_msg = status, msg
 
@@ -192,7 +211,7 @@ class RacknerdConsumer:
             if status == "catch_all":
                 return BackendVerdict(status="catch_all", message=msg, verified_at=_ISO_NOW())
             if status == "blocked":
-                self._guard.record_block()
+                self._guard_for(provider).record_block()
                 return BackendVerdict(status="blocked", message=msg, verified_at=_ISO_NOW())
             # error → try next MX host
 
