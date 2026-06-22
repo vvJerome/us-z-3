@@ -12,6 +12,8 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
+    INFRA_RETRY_BASE_MINUTES,
+    INFRA_RETRY_MULTIPLIER,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
@@ -99,6 +101,13 @@ def reconcile(
 
 def _greylisting_retry_after(minutes: int = 30) -> str:
     """Return an ISO timestamp N minutes from now for a greylisting hold."""
+    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _infra_retry_after(requeue_count: int) -> str:
+    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
+    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
     dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -242,13 +251,17 @@ class Dispatcher:
         # safety valve that terminates records stuck in permanent infra failure loops.
         dispatch_attempts = row["dispatch_attempts"] or 0
         requeue_count = row["requeue_count"] or 0
+        tunnel_requeue_count = row["tunnel_requeue_count"] or 0
+        bbops_requeue_count = row["bbops_requeue_count"] or 0
         if dispatch_attempts >= self.config.max_dispatch_attempts:
             logger.warning(
                 "Record %s hit max dispatch attempts (%d) — marking VALIDATION_FAILED",
                 unique_id, dispatch_attempts,
             )
             async with self._write_lock:
-                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+                await db.update_record_status(
+                    self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="max_attempts"
+                )
             self.stats["validation_failed"] += 1
             return
         if requeue_count >= self.config.max_requeue_count:
@@ -257,13 +270,17 @@ class Dispatcher:
                 unique_id, requeue_count,
             )
             async with self._write_lock:
-                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+                await db.update_record_status(
+                    self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="infra_loop"
+                )
             self.stats["validation_failed"] += 1
             return
 
         if not raw_candidates:
             logger.warning("No candidate_emails for %s — marking failed", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            await db.update_record_status(
+                self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="no_candidates"
+            )
             self.stats["validation_failed"] += 1
             return
 
@@ -271,7 +288,9 @@ class Dispatcher:
             candidates: list[str] = json.loads(raw_candidates)
         except (json.JSONDecodeError, TypeError):
             logger.warning("Invalid candidate_emails JSON for %s", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            await db.update_record_status(
+                self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="no_candidates"
+            )
             self.stats["validation_failed"] += 1
             return
 
@@ -289,6 +308,7 @@ class Dispatcher:
         i = 0
         last_rk: BackendVerdict | None = None
         last_bb: BackendVerdict | None = None
+        any_real_test = False  # True when any candidate got a definitive backend verdict
 
         while i < len(candidates):
             email = candidates[i]
@@ -382,15 +402,21 @@ class Dispatcher:
                 logger.info("Racknerd-validated (bbops skipped): %s → %s", unique_id, email)
                 return
 
-            # Tunnel down: pure infra, re-queue without burning dispatch_attempts
+            # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
             if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
-                async with self._write_lock:
-                    await db.requeue_record(
-                        self.conn, unique_id, increment_attempts=False, retry_after=None
-                    )
-                self.stats["requeued"] += 1
-                logger.debug("Re-queued %s (SSH tunnel not up)", unique_id)
-                return
+                if tunnel_requeue_count < self.config.max_tunnel_requeues:
+                    retry_after = _infra_retry_after(tunnel_requeue_count)
+                    async with self._write_lock:
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=False,
+                            retry_after=retry_after, infra_type="tunnel",
+                        )
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (SSH tunnel not up, retry after %s)", unique_id, retry_after)
+                    return
+                # Tunnel limit reached — treat as not_run and proceed bbops-only
+                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at="")
+                logger.debug("Tunnel requeue limit hit for %s — proceeding bbops-only", unique_id)
 
             # Racknerd gave blocked/error/invalid — run bbops
             t_bb = time.monotonic()
@@ -409,6 +435,9 @@ class Dispatcher:
             last_bb = bb_verdict
 
             result = reconcile(rk_verdict, bb_verdict)
+
+            if rk_verdict.status in _DEFINITIVE or bb_verdict.status in _DEFINITIVE:
+                any_real_test = True
 
             # Disagreement detection (only when both gave definitive verdicts)
             if (
@@ -479,13 +508,9 @@ class Dispatcher:
                     pending_trace.append(zuhal_trace)
 
                     if zuhal_status == "circuit_open":
-                        async with self._write_lock:
-                            await db.requeue_record(
-                                self.conn, unique_id, increment_attempts=False, retry_after=None
-                            )
-                        self.stats["requeued"] += 1
-                        logger.warning("Zuhal circuit open — re-queued %s for later retry", unique_id)
-                        return
+                        # No re-queue — skip Zuhal for this candidate and try next
+                        logger.warning("Zuhal circuit open for %s — skipping, trying next candidate", unique_id)
+                        continue
 
                     if zuhal_status == "accept-all":
                         zuhal_status = "catch_all"
@@ -528,18 +553,23 @@ class Dispatcher:
                         )
                     return
                 else:
-                    async with self._write_lock:
-                        await db.requeue_record(
-                            self.conn, unique_id,
-                            increment_attempts=any_real_verdict,
-                            retry_after=greylist_hold,
-                        )
-                    self.stats["requeued"] += 1
-                    if rk_is_4xx:
-                        logger.debug("Re-queued %s (greylisted — 4xx hold until %s)", unique_id, greylist_hold)
-                    else:
-                        logger.debug("Re-queued %s (inconclusive verdict, no Zuhal configured)", unique_id)
-                    return
+                    if bbops_requeue_count < self.config.max_bbops_requeues:
+                        retry_after = greylist_hold or _infra_retry_after(bbops_requeue_count)
+                        async with self._write_lock:
+                            await db.requeue_record(
+                                self.conn, unique_id,
+                                increment_attempts=any_real_verdict,
+                                retry_after=retry_after,
+                                infra_type="bbops",
+                            )
+                        self.stats["requeued"] += 1
+                        if rk_is_4xx:
+                            logger.debug("Re-queued %s (greylisted — 4xx hold until %s)", unique_id, greylist_hold)
+                        else:
+                            logger.debug("Re-queued %s (bbops inconclusive, retry after %s)", unique_id, retry_after)
+                        return
+                    # bbops limit reached — skip this candidate, try next
+                    logger.debug("bbops requeue limit hit for %s — skipping candidate %s", unique_id, email)
 
             if result.final_verdict in ("valid", "catch_all"):
                 score = compute_confidence_score(
@@ -581,15 +611,9 @@ class Dispatcher:
                 pending_trace.append(zuhal_trace)
 
                 if zuhal_status == "circuit_open":
-                    async with self._write_lock:
-                        await db.requeue_record(
-                            self.conn, unique_id, increment_attempts=False, retry_after=None
-                        )
-                    self.stats["requeued"] += 1
-                    logger.warning(
-                        "Zuhal circuit open (both-invalid rescue) — re-queued %s", unique_id
-                    )
-                    return
+                    # No re-queue — skip Zuhal for this candidate and try next
+                    logger.warning("Zuhal circuit open (both-invalid rescue) for %s — skipping", unique_id)
+                    continue
 
                 if zuhal_status == "accept-all":
                     zuhal_status = "catch_all"
@@ -667,6 +691,12 @@ class Dispatcher:
             return
 
         # All candidates exhausted — write last SMTP verdicts so we know what ran
+        if last_rk and last_rk.status == "blocked":
+            failure_reason = "provider_blocked"
+        elif not any_real_test:
+            failure_reason = "infra_loop"
+        else:
+            failure_reason = "max_attempts"
         async with self._write_lock:
             await db.update_record_dual(
                 self.conn,
@@ -679,10 +709,11 @@ class Dispatcher:
                 bbops_message=last_bb.message if last_bb else None,
                 bbops_verified_at=last_bb.verified_at if last_bb else None,
                 final_verdict="invalid",
+                failure_reason=failure_reason,
             )
             await db.flush_process_trace(self.conn, unique_id, pending_trace)
         self.stats["validation_failed"] += 1
-        logger.debug("All candidates failed for %s", unique_id)
+        logger.debug("All candidates failed for %s (failure_reason=%s)", unique_id, failure_reason)
 
     async def _zuhal_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()

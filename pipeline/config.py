@@ -108,6 +108,8 @@ class PipelineConfig(BaseSettings):
     max_discovery_retries: int = Field(default=3, ge=0)
     max_dispatch_attempts: int = Field(default=5, ge=1)
     max_requeue_count: int = Field(default=15, ge=1)
+    max_tunnel_requeues: int = Field(default=1, ge=0)
+    max_bbops_requeues: int = Field(default=1, ge=0)
 
     # --- Enrichment ---
     enrichment_source: Literal["serper"] = "serper"

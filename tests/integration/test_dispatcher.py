@@ -467,7 +467,7 @@ class TestDispatcherReconciliation:
         assert row["retry_after"] is not None  # hold set
 
     async def test_non_greylist_error_no_retry_after(self, test_db, config):
-        """A plain error (not 4xx temporary) does not set retry_after."""
+        """A plain error (not 4xx greylisting) sets an infra backoff retry_after."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "connection refused")
@@ -483,7 +483,8 @@ class TestDispatcherReconciliation:
             row = await cur.fetchone()
 
         assert row["record_state"] == State.DISCOVERED
-        assert row["retry_after"] is None
+        # Infra backoff: retry_after is set to a future timestamp (not None)
+        assert row["retry_after"] is not None
 
     async def test_max_requeue_count_terminates_loop(self, test_db, config):
         """A record that has hit max_requeue_count is marked VALIDATION_FAILED
@@ -525,3 +526,199 @@ class TestDispatcherReconciliation:
 
         rows = await db.fetch_pending_validation(test_db, limit=10)
         assert not any(r["unique_id"] == "rec1" for r in rows)
+
+
+async def _insert_discovered_with_counts(
+    conn: aiosqlite.Connection,
+    unique_id: str,
+    email: str = "test@example.com",
+    tunnel_requeue_count: int = 0,
+    bbops_requeue_count: int = 0,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO records
+            (unique_id, business_name, agent_name, record_state,
+             candidate_emails, candidate_email, candidate_domain, strategy, mx_provider,
+             tunnel_requeue_count, bbops_requeue_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            unique_id, "Test Corp", "John Doe",
+            State.DISCOVERED,
+            json.dumps([email]), email, "example.com", "with", "gmail.com",
+            tunnel_requeue_count, bbops_requeue_count,
+        ),
+    )
+    await conn.commit()
+
+
+class TestInfraRequeueLimit:
+    """Dispatcher enforces per-infra requeue limits."""
+
+    async def test_tunnel_down_first_time_requeues(self, test_db, config):
+        """First tunnel failure re-queues and increments tunnel_requeue_count."""
+        await _insert_discovered_with_counts(test_db, "rec1", tunnel_requeue_count=0)
+        rk = _mock_racknerd("error", "tunnel not up")
+        bb = _mock_bbops("invalid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, tunnel_requeue_count FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.DISCOVERED
+        assert row["tunnel_requeue_count"] == 1
+
+    async def test_tunnel_down_second_time_falls_through_to_bbops(self, test_db, config):
+        """Second tunnel failure skips Racknerd and runs bbops-only (no re-queue)."""
+        await _insert_discovered_with_counts(test_db, "rec1", tunnel_requeue_count=1)
+        rk = _mock_racknerd("error", "tunnel not up")
+        bb = _mock_bbops("invalid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, bbops_status FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        # Record moved to a terminal state (not re-queued) — bbops was called
+        assert row["record_state"] != State.DISCOVERED
+        bb.verify.assert_called_once()
+
+    async def test_bbops_error_first_time_requeues(self, test_db, config):
+        """First bbops error (unknown reconcile, no Zuhal) re-queues with bbops type."""
+        cfg = PipelineConfig(
+            serper_api_key="test",
+            zuhal_api_key="",
+            racknerd_host="localhost",
+            input_path=config.input_path,
+            output_dir=config.output_dir,
+            db_path=config.db_path,
+            log_dir=config.log_dir,
+            dispatch_concurrency=1,
+            dispatch_backend_timeout_s=5.0,
+            dispatch_poll_interval_s=0.1,
+            dispatch_chunk_size=10,
+        )
+        await _insert_discovered_with_counts(test_db, "rec1", bbops_requeue_count=0)
+        rk = _mock_racknerd("invalid")
+        bb = _mock_bbops("error")
+        dispatcher = Dispatcher(cfg, test_db, rk, bb, CostTracker(None), zuhal=None)
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, bbops_requeue_count FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.DISCOVERED
+        assert row["bbops_requeue_count"] == 1
+
+    async def test_bbops_error_second_time_skips_candidate(self, test_db, config):
+        """Second bbops error skips candidate and exhausts all → VALIDATION_FAILED."""
+        cfg = PipelineConfig(
+            serper_api_key="test",
+            zuhal_api_key="",
+            racknerd_host="localhost",
+            input_path=config.input_path,
+            output_dir=config.output_dir,
+            db_path=config.db_path,
+            log_dir=config.log_dir,
+            dispatch_concurrency=1,
+            dispatch_backend_timeout_s=5.0,
+            dispatch_poll_interval_s=0.1,
+            dispatch_chunk_size=10,
+        )
+        await _insert_discovered_with_counts(test_db, "rec1", bbops_requeue_count=1)
+        rk = _mock_racknerd("invalid")
+        bb = _mock_bbops("error")
+        dispatcher = Dispatcher(cfg, test_db, rk, bb, CostTracker(None), zuhal=None)
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+
+
+class TestFailureReason:
+    """Dispatcher sets failure_reason correctly on VALIDATION_FAILED."""
+
+    async def test_all_candidates_exhausted_no_real_test_is_infra_loop(self, test_db, config):
+        """dispatch_attempts=0 after all candidates exhausted → failure_reason=infra_loop."""
+        cfg = PipelineConfig(
+            serper_api_key="test",
+            zuhal_api_key="",
+            racknerd_host="localhost",
+            input_path=config.input_path,
+            output_dir=config.output_dir,
+            db_path=config.db_path,
+            log_dir=config.log_dir,
+            dispatch_concurrency=1,
+            dispatch_backend_timeout_s=5.0,
+            dispatch_poll_interval_s=0.1,
+            dispatch_chunk_size=10,
+            max_bbops_requeues=0,  # immediately skip on bbops error
+        )
+        await _insert_discovered_with_counts(test_db, "rec1")
+        rk = _mock_racknerd("error", "some error")
+        bb = _mock_bbops("error")
+        dispatcher = Dispatcher(cfg, test_db, rk, bb, CostTracker(None), zuhal=None)
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, failure_reason FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        assert row["failure_reason"] == "infra_loop"
+
+    async def test_all_candidates_invalid_is_max_attempts(self, test_db, config):
+        """dispatch_attempts>0 after real invalid verdicts → failure_reason=max_attempts."""
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid")
+        bb = _mock_bbops("invalid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, failure_reason FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        assert row["failure_reason"] == "max_attempts"
+
+    async def test_max_requeue_count_sets_infra_loop(self, test_db, config):
+        """Record at max_requeue_count with no real tests → failure_reason=infra_loop."""
+        await _insert_discovered(test_db, "rec1")
+        await test_db.execute(
+            "UPDATE records SET requeue_count = ?, dispatch_attempts = 0 WHERE unique_id = ?",
+            (config.max_requeue_count, "rec1"),
+        )
+        await test_db.commit()
+        rk = _mock_racknerd("invalid")
+        bb = _mock_bbops("invalid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "infra_loop"

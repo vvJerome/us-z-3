@@ -506,3 +506,104 @@ class TestProcessTrace:
         assert len(trace) == 2
         assert trace[0]["stage"] == "stage1"
         assert trace[1]["stage"] == "stage2"
+
+
+class TestRequeueRecord:
+    """Test requeue_record infra_type counter tracking."""
+
+    async def _insert(self, conn: aiosqlite.Connection, uid: str) -> None:
+        await conn.execute(
+            "INSERT INTO records (unique_id, record_state, candidate_emails) VALUES (?, ?, ?)",
+            (uid, State.VALIDATING, '["x@y.com"]'),
+        )
+        await conn.commit()
+
+    async def test_requeue_increments_requeue_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False)
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 0
+        assert row["bbops_requeue_count"] == 0
+
+    async def test_requeue_tunnel_type_increments_tunnel_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="tunnel")
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 1
+        assert row["bbops_requeue_count"] == 0
+
+    async def test_requeue_bbops_type_increments_bbops_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="bbops")
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 0
+        assert row["bbops_requeue_count"] == 1
+
+    async def test_tunnel_and_bbops_counts_are_independent(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="tunnel")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="bbops")
+        async with test_db.execute(
+            "SELECT tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["tunnel_requeue_count"] == 1
+        assert row["bbops_requeue_count"] == 1
+
+
+class TestFailureReason:
+    """Test that update_record_dual and update_record_status write failure_reason."""
+
+    async def test_update_record_status_sets_failure_reason(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            ("r1", State.VALIDATING),
+        )
+        await test_db.commit()
+        await db.update_record_status(test_db, "r1", State.VALIDATION_FAILED, failure_reason="infra_loop")
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "infra_loop"
+
+    async def test_update_record_dual_sets_failure_reason(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            ("r1", State.VALIDATING),
+        )
+        await test_db.commit()
+        await db.update_record_dual(
+            test_db,
+            "r1",
+            State.VALIDATION_FAILED,
+            racknerd_status="invalid",
+            racknerd_message="550",
+            racknerd_verified_at=None,
+            bbops_status="invalid",
+            bbops_message="550",
+            bbops_verified_at=None,
+            final_verdict="invalid",
+            failure_reason="max_attempts",
+        )
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "max_attempts"

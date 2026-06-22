@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +71,13 @@ CREATE TABLE IF NOT EXISTS records (
     process_trace       TEXT,
 
     -- Re-queue tracking
-    requeue_count       INTEGER DEFAULT 0,
-    retry_after         TEXT,
+    requeue_count         INTEGER DEFAULT 0,
+    tunnel_requeue_count  INTEGER DEFAULT 0,
+    bbops_requeue_count   INTEGER DEFAULT 0,
+    retry_after           TEXT,
+
+    -- Why VALIDATION_FAILED: 'infra_loop' (never tested) or 'max_attempts' (all tested invalid)
+    failure_reason        TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -201,6 +206,13 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v9
+_V9_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN tunnel_requeue_count INTEGER DEFAULT 0",
+    "ALTER TABLE records ADD COLUMN bbops_requeue_count INTEGER DEFAULT 0",
+    "ALTER TABLE records ADD COLUMN failure_reason TEXT",
+]
+
 # Migration statements for schema v8
 _V8_MIGRATIONS: list[str] = [
     # requeue_count: total re-queues (including infra transients) — safety valve against
@@ -257,6 +269,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (6, _V4_MIGRATIONS),
         (7, _V7_MIGRATIONS),
         (8, _V8_MIGRATIONS),
+        (9, _V9_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -414,6 +427,7 @@ async def requeue_record(
     *,
     increment_attempts: bool = True,
     retry_after: str | None = None,
+    infra_type: str | None = None,
 ) -> None:
     """Return a record to DISCOVERED.
 
@@ -421,27 +435,37 @@ async def requeue_record(
     (valid/invalid/catch_all). False for infra transients (tunnel down, Zuhal
     circuit open, bbops unhealthy) that should not penalise the dispatch budget.
 
-    requeue_count always increments regardless of increment_attempts — it is a
-    safety valve that bounds records in infinite-loop infra failure scenarios.
+    requeue_count always increments. infra_type="tunnel" or "bbops" additionally
+    increments the per-backend counter used to enforce per-infra requeue limits.
 
     retry_after (ISO timestamp) sets a hold: fetch_pending_validation skips
     the record until that time passes. Use for greylisting (SMTP 4xx).
     """
+    infra_fragment = ""
+    if infra_type == "tunnel":
+        infra_fragment = ", tunnel_requeue_count = tunnel_requeue_count + 1"
+    elif infra_type == "bbops":
+        infra_fragment = ", bbops_requeue_count = bbops_requeue_count + 1"
+
     if increment_attempts:
-        sql = """UPDATE records
-                    SET record_state = 'DISCOVERED',
-                        dispatch_attempts = dispatch_attempts + 1,
-                        requeue_count = requeue_count + 1,
-                        retry_after = ?,
-                        updated_at = datetime('now')
-                  WHERE unique_id = ?"""
+        sql = (
+            "UPDATE records"
+            " SET record_state = 'DISCOVERED',"
+            " dispatch_attempts = dispatch_attempts + 1,"
+            f" requeue_count = requeue_count + 1{infra_fragment},"
+            " retry_after = ?,"
+            " updated_at = datetime('now')"
+            " WHERE unique_id = ?"
+        )
     else:
-        sql = """UPDATE records
-                    SET record_state = 'DISCOVERED',
-                        requeue_count = requeue_count + 1,
-                        retry_after = ?,
-                        updated_at = datetime('now')
-                  WHERE unique_id = ?"""
+        sql = (
+            "UPDATE records"
+            " SET record_state = 'DISCOVERED',"
+            f" requeue_count = requeue_count + 1{infra_fragment},"
+            " retry_after = ?,"
+            " updated_at = datetime('now')"
+            " WHERE unique_id = ?"
+        )
     await conn.execute(sql, (retry_after, unique_id))
     await conn.commit()
 
@@ -482,6 +506,7 @@ async def update_record_dual(
     confidence_score: float | None = None,
     dispatch_attempts_delta: int = 1,
     zuhal_status_override: str | None = None,
+    failure_reason: str | None = None,
 ) -> None:
     """Write dual-backend verdicts and advance dispatch_attempts atomically."""
     sets = [
@@ -517,6 +542,10 @@ async def update_record_dual(
     if confidence_score is not None:
         sets.append("confidence_score = ?")
         values.append(confidence_score)
+
+    if failure_reason is not None:
+        sets.append("failure_reason = ?")
+        values.append(failure_reason)
 
     values.append(unique_id)
     sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"

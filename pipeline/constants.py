@@ -45,6 +45,13 @@ TUNNEL_BACKOFF_MAX_S: float = 60.0
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
 DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD: int = 3
 
+# --- Infra re-queue backoff ---
+# Backoff schedule for tunnel-down and bbops-error re-queues.
+# Delay (minutes) = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
+# With base=5 and multiplier=3: attempt 0→5min, 1→15min, 2→45min
+INFRA_RETRY_BASE_MINUTES: int = 5
+INFRA_RETRY_MULTIPLIER: float = 3.0
+
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.
 # This list grows at runtime via ProducerWorker._fallback_blocklist when a domain
