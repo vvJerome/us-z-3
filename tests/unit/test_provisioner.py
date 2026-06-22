@@ -81,6 +81,17 @@ async def test_provision_marks_last_as_reserve_in_reserve_region(tmp_path):
     assert [h.is_reserve for h in hosts] == [False, False, True]
 
 
+async def test_provision_skips_failed_workers(tmp_path):
+    class _FlakyClient(_FakeClient):
+        async def create_server(self, project_id, *, hostname, **kw):
+            if hostname == "cherry-2":
+                raise CherryAPIError(500, "boom")
+            return await super().create_server(project_id, hostname=hostname, **kw)
+
+    hosts = await _prov(_FlakyClient(server_state="active"), tmp_path).provision(3, [42])
+    assert {h.worker_id for h in hosts} == {"cherry-1", "cherry-3"}
+
+
 def test_inventory_round_trip_and_merge(tmp_path):
     prov = _prov(_FakeClient(), tmp_path)
     prov.write_inventory([FleetHost("cherry-1", 1, "1.1.1.1", "EU-Nord-1")])

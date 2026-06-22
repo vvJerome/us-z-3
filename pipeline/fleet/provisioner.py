@@ -126,15 +126,26 @@ class FleetProvisioner:
         reserve_region: str | None = None,
         user_data: str | None = None,
     ) -> list[FleetHost]:
-        """Provision `count` servers; the last one in `reserve_region` if given (item 6)."""
-        hosts: list[FleetHost] = []
-        for i in range(count):
+        """Provision `count` servers concurrently; the last one in `reserve_region` if given (item 6).
+
+        All creates fire at once and become-active polls run in parallel, so wall time is
+        ~one server instead of count×. A worker that fails to provision is logged and skipped.
+        """
+        async def _one(i: int) -> FleetHost:
             is_reserve = reserve_region is not None and i == count - 1
             region = reserve_region if is_reserve else self.region
-            hosts.append(await self.provision_one(
+            return await self.provision_one(
                 key_ids, f"{name_prefix}-{i + 1}", region=region,
                 user_data=user_data, is_reserve=is_reserve,
-            ))
+            )
+
+        results = await asyncio.gather(*(_one(i) for i in range(count)), return_exceptions=True)
+        hosts: list[FleetHost] = []
+        for i, result in enumerate(results):
+            if isinstance(result, FleetHost):
+                hosts.append(result)
+            else:
+                logger.error("worker %s-%d failed to provision: %s", name_prefix, i + 1, result)
         return hosts
 
     def load_inventory(self) -> list[FleetHost]:
