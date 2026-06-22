@@ -162,6 +162,11 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     config.zuhal_concurrency,
                     config.zuhal_rate_limit,
                 )
+                remaining = await zuhal_client.check_credits()
+                if remaining is not None:
+                    logger.info("Zuhal credits OK — %d remaining", remaining)
+                else:
+                    logger.info("Zuhal credits check passed (balance not reported)")
             else:
                 logger.info("Zuhal fallback disabled (ZUHAL_API_KEY not set)")
 

@@ -44,6 +44,42 @@ class ZuhalClient:
             exclude=[asyncio.TimeoutError],
         )
 
+    async def check_credits(self) -> int | None:
+        """Probe Zuhal at startup to confirm credits are available.
+
+        Returns remaining credit count if the API reports it, else None.
+        Raises PipelineHaltError on 401 (bad key) or 402 (no credits).
+        Bypasses circuit breaker and rate limiter — one-off startup call only.
+        """
+        if self.dry_run:
+            logger.info("Zuhal credit check skipped (dry-run)")
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        async with self.session.post(
+            "https://zuhal.io/api/v1/verify",
+            json={"email": "credits-probe@example.invalid"},
+            headers=headers,
+        ) as resp:
+            if resp.status == 401:
+                raise PipelineHaltError("Zuhal API key invalid or expired (401)")
+            if resp.status == 402:
+                raise PipelineHaltError(
+                    "Zuhal credit balance exhausted — top up your account before running"
+                )
+            # 200: extract remaining credits; anything else (429, 5xx) means key is valid
+            if resp.status == 200:
+                try:
+                    data = await resp.json()
+                    inner = data.get("data", {})
+                    return inner.get("remaining_credits")
+                except Exception:
+                    return None
+            return None
+
     async def validate(self, email: str) -> ValidationResult:
         async with self._sem:
             return await self._validate_inner(email)
