@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS records (
 
     -- Why VALIDATION_FAILED: 'infra_loop' (never tested) or 'max_attempts' (all tested invalid)
     failure_reason        TEXT,
+
+    -- Domain quality signal: 0.0–1.0 word-overlap between business name and discovered domain stem.
+    -- 1.0 for DNS hits (business owns the domain); <1.0 for Serper hits where domain may be wrong.
+    domain_match_score    REAL,
 
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -224,6 +228,11 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v12
+_V12_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN domain_match_score REAL",
+]
+
 # Migration statements for schema v11
 _V11_MIGRATIONS: list[str] = [
     """
@@ -272,8 +281,9 @@ INSERT OR IGNORE INTO records (
     unique_id, business_name, agent_name, state, jurisdiction,
     position_type, name_entity_type, candidate_email, candidate_emails,
     subdomain_emails, candidate_domain, discovery_source, discovery_attempts,
-    strategy, is_org_agent, mx_provider, record_state, process_trace, serper_enriched
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    strategy, is_org_agent, mx_provider, record_state, process_trace, serper_enriched,
+    domain_match_score
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_CHECKPOINT_SQL = """
@@ -316,6 +326,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (9, _V9_MIGRATIONS),
         (10, _V10_MIGRATIONS),
         (11, _V11_MIGRATIONS),
+        (12, _V12_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -383,6 +394,7 @@ async def insert_records_batch(
                     r.get("record_state", State.RAW),
                     r.get("process_trace"),
                     1 if r.get("serper_enriched") else 0,
+                    r.get("domain_match_score"),
                 ))
                 inserted += cur.rowcount
             if inserted < len(records):

@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Literal, TYPE_CHECKING
 
+from rapidfuzz import fuzz as _fuzz
+
 from pipeline.constants import DOMAIN_STEM_MIN_LENGTH
 
 if TYPE_CHECKING:
@@ -123,6 +125,44 @@ def generate_domain_stems(business_name: str) -> list[str]:
             unique.append(s)
 
     return unique
+
+
+def domain_match_score(business_name: str, domain: str) -> float:
+    """Score 0.0–1.0: how well a discovered domain matches the business name.
+
+    Takes the max of two signals:
+    - Word overlap: fraction of significant business name words found in the domain stem.
+      Handles "Smith Plumbing LLC" → "smithplumbing.com" well.
+    - Fuzzy ratio: rapidfuzz character similarity between joined business name and stem.
+      Handles concatenated variations that word overlap misses.
+
+    Neither signal handles pure abbreviation domains (ncrg.com for "NC Restaurant Group")
+    reliably — those score low (~0.25) and get a medium-tier cap at worst.
+    """
+    if not business_name or not domain:
+        return 0.0
+
+    norm = normalize_business_name(business_name)
+    if not norm:
+        return 0.0
+
+    # Extract first label of domain (skip www prefix)
+    parts = domain.lower().rstrip(".").split(".")
+    stem = parts[1] if parts[0] == "www" and len(parts) > 1 else parts[0]
+    if not stem:
+        return 0.0
+
+    # Signal 1: word overlap
+    words = [w for w in norm.split() if len(w) >= 3]
+    if not words:
+        words = norm.split()
+    word_score = sum(1 for w in words if w in stem) / len(words) if words else 0.0
+
+    # Signal 2: fuzzy ratio on joined name vs stem ("smithplumbing" vs "smithplumbing")
+    norm_joined = re.sub(r"\s+", "", norm)
+    fuzzy_score = _fuzz.ratio(norm_joined, stem) / 100.0
+
+    return round(max(word_score, fuzzy_score), 3)
 
 
 def assign_email_strategy(record: InputRecord) -> Literal["with", "without"]:

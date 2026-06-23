@@ -382,7 +382,7 @@ class ZuhalDispatcher:
 
         terminal = status in ("valid", "catch_all")
         record_state = State.VALIDATED if terminal else State.VALIDATION_FAILED
-        score = compute_confidence_score(email, candidate_domain, strategy, status, agent_name)
+        score = compute_confidence_score(email, candidate_domain, strategy, status, agent_name, domain_match_score=row["domain_match_score"])
 
         if trace_entry is None:
             trace_entry = {"stage": "zuhal_fallback", "outcome": status, "bulk": bulk, "email": email}

@@ -301,6 +301,7 @@ class Dispatcher:
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
         serper_enriched = bool(row["serper_enriched"])
+        dms: float | None = row["domain_match_score"]
 
         pending_trace: list[dict] = []
         cost_skipped = False
@@ -329,7 +330,7 @@ class Dispatcher:
                 pending_trace.append(ms_trace)
 
                 if ms_status == "valid":
-                    score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name)
+                    score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name, domain_match_score=dms)
                     async with self._write_lock:
                         await db.update_record_dual(
                             self.conn,
@@ -378,7 +379,7 @@ class Dispatcher:
             # Racknerd valid/catch_all: bbops not needed
             if rk_verdict.status in ("valid", "catch_all"):
                 score = compute_confidence_score(
-                    email, candidate_domain, strategy, rk_verdict.status, agent_name
+                    email, candidate_domain, strategy, rk_verdict.status, agent_name, domain_match_score=dms
                 )
                 async with self._write_lock:
                     await db.update_record_dual(
@@ -517,7 +518,7 @@ class Dispatcher:
                     terminal = zuhal_status in ("valid", "catch_all")
                     state = State.VALIDATED if terminal else State.VALIDATION_FAILED
                     score = compute_confidence_score(
-                        email, candidate_domain, strategy, zuhal_status, agent_name
+                        email, candidate_domain, strategy, zuhal_status, agent_name, domain_match_score=dms
                     )
                     async with self._write_lock:
                         await db.update_record_dual(
@@ -573,7 +574,7 @@ class Dispatcher:
 
             if result.final_verdict in ("valid", "catch_all"):
                 score = compute_confidence_score(
-                    email, candidate_domain, strategy, result.final_verdict, agent_name
+                    email, candidate_domain, strategy, result.final_verdict, agent_name, domain_match_score=dms
                 )
                 async with self._write_lock:
                     await db.update_record_dual(
@@ -619,7 +620,7 @@ class Dispatcher:
                     zuhal_status = "catch_all"
                 if zuhal_status in ("valid", "catch_all"):
                     score = compute_confidence_score(
-                        email, candidate_domain, strategy, zuhal_status, agent_name
+                        email, candidate_domain, strategy, zuhal_status, agent_name, domain_match_score=dms
                     )
                     async with self._write_lock:
                         await db.update_record_dual(
