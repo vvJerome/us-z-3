@@ -162,7 +162,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     _zuhal_bucket,
                     concurrency=config.zuhal_concurrency,
                     dry_run=config.dry_run,
-                    max_attempts=config.max_attempts,
+                    max_attempts=1,  # paid call fires once — never retried in-call
                     jitter=config.backoff_jitter,
                 )
                 logger.info(
