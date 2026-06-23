@@ -231,21 +231,39 @@ class TestZuhalDispatcherBulkDrainCreditGuard:
             row = await cur.fetchone()
         assert row["record_state"] == State.VALIDATION_FAILED
 
-    async def test_bulk_success_applies_verdicts(self, test_db, config):
+    async def test_bulk_success_applies_verdicts_and_records_cost(self, test_db, config):
         await _seed_needs_zuhal(test_db, unique_id="rec1", email="a@example.com")
-        zuhal = _mock_zuhal_bulk(return_value={"a@example.com": "valid"})
-        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+        await _seed_needs_zuhal(test_db, unique_id="rec2", email="b@example.com")
+        zuhal = _mock_zuhal_bulk(return_value={"a@example.com": "valid", "b@example.com": "invalid"})
+        cost = CostTracker(None)
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
 
         processed = await worker._drain_bulk()
 
-        assert processed == 1
+        assert processed == 2
         assert worker.stats["bulk_batches"] == 1
+        # Bulk must bill per email — otherwise the cost ceiling is blind in bulk mode.
+        assert cost.counts.get("zuhal", 0) == 2
         async with test_db.execute(
-            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'rec1'"
+            "SELECT final_verdict FROM records WHERE unique_id = 'rec1'"
         ) as cur:
-            row = await cur.fetchone()
-        assert row["record_state"] == State.VALIDATED
-        assert row["final_verdict"] == "valid"
+            assert (await cur.fetchone())["final_verdict"] == "valid"
+
+    async def test_bulk_skipped_when_cost_ceiling_reached(self, test_db, config):
+        await _seed_needs_zuhal(test_db, unique_id="rec1", email="a@example.com")
+        cost = CostTracker(max_cost=0.0)
+        cost.record_call("serper_producer")  # push past ceiling
+        zuhal = _mock_zuhal_bulk(return_value={"a@example.com": "valid"})
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+
+        processed = await worker._drain_bulk()
+
+        assert processed == 0
+        zuhal.bulk_validate.assert_not_called()   # no new paid batch past budget
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            assert (await cur.fetchone())["record_state"] == State.NEEDS_ZUHAL  # untouched
 
 
 class TestZuhalDispatcherCreditsExhausted:

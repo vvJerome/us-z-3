@@ -190,6 +190,10 @@ class ZuhalDispatcher:
 
     async def _drain_bulk(self) -> int:
         """Claim a batch, upload to Zuhal bulk API, apply results. Returns rows processed."""
+        if self.cost_tracker.ceiling_reached():
+            # Don't open a new paid batch past budget — the run loop falls through
+            # to single-verify, which marks the remainder COST_SKIPPED per-record.
+            return 0
         rows = await db.fetch_pending_zuhal(
             self.conn, limit=self.config.zuhal_bulk_batch_size,
         )
@@ -243,6 +247,10 @@ class ZuhalDispatcher:
 
         if not verdicts:
             return await self._fail_batch(rows, "Zuhal bulk returned no verdicts — marking %d records failed", len(rows))
+
+        # Bill per email — the bulk endpoint charges one credit each, same as
+        # single-verify. Without this the cost ceiling is blind in bulk mode.
+        self.cost_tracker.record_call("zuhal", n=len(emails))
 
         # Apply results
         for email_lower, row in id_by_email.items():
