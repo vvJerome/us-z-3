@@ -206,17 +206,28 @@ class ZuhalDispatcher:
         async def _heartbeat() -> None:
             await db.touch_zuhal_validating(self.conn, [r["unique_id"] for r in unique_ids])
 
+        _job_id: list[str] = []
+
+        async def _on_job_created(job_id: str) -> None:
+            _job_id.append(job_id)
+            async with self._write_lock:
+                await db.create_zuhal_job(self.conn, job_id, len(emails))
+
         try:
             verdicts = await self.zuhal.bulk_validate(
                 emails,
                 poll_interval_s=self.config.zuhal_bulk_poll_interval_s,
                 max_poll_minutes=self.config.zuhal_bulk_stale_timeout_minutes,
                 on_poll=_heartbeat,
+                on_job_created=_on_job_created,
             )
         except PipelineHaltError:
             raise
         except Exception as exc:
             logger.warning("Zuhal bulk failed (%s) — requeueing %d records", exc, len(rows))
+            if _job_id:
+                async with self._write_lock:
+                    await db.update_zuhal_job_status(self.conn, _job_id[0], "failed")
             for row in rows:
                 if row["candidate_email"]:
                     async with self._write_lock:
@@ -226,6 +237,9 @@ class ZuhalDispatcher:
 
         if not verdicts:
             # Bulk returned nothing — requeue for single-verify
+            if _job_id:
+                async with self._write_lock:
+                    await db.update_zuhal_job_status(self.conn, _job_id[0], "failed")
             for row in rows:
                 if row["candidate_email"]:
                     async with self._write_lock:
@@ -237,6 +251,10 @@ class ZuhalDispatcher:
         for email_lower, row in id_by_email.items():
             status = verdicts.get(email_lower, "unknown")
             await self._apply_verdict(row, status, bulk=True)
+
+        if _job_id:
+            async with self._write_lock:
+                await db.update_zuhal_job_status(self.conn, _job_id[0], "complete")
 
         self.stats["bulk_batches"] += 1
         processed = len(emails) + len(no_email_rows)

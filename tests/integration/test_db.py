@@ -583,6 +583,31 @@ class TestFailureReason:
             row = await cur.fetchone()
         assert row["failure_reason"] == "infra_loop"
 
+    async def test_update_record_dual_sets_failure_reason_none_does_not_overwrite(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state, failure_reason) VALUES (?, ?, ?)",
+            ("r2", State.VALIDATING, "infra_loop"),
+        )
+        await test_db.commit()
+        await db.update_record_dual(
+            test_db,
+            "r2",
+            State.VALIDATION_FAILED,
+            racknerd_status="invalid",
+            racknerd_message="550",
+            racknerd_verified_at=None,
+            bbops_status="invalid",
+            bbops_message="550",
+            bbops_verified_at=None,
+            final_verdict="invalid",
+            failure_reason=None,
+        )
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r2",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "infra_loop"
+
     async def test_update_record_dual_sets_failure_reason(self, test_db):
         await test_db.execute(
             "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
@@ -607,3 +632,48 @@ class TestFailureReason:
         ) as cur:
             row = await cur.fetchone()
         assert row["failure_reason"] == "max_attempts"
+
+
+class TestZuhalJobs:
+    """Test zuhal_jobs audit table helpers."""
+
+    async def test_create_zuhal_job_persists_row(self, test_db):
+        await db.create_zuhal_job(test_db, "job_abc123", 500)
+        async with test_db.execute(
+            "SELECT job_id, email_count, status, completed_at FROM zuhal_jobs WHERE job_id = ?",
+            ("job_abc123",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["job_id"] == "job_abc123"
+        assert row["email_count"] == 500
+        assert row["status"] == "polling"
+        assert row["completed_at"] is None
+
+    async def test_update_zuhal_job_status_complete(self, test_db):
+        await db.create_zuhal_job(test_db, "job_xyz", 100)
+        await db.update_zuhal_job_status(test_db, "job_xyz", "complete")
+        async with test_db.execute(
+            "SELECT status, completed_at FROM zuhal_jobs WHERE job_id = ?", ("job_xyz",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["status"] == "complete"
+        assert row["completed_at"] is not None
+
+    async def test_update_zuhal_job_status_failed(self, test_db):
+        await db.create_zuhal_job(test_db, "job_fail", 50)
+        await db.update_zuhal_job_status(test_db, "job_fail", "failed")
+        async with test_db.execute(
+            "SELECT status, completed_at FROM zuhal_jobs WHERE job_id = ?", ("job_fail",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["status"] == "failed"
+        assert row["completed_at"] is not None
+
+    async def test_create_zuhal_job_idempotent(self, test_db):
+        await db.create_zuhal_job(test_db, "job_dup", 10)
+        await db.create_zuhal_job(test_db, "job_dup", 10)
+        async with test_db.execute(
+            "SELECT COUNT(*) FROM zuhal_jobs WHERE job_id = ?", ("job_dup",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row[0] == 1

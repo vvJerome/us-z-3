@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +158,16 @@ CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
 CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business_name_norm, agent_name_norm, state, provider);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
+
+-- Audit trail for Zuhal bulk jobs (job_id, how many emails, outcome)
+CREATE TABLE IF NOT EXISTS zuhal_jobs (
+    job_id       TEXT PRIMARY KEY,
+    submitted_at TEXT DEFAULT (datetime('now')),
+    email_count  INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'polling',
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status);
 """
 
 # Migration statements from schema v3 → v4
@@ -204,6 +214,20 @@ _V7_MIGRATIONS: list[str] = [
     # before v3.25 and we want this to be idempotent on any existing DB.
     "ALTER TABLE records ADD COLUMN confidence_score REAL",
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
+]
+
+# Migration statements for schema v10
+_V10_MIGRATIONS: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS zuhal_jobs (
+        job_id       TEXT PRIMARY KEY,
+        submitted_at TEXT DEFAULT (datetime('now')),
+        email_count  INTEGER NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'polling',
+        completed_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status)",
 ]
 
 # Migration statements for schema v9
@@ -270,6 +294,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (7, _V7_MIGRATIONS),
         (8, _V8_MIGRATIONS),
         (9, _V9_MIGRATIONS),
+        (10, _V10_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -703,6 +728,27 @@ async def requeue_zuhal(conn: aiosqlite.Connection, unique_id: str) -> None:
          WHERE unique_id = ?
         """,
         (unique_id,),
+    )
+    await conn.commit()
+
+
+async def create_zuhal_job(conn: aiosqlite.Connection, job_id: str, email_count: int) -> None:
+    """Persist a new bulk job before polling starts (audit trail + crash recovery marker)."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO zuhal_jobs (job_id, email_count, status) VALUES (?, ?, 'polling')",
+        (job_id, email_count),
+    )
+    await conn.commit()
+
+
+async def update_zuhal_job_status(conn: aiosqlite.Connection, job_id: str, status: str) -> None:
+    """Update bulk job status to 'complete' or 'failed'."""
+    await conn.execute(
+        """UPDATE zuhal_jobs
+              SET status = ?,
+                  completed_at = CASE WHEN ? IN ('complete', 'failed') THEN datetime('now') ELSE completed_at END
+            WHERE job_id = ?""",
+        (status, status, job_id),
     )
     await conn.commit()
 

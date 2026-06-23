@@ -188,6 +188,7 @@ class ZuhalClient:
         poll_interval_s: float = 30.0,
         max_poll_minutes: int = 120,
         on_poll: Callable[[], Awaitable[None]] | None = None,
+        on_job_created: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict[str, str]:
         """Upload emails as CSV, poll until complete, return {email: verdict} mapping.
 
@@ -230,6 +231,9 @@ class ZuhalClient:
             return {}
 
         logger.info("Zuhal bulk job %s — %d emails uploaded", job_id, len(emails))
+
+        if on_job_created:
+            await on_job_created(job_id)
 
         # Poll
         deadline = asyncio.get_running_loop().time() + max_poll_minutes * 60

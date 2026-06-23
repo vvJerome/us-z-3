@@ -96,3 +96,70 @@ class TestCheckCredits:
         result = await client.check_credits()
         assert result is None
         session.post.assert_not_called()
+
+
+class TestBulkValidateJobCreatedCallback:
+    async def test_on_job_created_called_with_job_id(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        bucket = TokenBucket(capacity=100, refill_rate=100)
+        client = ZuhalClient("key", session, bucket)
+
+        upload_resp = AsyncMock()
+        upload_resp.status = 200
+        upload_resp.json = AsyncMock(return_value={"data": {"job_id": "bulk_job_42"}})
+        upload_resp.raise_for_status = MagicMock()
+
+        status_resp = AsyncMock()
+        status_resp.status = 200
+        status_resp.json = AsyncMock(return_value={"data": {"status": "completed", "percentage_complete": 100}})
+        status_resp.raise_for_status = MagicMock()
+
+        download_resp = AsyncMock()
+        download_resp.status = 200
+        download_resp.json = AsyncMock(return_value={"data": {"download_link": "https://example.com/result.csv"}})
+        download_resp.raise_for_status = MagicMock()
+
+        csv_resp = AsyncMock()
+        csv_resp.status = 200
+        csv_resp.raise_for_status = MagicMock()
+        csv_resp.text = AsyncMock(return_value="email,email_status\ntest@example.com,valid\n")
+
+        def _cm(resp):
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=resp)
+            cm.__aexit__ = AsyncMock(return_value=False)
+            return cm
+
+        session.post = MagicMock(return_value=_cm(upload_resp))
+        session.get = MagicMock(side_effect=[
+            _cm(status_resp),
+            _cm(download_resp),
+            _cm(csv_resp),
+        ])
+
+        received: list[str] = []
+
+        async def _on_job_created(job_id: str) -> None:
+            received.append(job_id)
+
+        with patch("pipeline.utils.zuhal_client.asyncio.sleep", new=AsyncMock(return_value=None)):
+            results = await client.bulk_validate(
+                ["test@example.com"],
+                on_job_created=_on_job_created,
+            )
+
+        assert received == ["bulk_job_42"]
+        assert results == {"test@example.com": "valid"}
+
+    async def test_on_job_created_not_called_when_dry_run(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        bucket = TokenBucket(capacity=100, refill_rate=100)
+        client = ZuhalClient("key", session, bucket, dry_run=True)
+
+        received: list[str] = []
+
+        async def _on_job_created(job_id: str) -> None:
+            received.append(job_id)
+
+        await client.bulk_validate(["test@example.com"], on_job_created=_on_job_created)
+        assert received == []
