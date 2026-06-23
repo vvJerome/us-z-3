@@ -201,6 +201,24 @@ class ZuhalDispatcher:
         if not emails:
             return len(no_email_rows)
 
+        # Apply cached verdicts immediately — no upload needed for these
+        cached_hits: dict[str, str] = {}
+        for e in emails:
+            verdict = await db.lookup_email_cache(self.conn, e.lower())
+            if verdict is not None:
+                cached_hits[e.lower()] = verdict
+
+        for email_lower, verdict in cached_hits.items():
+            row = id_by_email[email_lower]
+            trace_entry = {"stage": "zuhal_fallback", "outcome": verdict, "cache_hit": True, "email": email_lower}
+            await self._apply_verdict(row, verdict, bulk=True, trace_entry=trace_entry)
+
+        emails = [e for e in emails if e.lower() not in cached_hits]
+        id_by_email = {k: v for k, v in id_by_email.items() if k not in cached_hits}
+
+        if not emails:
+            return len(cached_hits) + len(no_email_rows)
+
         unique_ids = list(id_by_email.values())
 
         async def _heartbeat() -> None:
@@ -251,6 +269,9 @@ class ZuhalDispatcher:
         for email_lower, row in id_by_email.items():
             status = verdicts.get(email_lower, "unknown")
             await self._apply_verdict(row, status, bulk=True)
+            if status in ("valid", "catch_all", "invalid"):
+                async with self._write_lock:
+                    await db.write_email_cache(self.conn, email_lower, status, "zuhal")
 
         if _job_id:
             async with self._write_lock:
@@ -284,6 +305,13 @@ class ZuhalDispatcher:
             self.stats["cost_skipped"] += 1
             return
 
+        cached = await db.lookup_email_cache(self.conn, email)
+        if cached is not None:
+            logger.debug("Zuhal cache hit for %s (%s) — skipping API call", email, cached)
+            trace_entry = {"stage": "zuhal_fallback", "outcome": cached, "cache_hit": True, "email": email}
+            await self._apply_verdict(row, cached, bulk=False, trace_entry=trace_entry)
+            return
+
         t0 = time.monotonic()
         status: str
         try:
@@ -315,6 +343,9 @@ class ZuhalDispatcher:
         trace_entry = {"stage": "zuhal_fallback", "outcome": status, "ms": elapsed_ms, "email": email}
 
         self.cost_tracker.record_call("zuhal")
+        if status in ("valid", "catch_all", "invalid"):
+            async with self._write_lock:
+                await db.write_email_cache(self.conn, email, status, "zuhal")
         await self._apply_verdict(row, status, bulk=False, trace_entry=trace_entry)
 
     async def _apply_verdict(

@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +168,14 @@ CREATE TABLE IF NOT EXISTS zuhal_jobs (
     completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status);
+
+-- Dedup cache: prevents re-paying for Zuhal on emails verified in a prior stage
+CREATE TABLE IF NOT EXISTS email_verification_cache (
+    email_norm   TEXT PRIMARY KEY,
+    verdict      TEXT NOT NULL,
+    provider     TEXT NOT NULL,
+    verified_at  TEXT DEFAULT (datetime('now'))
+);
 """
 
 # Migration statements from schema v3 → v4
@@ -214,6 +222,18 @@ _V7_MIGRATIONS: list[str] = [
     # before v3.25 and we want this to be idempotent on any existing DB.
     "ALTER TABLE records ADD COLUMN confidence_score REAL",
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
+]
+
+# Migration statements for schema v11
+_V11_MIGRATIONS: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS email_verification_cache (
+        email_norm   TEXT PRIMARY KEY,
+        verdict      TEXT NOT NULL,
+        provider     TEXT NOT NULL,
+        verified_at  TEXT DEFAULT (datetime('now'))
+    )
+    """,
 ]
 
 # Migration statements for schema v10
@@ -295,6 +315,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (8, _V8_MIGRATIONS),
         (9, _V9_MIGRATIONS),
         (10, _V10_MIGRATIONS),
+        (11, _V11_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -749,6 +770,26 @@ async def update_zuhal_job_status(conn: aiosqlite.Connection, job_id: str, statu
                   completed_at = CASE WHEN ? IN ('complete', 'failed') THEN datetime('now') ELSE completed_at END
             WHERE job_id = ?""",
         (status, status, job_id),
+    )
+    await conn.commit()
+
+
+async def lookup_email_cache(conn: aiosqlite.Connection, email: str) -> str | None:
+    """Return cached verdict for this email (normalized), or None if not cached."""
+    async with conn.execute(
+        "SELECT verdict FROM email_verification_cache WHERE email_norm = ?",
+        (email.lower().strip(),),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def write_email_cache(conn: aiosqlite.Connection, email: str, verdict: str, provider: str) -> None:
+    """Cache a verified email result to prevent re-paying on duplicates."""
+    await conn.execute(
+        """INSERT OR REPLACE INTO email_verification_cache (email_norm, verdict, provider, verified_at)
+           VALUES (?, ?, ?, datetime('now'))""",
+        (email.lower().strip(), verdict, provider),
     )
     await conn.commit()
 

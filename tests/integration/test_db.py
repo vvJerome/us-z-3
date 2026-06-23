@@ -677,3 +677,27 @@ class TestZuhalJobs:
         ) as cur:
             row = await cur.fetchone()
         assert row[0] == 1
+
+
+class TestEmailVerificationCache:
+    """Test email_verification_cache lookup and write helpers."""
+
+    async def test_lookup_returns_none_when_not_cached(self, test_db):
+        result = await db.lookup_email_cache(test_db, "unknown@example.com")
+        assert result is None
+
+    async def test_write_and_lookup_returns_verdict(self, test_db):
+        await db.write_email_cache(test_db, "test@example.com", "valid", "zuhal")
+        result = await db.lookup_email_cache(test_db, "test@example.com")
+        assert result == "valid"
+
+    async def test_lookup_is_case_insensitive(self, test_db):
+        await db.write_email_cache(test_db, "Test@Example.COM", "catch_all", "zuhal")
+        assert await db.lookup_email_cache(test_db, "test@example.com") == "catch_all"
+        assert await db.lookup_email_cache(test_db, "TEST@EXAMPLE.COM") == "catch_all"
+
+    async def test_write_overwrites_existing(self, test_db):
+        await db.write_email_cache(test_db, "x@y.com", "invalid", "zuhal")
+        await db.write_email_cache(test_db, "x@y.com", "valid", "zuhal")
+        result = await db.lookup_email_cache(test_db, "x@y.com")
+        assert result == "valid"

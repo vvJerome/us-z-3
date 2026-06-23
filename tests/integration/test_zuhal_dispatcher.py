@@ -321,3 +321,71 @@ class TestZuhalDispatcherRunLoop:
             row = await cur.fetchone()
         assert row["record_state"] == State.VALIDATED
         assert worker.stats["validated"] == 1
+
+
+class TestEmailVerificationCacheDispatcher:
+    async def test_cache_hit_skips_api_call(self, test_db, config):
+        """Cache hit: applies verdict without calling zuhal.validate."""
+        await _seed_needs_zuhal(test_db, email="shared@example.com")
+        await db.write_email_cache(test_db, "shared@example.com", "valid", "zuhal")
+
+        zuhal = _mock_zuhal("valid")
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        zuhal.validate.assert_not_called()
+
+        async with test_db.execute(
+            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["final_verdict"] == "valid"
+
+    async def test_cache_miss_calls_api_and_writes_cache(self, test_db, config):
+        """Cache miss: calls Zuhal, then writes result to cache."""
+        await _seed_needs_zuhal(test_db, email="new@example.com")
+
+        zuhal = _mock_zuhal("valid")
+        zuhal.validate = AsyncMock(return_value=ValidationResult(
+            email="new@example.com", verdict="valid", score=0.0,
+            is_disposable=False, raw_status="", http_status=200,
+        ))
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        zuhal.validate.assert_called_once_with("new@example.com")
+        cached = await db.lookup_email_cache(test_db, "new@example.com")
+        assert cached == "valid"
+
+    async def test_cache_hit_does_not_bill_cost_tracker(self, test_db, config):
+        """Cache hit: cost tracker must not be incremented."""
+        await _seed_needs_zuhal(test_db, email="cached@example.com")
+        await db.write_email_cache(test_db, "cached@example.com", "catch_all", "zuhal")
+
+        zuhal = _mock_zuhal("catch_all")
+        cost = CostTracker(None)
+        worker = ZuhalDispatcher(config, test_db, zuhal, cost)
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        assert cost.counts.get("zuhal", 0) == 0
+
+    async def test_error_verdict_not_written_to_cache(self, test_db, config):
+        """Transient errors must not poison the cache."""
+        await _seed_needs_zuhal(test_db, email="err@example.com")
+
+        zuhal = MagicMock(spec=ZuhalClient)
+        zuhal.validate = AsyncMock(side_effect=Exception("timeout"))
+        worker = ZuhalDispatcher(config, test_db, zuhal, CostTracker(None))
+
+        rows = await db.fetch_pending_zuhal(test_db, limit=10)
+        await worker._process(rows[0])
+
+        cached = await db.lookup_email_cache(test_db, "err@example.com")
+        assert cached is None
