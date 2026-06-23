@@ -80,6 +80,9 @@ class PipelineConfig(BaseSettings):
     zuhal_concurrency_max: int = Field(default=50, ge=1)
     zuhal_on_both_invalid: bool = False
     zuhal_decoupled: bool = True
+    # Free requeue cap: circuit-open / 429 are unbilled, so a record may bounce
+    # back to NEEDS_ZUHAL this many times before giving up instead of spinning.
+    zuhal_max_circuit_requeues: int = Field(default=5, ge=1)
     # Identity/deliverability gates (0.0 = disabled, current behavior).
     # zuhal_min_confidence: candidates scoring below this skip paid Zuhal rescue.
     # catch_all_min_confidence: catch-all verdicts below this are not auto-accepted.

@@ -14,7 +14,7 @@ import aiosqlite
 from pipeline.consumers.bbops_async import BbopsUnhealthy
 from pipeline.models import BackendVerdict, PipelineHaltError
 from pipeline.utils.ms_verify import check_microsoft_email_async
-from pipeline.utils.zuhal_client import ZuhalCircuitOpenError
+from pipeline.utils.zuhal_client import ZuhalCircuitOpenError, ZuhalCreditsExhaustedError
 
 logger = logging.getLogger("pipeline.dispatcher")
 
@@ -39,7 +39,8 @@ async def zuhal_probe(zuhal, email: str) -> tuple[str, dict]:
         status = result.verdict
     except PipelineHaltError:
         raise
-    except ZuhalCircuitOpenError:
+    except (ZuhalCircuitOpenError, ZuhalCreditsExhaustedError):
+        # circuit open OR credits out → defer (re-queue), don't burn as failed.
         status = "circuit_open"
     except Exception as exc:
         logger.debug("Zuhal probe error for %s: %s", email, exc)
