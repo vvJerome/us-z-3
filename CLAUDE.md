@@ -474,7 +474,7 @@ manager, control, wiring, `__main__` = the provision/status/teardown CLI). Durab
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 646 tests
+.venv/bin/python -m pytest tests/ -q    # all 648 tests
 .venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```
