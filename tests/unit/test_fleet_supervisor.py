@@ -109,6 +109,16 @@ async def test_can_provision_false_below_floor(tmp_path):
     assert await sup.can_provision() is False
 
 
+async def test_spawn_seq_skips_existing_reprovision_names(tmp_path):
+    # A reused fleet whose prior process auto-healed already has cherry-r2 — the new
+    # supervisor must number from there (cherry-r3), not regenerate a clashing cherry-r1.
+    mgr = FleetManager([FleetWorker(worker_id="cherry-r2", verifier=_Stub(), server_id=1, managed=True)])
+    sup = _supervisor(mgr, _FakeClient(credit=10.0), tmp_path)
+    await sup._spawn()
+    names = {w.worker_id for w in mgr.workers}
+    assert "cherry-r3" in names and len(mgr.workers) == 2
+
+
 async def test_scale_up_provisions_workers(tmp_path):
     mgr = FleetManager([FleetWorker(worker_id="w1", verifier=_Stub())])
     await _supervisor(mgr, _FakeClient(credit=10.0), tmp_path).scale_to(3)

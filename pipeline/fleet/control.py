@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -61,7 +62,15 @@ class FleetSupervisor:
         self.name_prefix = name_prefix
         self.control_path = Path(control_path)
         self._reprovisions = 0
-        self._spawn_seq = 0
+        # Start numbering past any existing {prefix}-r<N> worker so a reused fleet (whose
+        # earlier process already auto-healed) doesn't regenerate a clashing name.
+        self._spawn_seq = self._initial_spawn_seq()
+
+    def _initial_spawn_seq(self) -> int:
+        pat = re.compile(rf"{re.escape(self.name_prefix)}-r(\d+)$")
+        seqs = [int(m.group(1)) for w in self.manager.workers
+                if (m := pat.match(w.worker_id)) is not None]
+        return max(seqs, default=0)
 
     async def can_provision(self) -> bool:
         if self._reprovisions >= self.max_reprovisions:
