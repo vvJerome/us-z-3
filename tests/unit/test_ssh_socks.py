@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -88,6 +87,17 @@ class TestSshCmd:
         assert "-D" in cmd
         assert any("1080" in arg for arg in cmd)
         assert "myuser@myhost.com" in cmd
+
+    def test_ssh_cmd_default_pins_host_keys(self):
+        cmd = SshSocksTunnel(_config(host="h"))._ssh_cmd()
+        assert "StrictHostKeyChecking=accept-new" in cmd
+        assert not any("UserKnownHostsFile" in c for c in cmd)
+
+    def test_ssh_cmd_ephemeral_ignores_known_hosts(self):
+        cfg = _config(host="h", strict_host_key_checking="no", known_hosts_file="/dev/null")
+        cmd = SshSocksTunnel(cfg)._ssh_cmd()
+        assert "StrictHostKeyChecking=no" in cmd
+        assert "UserKnownHostsFile=/dev/null" in cmd
 
 
 class TestStop:

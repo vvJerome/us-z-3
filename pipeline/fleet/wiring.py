@@ -63,9 +63,11 @@ async def _make_worker(
     config: PipelineConfig, host: FleetHost, socks_port: int, resolver: aiodns.DNSResolver | None
 ) -> FleetWorker:
     tcfg = TunnelConfig(host=host.ip, user=config.cherry_ssh_user, ssh_key=config.cherry_ssh_key,
-                        socks_port=socks_port, autorestart=True)
+                        socks_port=socks_port, autorestart=True,
+                        # Fleet workers are disposable, reused-IP cloud boxes — never pin host keys.
+                        strict_host_key_checking="no", known_hosts_file="/dev/null")
     tunnel = SshSocksTunnel(tcfg)
-    await tunnel.start(ready_timeout_s=30.0)
+    await tunnel.start(ready_timeout_s=45.0)
     # HELO/MAIL FROM with the worker's own rDNS (PTR) so it matches the connecting IP — the
     # forward-confirmed check receivers run before honoring RCPT. Explicit config wins; else
     # fall back to the RacknerdConfig default if the IP has no PTR.

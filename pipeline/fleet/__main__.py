@@ -96,18 +96,23 @@ async def _teardown(client: CherryClient, args: argparse.Namespace) -> int:
 
 
 async def _benchmark(client: CherryClient, args: argparse.Namespace) -> int:
+    from pipeline.config import PipelineConfig
     from pipeline.fleet.benchmark import run_benchmark
     pub = Path(args.key_file)
     if not pub.exists():
         logger.error("SSH public key %s not found — generate one: ssh-keygen -t ed25519 -f %s",
                      pub, pub.with_suffix(""))
         return 2
+    # cherry_enabled relaxes the SMTP-source validator; gives the same ssh_user/key the
+    # validation subprocess will use for its tunnels, so the readiness probe matches.
+    cfg = PipelineConfig(cherry_enabled=True)
     prov = _provisioner(client, args)
     key_id = await prov.ensure_ssh_key("cherry_fleet", pub.read_text().strip())
     report = await run_benchmark(
         prov, count=args.count, key_ids=[key_id], input_path=args.input,
         name=args.name, ground_truth=args.ground_truth,
         with_zuhal=args.with_zuhal, dispatch_concurrency=args.dispatch_concurrency,
+        ssh_user=cfg.cherry_ssh_user, ssh_key=cfg.cherry_ssh_key,
     )
     logger.info("benchmark report:\n%s", report.render())
     return 0

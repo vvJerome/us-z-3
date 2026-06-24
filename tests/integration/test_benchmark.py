@@ -1,8 +1,6 @@
 """Tests for the autonomous fleet benchmark: summarize, ssh-readiness, teardown-always."""
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from pipeline.db import init_db
@@ -53,18 +51,25 @@ async def test_summarize_without_ground_truth_counts_all(tmp_path):
     assert rep.decisive_accuracy_pct is None
 
 
-async def test_wait_ssh_ready_detects_open_and_closed_ports():
-    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    hosts = [FleetHost(worker_id="w1", server_id=0, ip="127.0.0.1", region="")]
-    try:
-        ready = await wait_ssh_ready(hosts, port=port, timeout_s=3.0, interval_s=0.1)
-        assert ready == ["127.0.0.1"]
-    finally:
-        server.close()
-        await server.wait_closed()
-    # Port now closed → not ready within the timeout.
-    ready = await wait_ssh_ready(hosts, port=port, timeout_s=0.5, interval_s=0.1)
+async def test_wait_ssh_ready_uses_injected_auth_probe():
+    # 1.1.1.1 authenticates on the 2nd poll; 2.2.2.2 on the 1st.
+    calls = {"1.1.1.1": 0, "2.2.2.2": 0}
+
+    async def probe(ip):
+        calls[ip] += 1
+        return calls[ip] >= (2 if ip == "1.1.1.1" else 1)
+
+    hosts = [FleetHost("w1", 0, "1.1.1.1", ""), FleetHost("w2", 0, "2.2.2.2", "")]
+    ready = await wait_ssh_ready(hosts, timeout_s=5.0, interval_s=0, probe=probe)
+    assert set(ready) == {"1.1.1.1", "2.2.2.2"}
+
+
+async def test_wait_ssh_ready_times_out_when_login_never_succeeds():
+    async def never(ip):
+        return False
+
+    hosts = [FleetHost("w1", 0, "1.1.1.1", "")]
+    ready = await wait_ssh_ready(hosts, timeout_s=0.2, interval_s=0.05, probe=never)
     assert ready == []
 
 

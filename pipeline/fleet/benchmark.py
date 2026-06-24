@@ -34,29 +34,53 @@ def _pct(a: int, b: int) -> float | None:
     return round(100 * a / b, 2) if b else None
 
 
-async def _port_open(ip: str, port: int, timeout_s: float) -> bool:
+async def _ssh_auth_ok(ip: str, user: str, key: str, timeout_s: float) -> bool:
+    """True if we can SSH in and run a no-op — confirms sshd is up AND the key is authorized.
+
+    A freshly-booted cloud server opens port 22 before cloud-init authorizes the key, so a
+    plain TCP check is a false ready and the SOCKS tunnel then fails auth. This is the real
+    signal. Host keys are ignored (ephemeral, reused-IP workers).
+    """
+    cmd = [
+        "ssh", "-i", os.path.expanduser(key), "-p", "22",
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={max(2, int(timeout_s))}",
+        f"{user}@{ip}", "true",
+    ]
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout_s)
-    except (OSError, asyncio.TimeoutError):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
         return False
-    writer.close()
     try:
-        await writer.wait_closed()
-    except OSError:
-        pass
-    return True
+        rc = await asyncio.wait_for(proc.wait(), timeout=timeout_s + 3)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False
+    return rc == 0
 
 
 async def wait_ssh_ready(
-    hosts: list[FleetHost], *, port: int = 22, timeout_s: float = 180.0, interval_s: float = 5.0
+    hosts: list[FleetHost], *, ssh_user: str = "root", ssh_key: str = "~/.ssh/cherry_fleet",
+    timeout_s: float = 240.0, interval_s: float = 8.0, probe=None,
 ) -> list[str]:
-    """Poll each worker's sshd port until open; return the IPs that became ready in time."""
+    """Wait until each worker accepts an SSH login; return the IPs that became ready in time.
+
+    `probe(ip) -> bool` defaults to a real SSH-auth check and is injectable for tests.
+    """
+    async def _default_probe(ip: str) -> bool:
+        return await _ssh_auth_ok(ip, ssh_user, ssh_key, 15.0)
+
+    probe = probe or _default_probe
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     pending = {h.ip for h in hosts}
     while pending and loop.time() < deadline:
         ips = list(pending)
-        oks = await asyncio.gather(*(_port_open(ip, port, 8.0) for ip in ips))
+        oks = await asyncio.gather(*(probe(ip) for ip in ips))
         pending -= {ip for ip, ok in zip(ips, oks) if ok}
         if pending:
             await asyncio.sleep(interval_s)
@@ -269,6 +293,7 @@ async def run_benchmark(
     with_zuhal: bool = False, dispatch_concurrency: int | None = None,
     reserve_region: str | None = None, name_prefix: str = "cherry",
     provision_retries: int = 3, provision_retry_delay_s: float = 120.0,
+    ssh_user: str = "root", ssh_key: str = "~/.ssh/cherry_fleet",
 ) -> BenchmarkReport:
     """Provision `count` workers, validate `input_path`, and ALWAYS tear the fleet down.
 
@@ -291,11 +316,11 @@ async def run_benchmark(
             raise RuntimeError(f"provisioned 0 workers after {provision_retries} attempt(s)")
         prov.write_inventory(hosts)
         logger.info("fleet up: %s", [(h.worker_id, h.ip) for h in hosts])
-        logger.info("[2/4] waiting for sshd on %d worker(s) ...", len(hosts))
-        ready = await wait_ssh_ready(hosts)
+        logger.info("[2/4] waiting for SSH login on %d worker(s) ...", len(hosts))
+        ready = await wait_ssh_ready(hosts, ssh_user=ssh_user, ssh_key=ssh_key)
         missing = [h.ip for h in hosts if h.ip not in ready]
         if missing:
-            logger.warning("sshd not ready on %s (tunnel autorestart will retry)", missing)
+            logger.warning("SSH login not ready on %s (tunnel autorestart will retry)", missing)
         else:
             logger.info("sshd ready on all %d worker(s)", len(hosts))
         logger.info("[3/4] validating ...")
