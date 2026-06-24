@@ -51,6 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
     bm.add_argument("--ground-truth", default=None, help="optional email,zb_status CSV for an accuracy score")
     bm.add_argument("--dispatch-concurrency", type=int, default=None, help="override dispatcher concurrency")
     bm.add_argument("--with-zuhal", action="store_true", help="keep paid Zuhal rescue on (default: off)")
+    bm.add_argument("--keep-fleet", action="store_true",
+                    help="do NOT tear down after the run (fleet stays up + billing; tear down manually)")
     return p
 
 
@@ -113,6 +115,7 @@ async def _benchmark(client: CherryClient, args: argparse.Namespace) -> int:
         name=args.name, ground_truth=args.ground_truth,
         with_zuhal=args.with_zuhal, dispatch_concurrency=args.dispatch_concurrency,
         ssh_user=cfg.cherry_ssh_user, ssh_key=cfg.cherry_ssh_key,
+        teardown=not args.keep_fleet,
     )
     logger.info("benchmark report:\n%s", report.render())
     return 0

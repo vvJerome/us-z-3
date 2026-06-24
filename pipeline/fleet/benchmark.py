@@ -294,6 +294,7 @@ async def run_benchmark(
     reserve_region: str | None = None, name_prefix: str = "cherry",
     provision_retries: int = 3, provision_retry_delay_s: float = 120.0,
     ssh_user: str = "root", ssh_key: str = "~/.ssh/cherry_fleet",
+    teardown: bool = True,
 ) -> BenchmarkReport:
     """Provision `count` workers, validate `input_path`, and ALWAYS tear the fleet down.
 
@@ -333,7 +334,18 @@ async def run_benchmark(
         logger.info("report written to %s/benchmark_report.{txt,json}\n%s", out_dir, report.render())
         return report
     finally:
-        logger.info("[4/4] tearing down fleet ...")
-        deleted = await _teardown_fleet(prov, name_prefix)
-        logger.info("=== benchmark done: torn down %d server(s): %s ===", len(deleted), deleted)
+        if teardown:
+            logger.info("[4/4] tearing down fleet ...")
+            deleted = await _teardown_fleet(prov, name_prefix)
+            logger.info("=== benchmark done: torn down %d server(s): %s ===", len(deleted), deleted)
+        else:
+            kept = prov.load_inventory()
+            if kept:
+                logger.warning(
+                    "=== benchmark done: KEEPING %d worker(s) UP (--keep-fleet): %s — "
+                    "tear down later with `python -m pipeline.fleet teardown --yes` ===",
+                    len(kept), [(h.worker_id, h.ip) for h in kept],
+                )
+            else:
+                logger.info("=== benchmark done: no fleet to keep (0 workers provisioned) ===")
         _detach_log_file(handler)

@@ -96,6 +96,9 @@ class _FakeProv:
     def write_inventory(self, hosts, *, merge=True):
         pass
 
+    def load_inventory(self):
+        return self._hosts
+
     async def teardown(self):
         self.torn_down += 1
         return [h.server_id for h in self._hosts]
@@ -122,6 +125,20 @@ async def test_run_benchmark_raises_and_tears_down_when_no_workers(monkeypatch, 
         await run_benchmark(prov, count=3, key_ids=[1], input_path="x.jsonl", name="t_none",
                             provision_retries=1, provision_retry_delay_s=0)
     assert prov.torn_down >= 1
+
+
+async def test_run_benchmark_keep_fleet_skips_teardown(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    prov = _FakeProv([FleetHost(worker_id="w1", server_id=11, ip="1.2.3.4", region="r")])
+    monkeypatch.setattr(benchmark, "wait_ssh_ready", lambda hosts, **k: _async(["1.2.3.4"]))
+    monkeypatch.setattr(benchmark, "_run_validation",
+                        lambda *a, **k: _async(tmp_path / "out" / "pipeline.db"))
+    monkeypatch.setattr(benchmark, "summarize",
+                        lambda db, gt=None: benchmark.BenchmarkReport(records=0, matched=0,
+                                                                      has_ground_truth=False))
+    await run_benchmark(prov, count=1, key_ids=[1], input_path="x.jsonl", name="t_keep",
+                        teardown=False)
+    assert prov.torn_down == 0   # --keep-fleet must never tear down
 
 
 def _async(value):
