@@ -356,19 +356,56 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 
 ## Environment variables
 
+All live in `.env` (gitignored); see `.env.example` for a copy-paste template. Only
+`SERPER_API_KEY` plus one SMTP egress source (RackNerd host, `SMTP_HOSTS`, or a Cherry
+fleet) are needed to run.
+
+**Core**
+
 | Variable | Required | Default |
 |---|---|---|
 | `SERPER_API_KEY` | Yes | — |
-| `ZUHAL_API_KEY` | Yes (dispatcher) | — |
-| `RACKNERD_HOST` | Yes* (dispatcher) | — |
+| `ZUHAL_API_KEY` | For Zuhal rescue (empty = rescue disabled) | — |
+| `ZEROBOUNCE_API_KEY` | For the post-pipeline ZB ingest only | — |
+| `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
+
+**SMTP egress — single RackNerd VPS / per-worker SMTP tuning**
+
+| Variable | Required | Default |
+|---|---|---|
+| `RACKNERD_HOST` | Yes* | — |
 | `RACKNERD_SSH_USER` | No | `egress` |
 | `RACKNERD_SSH_KEY` | No | `~/.ssh/racknerd_egress` |
-| `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
-| `CHERRY_AUTH_TOKEN` | Yes (fleet) | — |
-| `CHERRY_PROJECT_ID` / `CHERRY_TEAM_ID` | Yes (fleet) | — |
-| `BACKUP_R2_ENDPOINT` + `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | No | — |
+| `RACKNERD_HELO_HOSTNAME` | No — overrides SMTP HELO/MAIL FROM FQDN; fleet falls back to each worker's rDNS/PTR | — |
+| `RACKNERD_CONCURRENCY` | No — parallel SMTP channels per worker | `25` |
+| `RACKNERD_SMTP_TIMEOUT_S` | No | `8.0` |
 
-\* `RACKNERD_HOST` is not required when `--cherry-enabled` or `--smtp-hosts` is set.
+\* Not required when `--cherry-enabled`, `--smtp-hosts`, or `--racknerd-direct` is set.
+
+**Cherry Servers SMTP fleet**
+
+| Variable | Required | Default |
+|---|---|---|
+| `CHERRY_AUTH_TOKEN` | For provisioning / auto-heal | — |
+| `CHERRY_PROJECT_ID` | For the fleet | — |
+| `CHERRY_TEAM_ID` | For the auto-heal credit guard | — |
+| `CHERRY_REGION` | No | `EU-Nord-1` |
+| `CHERRY_PLAN` | No | `B2-1-1gb-20s-shared` |
+| `CHERRY_SSH_KEY` | No — private key; `<path>.pub` is registered with Cherry | `~/.ssh/cherry_fleet` |
+| `SMTP_HOSTS` | No — explicit worker IPs as a JSON list; overrides the inventory | `[]` |
+| `FLEET_CREDIT_FLOOR_EUR` | No — auto-heal refuses to provision below this | `0.10` |
+| `FLEET_MAX_REPROVISIONS` | No — per-run auto-heal cap | `10` |
+| `FLEET_SCALE_MAX` | No | `10` |
+
+**Durable state backup to R2/S3 (off by default)**
+
+| Variable | Required | Default |
+|---|---|---|
+| `BACKUP_ENABLED` | No — master switch | `false` |
+| `BACKUP_R2_ENDPOINT` | If `BACKUP_ENABLED` — S3-compatible endpoint incl. bucket | — |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | If backing up to R2 | — |
+| `BACKUP_DIR` | No — optional local copy alongside R2 | — |
+| `BACKUP_INTERVAL_S` | No | `300` |
 
 ---
 
@@ -404,7 +441,8 @@ python -m pipeline.fleet teardown --yes        # deletes only fleet-provisioned 
 ```
 
 Fleet package: `pipeline/fleet/` (cherry_client, provisioner, worker, health, balancer,
-manager, control, wiring). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3).
+manager, control, wiring, `__main__` = the provision/status/teardown CLI). Durable backup:
+`pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled with `BACKUP_ENABLED=true`.
 
 ---
 
@@ -422,11 +460,11 @@ manager, control, wiring). Durable backup: `pipeline/storage/` (R2/S3 via SigV4,
 | `--harvest` | off | Scrape the business website for emails/officers (free) before the paid Serper fallback |
 | `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |
-| `--dispatch-concurrency N` | 20 | Parallel dispatcher workers |
+| `--dispatch-concurrency N` | 50 | Parallel dispatcher workers |
 | `--dispatch-backend-timeout-s S` | 60.0 | Per-backend timeout for Racknerd + bbops |
 | `--dispatch-chunk-size N` | 50 | Records fetched per dispatcher poll cycle |
 | `--racknerd-host HOST` | — | VPS hostname for SSH tunnel (required for dispatcher) |
-| `--racknerd-concurrency N` | 10 | Parallel SMTP connections via tunnel |
+| `--racknerd-concurrency N` | 25 | Parallel SMTP connections via tunnel |
 | `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
 | `--racknerd-direct` | off | Skip SOCKS5 tunnel; connect directly to MX servers (use when running on the egress VPS) |
 | `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
@@ -436,7 +474,7 @@ manager, control, wiring). Durable backup: `pipeline/storage/` (R2/S3 via SigV4,
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 515 tests
+.venv/bin/python -m pytest tests/ -q    # all 646 tests
 .venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
 ```
