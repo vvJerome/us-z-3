@@ -14,7 +14,7 @@ from pipeline.constants import (
     HEARTBEAT_INTERVAL_S,
     NOTIFY_POLL_TIMEOUT_S,
 )
-from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
+from pipeline.consumers.bbops_async import BbopsAsyncConsumer
 from pipeline.consumers.racknerd import RacknerdConsumer
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline.utils.serper_client import SerperClient
@@ -392,28 +392,16 @@ class Dispatcher:
 
                 # unknown/error → fall through to SMTP backends
 
-            # Co-equal concurrent SMTP fan-out: Racknerd + bbops always run together as
-            # two equally-weighted checkers reconciled by OR-of-valids. bbops is not a
-            # fallback — a confirmed verdict from either backend stands on its own.
+            # Co-equal concurrent SMTP fan-out: Racknerd + bbops run together as two
+            # equally-weighted checkers reconciled by OR-of-valids. bbops is not a fallback.
+            # We short-circuit on the first `valid` (decisive under OR-of-valids) so a record
+            # the fleet validates directly doesn't wait on the batched bbops backend; a record
+            # the fleet can't validate still waits for bbops to rescue it (coverage unchanged).
             timeout = self.config.dispatch_backend_timeout_s
             t_smtp = time.monotonic()
-            rk_res, bb_res = await asyncio.gather(
-                asyncio.wait_for(dp.safe_racknerd(self.racknerd, email, mx_provider), timeout=timeout),
-                asyncio.wait_for(dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout),
-                return_exceptions=True,
-            )
+            rk_verdict, bb_verdict = await dp.run_backends(
+                self.racknerd, self.bbops, email, mx_provider, row["id"], timeout)
             elapsed = int((time.monotonic() - t_smtp) * 1000)
-
-            if isinstance(rk_res, BackendVerdict):
-                rk_verdict = rk_res
-            else:
-                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at="")
-            if isinstance(bb_res, BackendVerdict):
-                bb_verdict = bb_res
-            elif isinstance(bb_res, BbopsUnhealthy):
-                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at="")
-            else:
-                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at="")
 
             pending_trace.append({"stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed, "email": email})
             pending_trace.append({"stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed, "email": email})
