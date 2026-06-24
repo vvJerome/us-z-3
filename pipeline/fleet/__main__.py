@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -42,6 +43,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     td = sub.add_parser("teardown", help="delete all managed workers (keeps pre-existing)")
     td.add_argument("--yes", action="store_true", help="required to actually delete")
+
+    bm = sub.add_parser("benchmark", help="provision N workers, validate a dataset, then tear down")
+    bm.add_argument("--input", "-i", required=True, help="JSONL dataset to validate")
+    bm.add_argument("--count", type=int, default=5, help="workers to provision (default 5)")
+    bm.add_argument("--name", default="fleet_benchmark", help="run/output name (output/<name>/)")
+    bm.add_argument("--ground-truth", default=None, help="optional email,zb_status CSV for an accuracy score")
+    bm.add_argument("--dispatch-concurrency", type=int, default=None, help="override dispatcher concurrency")
+    bm.add_argument("--with-zuhal", action="store_true", help="keep paid Zuhal rescue on (default: off)")
     return p
 
 
@@ -86,20 +95,46 @@ async def _teardown(client: CherryClient, args: argparse.Namespace) -> int:
     return 0
 
 
+async def _benchmark(client: CherryClient, args: argparse.Namespace) -> int:
+    from pipeline.fleet.benchmark import run_benchmark
+    pub = Path(args.key_file)
+    if not pub.exists():
+        logger.error("SSH public key %s not found — generate one: ssh-keygen -t ed25519 -f %s",
+                     pub, pub.with_suffix(""))
+        return 2
+    prov = _provisioner(client, args)
+    key_id = await prov.ensure_ssh_key("cherry_fleet", pub.read_text().strip())
+    report = await run_benchmark(
+        prov, count=args.count, key_ids=[key_id], input_path=args.input,
+        name=args.name, ground_truth=args.ground_truth,
+        with_zuhal=args.with_zuhal, dispatch_concurrency=args.dispatch_concurrency,
+    )
+    logger.info("benchmark report:\n%s", report.render())
+    return 0
+
+
 async def _run(args: argparse.Namespace, token: str) -> int:
-    handlers = {"provision": _provision, "status": _status, "teardown": _teardown}
+    handlers = {"provision": _provision, "status": _status,
+                "teardown": _teardown, "benchmark": _benchmark}
     async with CherryClient(token) as client:
         return await handlers[args.command](client, args)
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Make SIGTERM raise KeyboardInterrupt like SIGINT so a `kill` still runs the
+    # benchmark's finally-block teardown instead of leaking provisioned servers.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     args = _build_parser().parse_args(argv)
     token = os.environ.get("CHERRY_AUTH_TOKEN", "")
     if not token:
         logger.error("CHERRY_AUTH_TOKEN is not set")
         return 2
-    return asyncio.run(_run(args, token))
+    try:
+        return asyncio.run(_run(args, token))
+    except KeyboardInterrupt:
+        logger.warning("interrupted — any provisioned fleet was torn down")
+        return 130
 
 
 if __name__ == "__main__":
