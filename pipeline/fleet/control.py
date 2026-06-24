@@ -124,6 +124,7 @@ class FleetSupervisor:
             except CherryAPIError as exc:
                 logger.error("could not delete server %s (%s): %s",
                              worker.server_id, worker.worker_id, exc)
+        self.provisioner.remove_from_inventory(worker.worker_id)
 
     @staticmethod
     async def _stop_tunnel(worker: FleetWorker) -> None:

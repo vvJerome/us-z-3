@@ -158,6 +158,12 @@ class FleetProvisioner:
         self.inventory_path.parent.mkdir(parents=True, exist_ok=True)
         self.inventory_path.write_text(json.dumps([asdict(h) for h in by_id.values()], indent=2))
 
+    def remove_from_inventory(self, worker_id: str) -> None:
+        """Drop one worker from the inventory file (after its server has been deleted)."""
+        remaining = [h for h in self.load_inventory() if h.worker_id != worker_id]
+        self.inventory_path.parent.mkdir(parents=True, exist_ok=True)
+        self.inventory_path.write_text(json.dumps([asdict(h) for h in remaining], indent=2))
+
     async def teardown(self) -> list[int]:
         """Delete every managed host in the inventory; keep unmanaged (pre-existing) ones."""
         inventory = self.load_inventory()

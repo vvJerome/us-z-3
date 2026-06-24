@@ -133,6 +133,20 @@ async def test_scale_down_deletes_the_server(tmp_path):
     assert client.deleted == [5001]   # the removed worker's VM is actually deprovisioned, not leaked
 
 
+async def test_scale_down_prunes_inventory(tmp_path):
+    from pipeline.fleet.provisioner import FleetHost
+    client = _FakeClient(credit=10.0)
+    sup = _supervisor(FleetManager([
+        FleetWorker(worker_id="w1", verifier=_Stub(), server_id=5001, managed=True),
+        FleetWorker(worker_id="w2", verifier=_Stub(), server_id=5002, managed=True),
+    ]), client, tmp_path)
+    sup.provisioner.write_inventory([
+        FleetHost("w1", 5001, "1.1.1.1", "r"), FleetHost("w2", 5002, "2.2.2.2", "r")])
+    await sup.scale_to(1)
+    remaining = {h.worker_id for h in sup.provisioner.load_inventory()}
+    assert len(remaining) == 1 and "w1" not in remaining   # the deleted worker is pruned
+
+
 async def test_scale_down_keeps_reserve(tmp_path):
     workers = [
         FleetWorker(worker_id="w1", verifier=_Stub(), managed=True),
