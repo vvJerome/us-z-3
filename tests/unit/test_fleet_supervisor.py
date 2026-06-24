@@ -121,6 +121,18 @@ async def test_scale_up_clamped_to_max(tmp_path):
     assert len(mgr.workers) == 2
 
 
+async def test_scale_down_deletes_the_server(tmp_path):
+    client = _FakeClient(credit=10.0)
+    workers = [
+        FleetWorker(worker_id="w1", verifier=_Stub(), server_id=5001, managed=True),
+        FleetWorker(worker_id="w2", verifier=_Stub(), server_id=5002, managed=True),
+    ]
+    mgr = FleetManager(workers)
+    await _supervisor(mgr, client, tmp_path).scale_to(1)
+    assert len(mgr.workers) == 1
+    assert client.deleted == [5001]   # the removed worker's VM is actually deprovisioned, not leaked
+
+
 async def test_scale_down_keeps_reserve(tmp_path):
     workers = [
         FleetWorker(worker_id="w1", verifier=_Stub(), managed=True),

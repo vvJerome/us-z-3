@@ -111,14 +111,19 @@ class FleetSupervisor:
             logger.error("auto-heal of %s failed to provision: %s", worker.worker_id, exc)
             return
         self._reprovisions += 1
+        await self._terminate_worker(worker)
+        logger.info("auto-healed %s -> %s (fresh IP)", worker.worker_id, new.worker_id)
+
+    async def _terminate_worker(self, worker: FleetWorker) -> None:
+        """Detach a worker from the pool and DELETE its Cherry server (true deprovision)."""
         self.manager.remove_worker(worker.worker_id)
         await self._stop_tunnel(worker)
         if worker.server_id is not None:
             try:
                 await self.client.delete_server(worker.server_id)
             except CherryAPIError as exc:
-                logger.error("could not delete old server %s: %s", worker.server_id, exc)
-        logger.info("auto-healed %s -> %s (fresh IP)", worker.worker_id, new.worker_id)
+                logger.error("could not delete server %s (%s): %s",
+                             worker.server_id, worker.worker_id, exc)
 
     @staticmethod
     async def _stop_tunnel(worker: FleetWorker) -> None:
@@ -144,9 +149,9 @@ class FleetSupervisor:
         )[:n]
         for worker in removable:
             worker.draining = True
-            self.manager.remove_worker(worker.worker_id)
-            await self._stop_tunnel(worker)
-            logger.info("scaled down: removed worker %s", worker.worker_id)
+            await self._terminate_worker(worker)
+            logger.info("scaled down: removed and deleted worker %s (server %s)",
+                        worker.worker_id, worker.server_id)
 
     async def check_control_file(self) -> None:
         """Apply an out-of-band scale command: {"scale_to": N} in the control file."""
