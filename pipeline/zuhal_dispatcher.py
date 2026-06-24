@@ -403,6 +403,7 @@ class ZuhalDispatcher:
                 confidence_score=float(score),
                 zuhal_status_override=status,
                 dispatch_attempts_delta=0,
+                verifier_agreement="zuhal_only" if terminal else None,
             )
             await db.append_process_trace(self.conn, unique_id, trace_entry)
 

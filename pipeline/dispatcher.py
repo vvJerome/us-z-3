@@ -112,6 +112,18 @@ def _infra_retry_after(requeue_count: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _verifier_agreement(rk: str, bb: str) -> str:
+    rk_ok = rk in ("valid", "catch_all")
+    bb_ok = bb in ("valid", "catch_all")
+    if rk_ok and bb_ok:
+        return "both"
+    if rk_ok:
+        return "racknerd_only"
+    if bb_ok:
+        return "bbops_only"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -161,6 +173,9 @@ class Dispatcher:
             "requeued": 0,
             "handed_off_to_zuhal": 0,
         }
+        # MS probe health tracking: warn when error rate exceeds threshold
+        self._ms_total: int = 0
+        self._ms_errors: int = 0
 
     async def run(self) -> None:
         base_interval = self.config.dispatch_poll_interval_s
@@ -346,6 +361,7 @@ class Dispatcher:
                             candidate_email=email,
                             confidence_score=float(score),
                             dispatch_attempts_delta=0,  # MS probe is free, don't count
+                            verifier_agreement="ms_only",
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
@@ -396,6 +412,7 @@ class Dispatcher:
                         candidate_email=email,
                         confidence_score=float(score),
                         dispatch_attempts_delta=1,
+                        verifier_agreement="racknerd_only",
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
                 await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
@@ -536,6 +553,7 @@ class Dispatcher:
                             confidence_score=float(score),
                             zuhal_status_override=zuhal_status,
                             dispatch_attempts_delta=1,
+                            verifier_agreement="zuhal_only" if terminal else None,
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
@@ -591,6 +609,7 @@ class Dispatcher:
                         candidate_email=email,
                         confidence_score=float(score),
                         dispatch_attempts_delta=1,
+                        verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
                     )
                     await db.flush_process_trace(self.conn, unique_id, pending_trace)
                 await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
@@ -638,6 +657,7 @@ class Dispatcher:
                             confidence_score=float(score),
                             zuhal_status_override=zuhal_status,
                             dispatch_attempts_delta=1,
+                            verifier_agreement="zuhal_only",
                         )
                         await db.flush_process_trace(self.conn, unique_id, pending_trace)
                     self.cost_tracker.record_call("zuhal")
@@ -749,6 +769,11 @@ class Dispatcher:
             logger.warning("Serper fallback error for %s: %s", unique_id, exc)
             return []
 
+    # Log a warning when this many MS probes have been attempted in the current window
+    _MS_ALERT_WINDOW: int = 100
+    # Error rate above this fraction triggers the warning
+    _MS_ERROR_THRESHOLD: float = 0.5
+
     async def _ms_probe(self, email: str) -> tuple[str, dict]:
         t0 = time.monotonic()
         try:
@@ -758,6 +783,21 @@ class Dispatcher:
             result = {"status": "error"}
         ms = int((time.monotonic() - t0) * 1000)
         status = result.get("status", "error")
+
+        self._ms_total += 1
+        if status == "error":
+            self._ms_errors += 1
+        if self._ms_total >= self._MS_ALERT_WINDOW:
+            rate = self._ms_errors / self._ms_total
+            if rate >= self._MS_ERROR_THRESHOLD:
+                logger.error(
+                    "MS probe degraded: %d/%d errors (%.0f%%) in last %d probes — "
+                    "Microsoft domains falling through to paid SMTP",
+                    self._ms_errors, self._ms_total, rate * 100, self._ms_total,
+                )
+            self._ms_total = 0
+            self._ms_errors = 0
+
         return status, {"stage": "ms_api", "outcome": status, "ms": ms, "email": email}
 
     async def _safe_racknerd(self, email: str) -> BackendVerdict:

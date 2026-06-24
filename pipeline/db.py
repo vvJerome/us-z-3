@@ -8,7 +8,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS records (
     -- Domain quality signal: 0.0–1.0 word-overlap between business name and discovered domain stem.
     -- 1.0 for DNS hits (business owns the domain); <1.0 for Serper hits where domain may be wrong.
     domain_match_score    REAL,
+
+    -- Which backend(s) confirmed this email: both | racknerd_only | bbops_only | ms_only | zuhal_only
+    verifier_agreement    TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -228,6 +231,11 @@ _V7_MIGRATIONS: list[str] = [
     "UPDATE records SET confidence_score = zuhal_score WHERE confidence_score IS NULL AND zuhal_score IS NOT NULL",
 ]
 
+# Migration statements for schema v13
+_V13_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN verifier_agreement TEXT",
+]
+
 # Migration statements for schema v12
 _V12_MIGRATIONS: list[str] = [
     "ALTER TABLE records ADD COLUMN domain_match_score REAL",
@@ -327,6 +335,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (10, _V10_MIGRATIONS),
         (11, _V11_MIGRATIONS),
         (12, _V12_MIGRATIONS),
+        (13, _V13_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -565,6 +574,7 @@ async def update_record_dual(
     dispatch_attempts_delta: int = 1,
     zuhal_status_override: str | None = None,
     failure_reason: str | None = None,
+    verifier_agreement: str | None = None,
 ) -> None:
     """Write dual-backend verdicts and advance dispatch_attempts atomically."""
     sets = [
@@ -604,6 +614,10 @@ async def update_record_dual(
     if failure_reason is not None:
         sets.append("failure_reason = ?")
         values.append(failure_reason)
+
+    if verifier_agreement is not None:
+        sets.append("verifier_agreement = ?")
+        values.append(verifier_agreement)
 
     values.append(unique_id)
     sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
@@ -945,6 +959,17 @@ async def get_status_summary(conn: aiosqlite.Connection) -> dict:
         "SELECT final_verdict, COUNT(*) FROM records WHERE final_verdict IS NOT NULL GROUP BY final_verdict"
     ) as cursor:
         summary["records_by_verdict"] = {row[0]: row[1] async for row in cursor}
+
+    # Rolling throughput: records that reached a terminal state in the last 5 minutes
+    async with conn.execute(
+        """
+        SELECT COUNT(*) FROM records
+         WHERE record_state IN ('VALIDATED', 'VALIDATION_FAILED', 'COST_SKIPPED', 'DISCOVERY_FAILED')
+           AND updated_at >= datetime('now', '-5 minutes')
+        """
+    ) as cursor:
+        row = await cursor.fetchone()
+        summary["terminal_last_5min"] = row[0] if row else 0
 
     return summary
 

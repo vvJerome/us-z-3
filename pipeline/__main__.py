@@ -362,6 +362,26 @@ def _print_status(summary: dict) -> None:
         cost = stats.get("estimated_cost_usd", 0)
         print(f"\nEstimated cost: ${cost:.4f}")
 
+    terminal_last_5min = summary.get("terminal_last_5min", 0)
+    by_state = summary.get("records_by_state", {})
+    pending = sum(
+        by_state.get(s, 0)
+        for s in ("RAW", "DISCOVERING", "DISCOVERED", "VALIDATING", "NEEDS_ZUHAL", "ZUHAL_VALIDATING")
+    )
+    if terminal_last_5min > 0 and pending > 0:
+        rate_per_min = terminal_last_5min / 5.0
+        eta_min = pending / rate_per_min
+        if eta_min < 60:
+            eta_str = f"{eta_min:.0f} min"
+        elif eta_min < 1440:
+            eta_str = f"{eta_min / 60:.1f} hr"
+        else:
+            eta_str = f"{eta_min / 1440:.1f} days"
+        print(f"\nThroughput (5 min): {rate_per_min:.1f} records/min")
+        print(f"Pending: {pending:,}  →  ETA: {eta_str}")
+    elif pending == 0:
+        print("\nAll records processed.")
+
     print()
 
 

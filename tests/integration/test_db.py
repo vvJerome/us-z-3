@@ -701,3 +701,74 @@ class TestEmailVerificationCache:
         await db.write_email_cache(test_db, "x@y.com", "valid", "zuhal")
         result = await db.lookup_email_cache(test_db, "x@y.com")
         assert result == "valid"
+
+
+class TestVerifierAgreement:
+    """Test that update_record_dual persists verifier_agreement correctly."""
+
+    async def _insert_validating(self, conn, unique_id: str) -> None:
+        await conn.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            (unique_id, State.VALIDATING),
+        )
+        await conn.commit()
+
+    async def test_verifier_agreement_written_when_provided(self, test_db):
+        await self._insert_validating(test_db, "va1")
+        await db.update_record_dual(
+            test_db, "va1", State.VALIDATED,
+            racknerd_status="valid", racknerd_message="250 ok", racknerd_verified_at=None,
+            bbops_status="valid", bbops_message="ok", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="a@b.com",
+            verifier_agreement="both",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "both"
+
+    async def test_verifier_agreement_null_when_omitted(self, test_db):
+        await self._insert_validating(test_db, "va2")
+        await db.update_record_dual(
+            test_db, "va2", State.VALIDATION_FAILED,
+            racknerd_status="invalid", racknerd_message="550", racknerd_verified_at=None,
+            bbops_status="invalid", bbops_message="550", bbops_verified_at=None,
+            final_verdict="invalid",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va2",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] is None
+
+    async def test_verifier_agreement_racknerd_only(self, test_db):
+        await self._insert_validating(test_db, "va3")
+        await db.update_record_dual(
+            test_db, "va3", State.VALIDATED,
+            racknerd_status="valid", racknerd_message="250 ok", racknerd_verified_at=None,
+            bbops_status="not_run", bbops_message="skipped", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="c@d.com",
+            verifier_agreement="racknerd_only",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va3",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "racknerd_only"
+
+    async def test_verifier_agreement_zuhal_only(self, test_db):
+        await self._insert_validating(test_db, "va4")
+        await db.update_record_dual(
+            test_db, "va4", State.VALIDATED,
+            racknerd_status="invalid", racknerd_message="550", racknerd_verified_at=None,
+            bbops_status="invalid", bbops_message="550", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="e@f.com",
+            zuhal_status_override="valid",
+            verifier_agreement="zuhal_only",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va4",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "zuhal_only"
