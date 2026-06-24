@@ -459,6 +459,31 @@ Zuhal rescue is off by default (it measures the SMTP fleet; pass `--with-zuhal` 
 the paid rescue on). `summarize()` reports per-record **decisive accuracy** (definitive
 verdicts that match ground-truth deliverability) and **coverage** (decided / attempted).
 
+### Throughput tuning (≥5k records/hour on a 5-worker fleet)
+
+The dispatcher short-circuits the SMTP fan-out on the first `valid` (a record the fleet
+validates directly no longer waits on the batched bbops backend). Beyond that, the dominant
+limiter is **per-recipient-domain serialization**: one shared semaphore caps concurrent
+probes per domain across the whole fleet, and free-mail domains dominate real data (gmail
+alone is ~30% of the Michigan set). The knobs (defaults already raised for fleets):
+
+| Setting | Default | High-throughput | Effect |
+|---|---|---|---|
+| `FLEET_DOMAIN_CONCURRENCY` | `10` | `10–15` | unblock gmail/yahoo; too high → provider 421-rate-limits cold IPs |
+| `FLEET_BLOCK_COOLDOWN_S` | `120` | `60` | a 421-blocked worker recovers fast instead of collapsing the fleet |
+| `--dispatch-backend-timeout-s` | `60` | `30` | caps the bbops-rescue wait on fleet-non-valid records (trades a little coverage) |
+| `--dispatch-concurrency` | `50` | `100` | keep moderate — over-driving cold IPs *lowers* throughput |
+
+```bash
+FLEET_DOMAIN_CONCURRENCY=10 FLEET_BLOCK_COOLDOWN_S=60 \
+  python -m pipeline run -i input/<file> --cherry-enabled \
+    --dispatch-concurrency 100 --dispatch-backend-timeout-s 30
+```
+
+Sustained ~6k/hour on 5 cold IPs with this. The ceiling is provider rate-limiting of
+cold IPs (gmail throttles low-reputation IPs) — to go higher, scale out to more IPs
+(`--count`/`scale_to`) rather than driving each IP harder.
+
 Fleet package: `pipeline/fleet/` (cherry_client, provisioner, worker, health, balancer,
 manager, control, wiring, benchmark, `__main__` = the provision/status/teardown/benchmark
 CLI). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled with
