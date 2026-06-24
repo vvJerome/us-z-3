@@ -5,13 +5,29 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pipeline._dispatch_helpers import (
+    catch_all_confidence_floor,
     compute_confidence_score,
     confidence_tier,
     name_matches_email,
+    pre_score,
     record_pattern,
     GENERIC_PREFIXES,
 )
 from pipeline.utils.text import domain_match_score
+
+
+class TestCatchAllConfidenceFloor:
+    def test_disabled_gate_floors_at_zero_any_provider(self):
+        assert catch_all_confidence_floor(0.0, "x.mail.protection.outlook.com") == 0.0
+
+    def test_trustworthy_provider_uses_base(self):
+        assert catch_all_confidence_floor(2.0, "mx.privatehost.example") == 2.0
+
+    def test_untrustworthy_provider_raises_floor(self):
+        assert catch_all_confidence_floor(2.0, "x.mail.protection.outlook.com") == 3.0
+
+    def test_gateway_raises_floor(self):
+        assert catch_all_confidence_floor(2.0, "mx1.pphosted.com") == 3.0
 
 
 class TestNameMatchesEmail:
@@ -140,6 +156,29 @@ class TestConfidenceScoreWithoutStrategy:
             verdict="catch_all",
         )
         assert score == 2  # domain match + IS generic; no valid point
+
+
+class TestPreScore:
+    def test_drops_verdict_term_relative_to_full_score(self):
+        # pre_score == confidence score with no "valid" verdict point.
+        pre = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        full = compute_confidence_score("john.doe@acme.com", "acme.com", "with", "valid", "John Doe")
+        assert pre == float(full) - 1.0
+
+    def test_domain_confidence_adds_scaled_bonus(self):
+        base = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        high = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", domain_confidence=1.0)
+        assert high == base + 2.0  # 0–1 confidence scaled to 0–2 points
+
+    def test_none_domain_confidence_is_neutral(self):
+        base = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe")
+        nullc = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", domain_confidence=None)
+        assert nullc == base
+
+    def test_strong_candidate_outranks_weak(self):
+        strong = pre_score("john.doe@acme.com", "acme.com", "with", "John Doe", domain_confidence=0.9)
+        weak = pre_score("zzz@other.com", "acme.com", "with", "John Doe", domain_confidence=0.1)
+        assert strong > weak
 
 
 class TestConfidenceTier:

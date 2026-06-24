@@ -4,6 +4,7 @@ import aiosqlite
 from rapidfuzz import fuzz
 
 from pipeline import db
+from pipeline.constants import is_untrustworthy_catchall_mx
 from pipeline.utils.email_patterns import email_to_template
 
 GENERIC_PREFIXES: frozenset[str] = frozenset({
@@ -78,6 +79,36 @@ def compute_confidence_score(
             score = min(score, 2)   # weak match → cap at medium
 
     return score
+
+
+def pre_score(
+    email: str,
+    candidate_domain: str | None,
+    strategy: str,
+    agent_name: str = "",
+    domain_confidence: float | None = None,
+) -> float:
+    """Identity/deliverability confidence available BEFORE any verdict.
+
+    Same components as compute_confidence_score minus the verdict term (verdict is
+    unknown pre-validation), plus the business-to-domain confidence (0–1, scaled to
+    0–2 points) computed at discovery. Used to rank candidates and gate paid
+    verification.
+    """
+    score = float(compute_confidence_score(email, candidate_domain, strategy, "pending", agent_name))
+    return score + 2.0 * (domain_confidence or 0.0)
+
+
+def catch_all_confidence_floor(base: float, mx_provider: str | None) -> float:
+    """Confidence a catch-all must clear to be accepted, raised for untrustworthy providers.
+
+    When the gate is disabled (base <= 0) nothing changes — every catch-all is accepted,
+    today's behavior. When enabled, providers that accept-all by default or sit behind a
+    security gateway (always 250) must clear a higher bar before a catch-all counts.
+    """
+    if base <= 0.0:
+        return 0.0
+    return base + 1.0 if is_untrustworthy_catchall_mx(mx_provider) else base
 
 
 def confidence_tier(score: int) -> str:

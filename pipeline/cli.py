@@ -81,6 +81,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Enable Racknerd SMTP backend (default: True unless --producer-only)")
     parser.add_argument("--no-racknerd", dest="racknerd_enabled", action="store_false",
                         help="Disable Racknerd SMTP backend")
+    parser.add_argument("--harvest", dest="harvest_enabled", action="store_true", default=None,
+                        help="Enable free website harvest (emails + officers) before paid Serper fallback")
     parser.add_argument("--racknerd-direct", action="store_true", default=None,
                         help="Use Racknerd in direct TCP mode (no SOCKS5 tunnel — use when running on the egress VPS)")
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
@@ -109,8 +111,6 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="Seconds between bbops result-polling cycles")
 
     # Rate limits
-    parser.add_argument("--serper-rate-limit", type=int, default=500,
-                        help="Serper calls/hour ceiling")
     parser.add_argument("--zuhal-rate-limit", type=int, default=100,
                         help="Zuhal calls/hour ceiling")
     parser.add_argument("--zuhal-concurrency", type=int, default=5,
@@ -138,18 +138,12 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--zuhal-bulk-concurrent-jobs", type=int, default=None,
                         help="Concurrent bulk upload jobs per worker (default 1)")
 
-    # Backoff
+    # Backoff (per-service base/max delays live in constants.SERVICE_BACKOFF)
     parser.add_argument("--max-attempts", type=int, default=3, help="Max retries per phase")
-    parser.add_argument("--backoff-base-dns", type=float, default=0.5)
-    parser.add_argument("--backoff-base-serper", type=float, default=1.0)
-    parser.add_argument("--backoff-max-dns", type=float, default=8.0)
-    parser.add_argument("--backoff-max-serper", type=float, default=32.0)
     parser.add_argument("--backoff-jitter", type=float, default=0.2)
 
     # Cost / safety
     parser.add_argument("--max-cost", type=float, default=None, help="USD cost ceiling")
-    parser.add_argument("--max-consecutive-errors", type=int, default=10,
-                        help="Halt pipeline after this many consecutive errors")
     parser.add_argument("--max-dispatch-attempts", type=int, default=None,
                         help="Max real-verdict attempts before marking VALIDATION_FAILED (default: 5)")
     parser.add_argument("--max-requeue-count", type=int, default=None,
@@ -157,9 +151,6 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Mock all API calls")
 
     # Enrichment
-    parser.add_argument("--enrichment-source", default="serper",
-                        choices=["serper"],
-                        help="Phase 2 search API source")
     parser.add_argument("--ignore-cache", action="store_true",
                         help="Bypass Serper enrichment cache (forces live API call)")
 

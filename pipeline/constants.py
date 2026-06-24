@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # pipeline/constants.py
 #
 # Single source of truth for all hardcoded values in the pipeline.
@@ -8,7 +10,7 @@
 API_COSTS: dict[str, float] = {
     "serper_producer": 0.001,     # DNS-miss path: Serper called in producer
     "serper_dispatcher": 0.001,   # fallback: Serper called in dispatcher after patterns exhausted
-    "zuhal": 0.0005,              # rescue backend — runs after both SMTP backends return invalid
+    "zuhal": 0.001,               # rescue backend; tiered pricing — $0.001/credit @ 10k tier (drops to $0.0005 @ 250k)
 }
 
 # --- Exponential backoff parameters (base_seconds, max_seconds) per service ---
@@ -19,6 +21,19 @@ SERVICE_BACKOFF: dict[str, tuple[float, float]] = {
     "bbops": (1.0, 60.0),
     "racknerd": (1.0, 32.0),
 }
+
+# --- DNS resolver (shared defaults; previously duplicated across producer/dns_probe/__main__) ---
+DNS_RESOLVER_TIMEOUT_S: int = 3
+DNS_RESOLVER_TRIES: int = 1
+
+# --- Serper token bucket: 2 calls/sec sustained, burst cap 5, starts empty ---
+SERPER_BUCKET_CAPACITY: int = 5
+SERPER_BUCKET_REFILL_RATE: float = 2.0
+
+# --- Heartbeats / IPC / metrics ---
+HEARTBEAT_INTERVAL_S: float = 30.0    # producer & dispatcher heartbeat loop wait
+NOTIFY_POLL_TIMEOUT_S: float = 30.0   # dispatcher notify-pipe read timeout
+METRICS_PORT: int = 9090
 
 # --- DNS ---
 DNS_TLDS: tuple[str, ...] = (".com", ".net", ".org", ".us", ".info")
@@ -52,6 +67,27 @@ DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD: int = 3
 INFRA_RETRY_BASE_MINUTES: int = 5
 INFRA_RETRY_MULTIPLIER: float = 3.0
 
+# MX-host substrings where a catch-all / accept-all result is least trustworthy:
+# providers that accept-all by default, and security gateways that answer 250 for
+# every address (Proofpoint, Mimecast, Barracuda). A catch-all from these needs
+# higher identity confidence before we accept it, and an `unknown` from them is
+# not worth a second paid verification credit (it will stay unknown).
+CATCHALL_UNTRUSTWORTHY_MX: tuple[str, ...] = (
+    "outlook.com", "protection.outlook.com",          # Microsoft 365 / EOP
+    "google.com", "googlemail.com",                   # Google Workspace
+    "pphosted.com", "ppe-hosted.com",                 # Proofpoint
+    "mimecast.com",                                    # Mimecast
+    "barracudanetworks.com", "barracuda.com",          # Barracuda
+)
+
+
+def is_untrustworthy_catchall_mx(mx_provider: str | None) -> bool:
+    """True if catch-all from this MX host should be treated skeptically."""
+    if not mx_provider:
+        return False
+    lp = mx_provider.lower()
+    return any(p in lp for p in CATCHALL_UNTRUSTWORTHY_MX)
+
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.
 # This list grows at runtime via ProducerWorker._fallback_blocklist when a domain
@@ -70,4 +106,41 @@ FALLBACK_DOMAIN_BLOCKLIST: frozenset[str] = frozenset({
     "whitepages.com", "spokeo.com", "intelius.com",
     # Maps / generic web
     "google.com", "mapquest.com",
+})
+
+# --- Registered-agent → owner inference (pipeline.utils.owner_inference) ---
+# Normalized substrings of commercial registered-agent services. When the agent name
+# matches one, the agent is a paid service, never the business owner. Grows as new
+# services surface in the data.
+COMMERCIAL_AGENT_NAMES: frozenset[str] = frozenset({
+    "ct corporation", "c t corporation", "corporation service company",
+    "cogency global", "national registered agents", "registered agents inc",
+    "registered agent solutions", "registered agent inc", "northwest registered agent",
+    "a registered agent", "legalzoom", "incorp services", "vcorp services",
+    "harbor compliance", "zenbusiness", "united states corporation agents",
+    "capitol corporate services", "capitol services", "paracorp",
+    "interstate agent services", "spiegel utrera", "business filings", "blumberg",
+})
+
+# position_type / filing-role tokens that imply a business principal (not an agent-of-record).
+OWNER_ROLE_KEYWORDS: frozenset[str] = frozenset({
+    "owner", "member", "manager", "president", "ceo", "cfo", "coo", "principal",
+    "partner", "director", "incorporator", "organizer", "officer", "treasurer",
+    "secretary", "founder", "proprietor", "chairman",
+})
+
+# --- Website harvest (pipeline.harvest) ---
+# Paths fetched on the candidate domain, in order. "" is the homepage. Kept short:
+# a known address on any one of these reveals the house email convention.
+HARVEST_PATHS: tuple[str, ...] = (
+    "", "contact", "about", "about-us", "team", "leadership", "staff", "people",
+)
+
+# curl_cffi TLS fingerprint used for every harvest fetch.
+HARVEST_IMPERSONATE: str = "chrome131"
+
+# Visible-text tokens that flag a nearby name as an officer/decision-maker (item 4).
+HARVEST_ROLE_KEYWORDS: frozenset[str] = frozenset({
+    "owner", "founder", "co-founder", "president", "ceo", "cfo", "coo", "cto",
+    "principal", "partner", "director", "manager", "proprietor", "officer",
 })

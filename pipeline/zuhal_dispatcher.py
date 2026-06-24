@@ -17,6 +17,7 @@ from pipeline.utils.text import parse_name
 from pipeline.utils.zuhal_client import (
     ZuhalClient,
     ZuhalCircuitOpenError,
+    ZuhalCreditsExhaustedError,
     _RetryableHTTPError,
 )
 from pipeline import db
@@ -63,6 +64,12 @@ class ZuhalDispatcher:
         self._write_lock = asyncio.Lock()
         self._saw_429 = False
         self._ok_batches = 0
+        # Per-record count of free (unbilled) circuit-open/429 requeues, capped by
+        # config.zuhal_max_circuit_requeues so a permanently-down Zuhal can't spin.
+        self._circuit_requeues: dict[str, int] = {}
+        # Set on a 402 (credits out): exit the loop gracefully, leaving records in
+        # NEEDS_ZUHAL for resume — never crash the producer/SMTP work in flight.
+        self._credits_out = False
         self.stats: dict[str, int] = {
             "validated": 0,
             "validation_failed": 0,
@@ -111,6 +118,9 @@ class ZuhalDispatcher:
         )
 
         while not self.stop_event.is_set():
+            if self._credits_out:
+                logger.warning("Zuhal credits exhausted — worker stopping; backlog left in NEEDS_ZUHAL for resume")
+                break
             backlog = await db.count_needs_zuhal(self.conn)
 
             # Bulk mode: large backlog → upload N concurrent CSV batches
@@ -180,6 +190,10 @@ class ZuhalDispatcher:
 
     async def _drain_bulk(self) -> int:
         """Claim a batch, upload to Zuhal bulk API, apply results. Returns rows processed."""
+        if self.cost_tracker.ceiling_reached():
+            # Don't open a new paid batch past budget — the run loop falls through
+            # to single-verify, which marks the remainder COST_SKIPPED per-record.
+            return 0
         rows = await db.fetch_pending_zuhal(
             self.conn, limit=self.config.zuhal_bulk_batch_size,
         )
@@ -241,29 +255,28 @@ class ZuhalDispatcher:
             )
         except PipelineHaltError:
             raise
-        except Exception as exc:
-            logger.warning("Zuhal bulk failed (%s) — requeueing %d records", exc, len(rows))
-            if _job_id:
-                async with self._write_lock:
-                    await db.update_zuhal_job_status(self.conn, _job_id[0], "failed")
+        except ZuhalCreditsExhaustedError:
+            # Credits out (402) — defer the whole batch back to NEEDS_ZUHAL (unbilled)
+            # and signal the loop to stop. Resumable after top-up; never failed.
+            self._credits_out = True
             for row in rows:
-                if row["candidate_email"]:
-                    async with self._write_lock:
-                        await db.requeue_zuhal(self.conn, row["unique_id"])
-                    self.stats["requeued"] += 1
+                async with self._write_lock:
+                    await db.requeue_zuhal(self.conn, row["unique_id"])
+                self.stats["requeued"] += 1
+            logger.warning("Zuhal credits exhausted mid-bulk — deferred %d records", len(rows))
             return 0
+        except Exception as exc:
+            # A failure here (e.g. the status-poll timing out) typically happens
+            # after the upload already succeeded and was billed — requeueing would
+            # re-upload the same emails as a brand-new paid job. Terminal instead.
+            return await self._fail_batch(rows, "Zuhal bulk failed (%s) — marking %d records failed", exc, len(rows))
 
         if not verdicts:
-            # Bulk returned nothing — requeue for single-verify
-            if _job_id:
-                async with self._write_lock:
-                    await db.update_zuhal_job_status(self.conn, _job_id[0], "failed")
-            for row in rows:
-                if row["candidate_email"]:
-                    async with self._write_lock:
-                        await db.requeue_zuhal(self.conn, row["unique_id"])
-                    self.stats["requeued"] += 1
-            return 0
+            return await self._fail_batch(rows, "Zuhal bulk returned no verdicts — marking %d records failed", len(rows))
+
+        # Bill per email — the bulk endpoint charges one credit each, same as
+        # single-verify. Without this the cost ceiling is blind in bulk mode.
+        self.cost_tracker.record_call("zuhal", n=len(emails))
 
         # Apply results
         for email_lower, row in id_by_email.items():
@@ -319,19 +332,24 @@ class ZuhalDispatcher:
             status = result.verdict
         except PipelineHaltError:
             raise
-        except ZuhalCircuitOpenError:
+        except ZuhalCreditsExhaustedError:
+            # Credits out (402) — defer this record (unbilled) and signal the loop
+            # to stop. Not counted against the circuit cap: it's a budget stop.
+            self._credits_out = True
             async with self._write_lock:
                 await db.requeue_zuhal(self.conn, unique_id)
             self.stats["requeued"] += 1
-            logger.warning("Zuhal circuit open — re-queued %s to NEEDS_ZUHAL", unique_id)
+            return
+        except ZuhalCircuitOpenError:
+            # Breaker open — the API was never called, so this is unbilled. Free
+            # requeue, capped so a permanently-down Zuhal can't spin forever.
+            await self._requeue_or_give_up(unique_id, reason="circuit open")
             return
         except _RetryableHTTPError as exc:
             if exc.status == 429:
+                # Rate-limited — not processed, not billed. Same capped free requeue.
                 self._saw_429 = True
-                async with self._write_lock:
-                    await db.requeue_zuhal(self.conn, unique_id)
-                self.stats["requeued"] += 1
-                logger.warning("Zuhal 429 — re-queued %s to NEEDS_ZUHAL", unique_id)
+                await self._requeue_or_give_up(unique_id, reason="429")
                 return
             logger.debug("Zuhal probe HTTP %d for %s/%s", exc.status, unique_id, email)
             status = "error"
@@ -339,6 +357,8 @@ class ZuhalDispatcher:
             logger.debug("Zuhal probe error for %s/%s: %s", unique_id, email, exc)
             status = "error"
 
+        # A verdict came back (billed once) — drop any requeue tally for this record.
+        self._circuit_requeues.pop(unique_id, None)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         trace_entry = {"stage": "zuhal_fallback", "outcome": status, "ms": elapsed_ms, "email": email}
 
@@ -347,6 +367,35 @@ class ZuhalDispatcher:
             async with self._write_lock:
                 await db.write_email_cache(self.conn, email, status, "zuhal")
         await self._apply_verdict(row, status, bulk=False, trace_entry=trace_entry)
+
+    async def _fail_batch(self, rows: list[aiosqlite.Row], log_msg: str, *args: object) -> int:
+        """Mark a whole bulk batch VALIDATION_FAILED (terminal, no resubmit)."""
+        logger.warning(log_msg, *args)
+        for row in rows:
+            async with self._write_lock:
+                await db.update_record_status(self.conn, row["unique_id"], State.VALIDATION_FAILED)
+            self.stats["validation_failed"] += 1
+        return 0
+
+    async def _requeue_or_give_up(self, unique_id: str, *, reason: str) -> None:
+        """Free (unbilled) requeue for circuit-open/429, capped to avoid infinite spin."""
+        cap = self.config.zuhal_max_circuit_requeues
+        n = self._circuit_requeues.get(unique_id, 0) + 1
+        if n >= cap:
+            self._circuit_requeues.pop(unique_id, None)
+            async with self._write_lock:
+                await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            self.stats["validation_failed"] += 1
+            logger.warning(
+                "Zuhal %s — %s, gave up after %d free requeues, marking VALIDATION_FAILED",
+                unique_id, reason, n,
+            )
+            return
+        self._circuit_requeues[unique_id] = n
+        async with self._write_lock:
+            await db.requeue_zuhal(self.conn, unique_id)
+        self.stats["requeued"] += 1
+        logger.warning("Zuhal %s — %s, re-queued to NEEDS_ZUHAL (%d/%d)", unique_id, reason, n, cap)
 
     async def _apply_verdict(
         self,
@@ -368,18 +417,8 @@ class ZuhalDispatcher:
         if status == "accept-all":
             status = "catch_all"
 
-        # "unknown" means Zuhal could not determine validity — not a confirmed
-        # failure. Re-queue for one more attempt; if it comes back unknown again
-        # (dispatch_attempts >= 1) fall through to VALIDATION_FAILED so the
-        # ZeroBounce pass can handle it.
-        if status == "unknown":
-            if (row["dispatch_attempts"] or 0) < 1:
-                async with self._write_lock:
-                    await db.requeue_zuhal(self.conn, unique_id)
-                self.stats["requeued"] += 1
-                logger.debug("Zuhal unknown — re-queued %s for second attempt", unique_id)
-                return
-
+        # One paid call per record — the old "retry once" keyed off dispatch_attempts,
+        # which requeue_zuhal never advanced, so it never closed. ZeroBounce handles unknowns.
         terminal = status in ("valid", "catch_all")
         record_state = State.VALIDATED if terminal else State.VALIDATION_FAILED
         score = compute_confidence_score(email, candidate_domain, strategy, status, agent_name, domain_match_score=row["domain_match_score"])

@@ -14,10 +14,11 @@ class CostTracker:
         self._totals: dict[str, float] = defaultdict(float)
         self._counts: dict[str, int] = defaultdict(int)
 
-    def record_call(self, service: str) -> None:
+    def record_call(self, service: str, n: int = 1) -> None:
+        """Record n paid calls (n>1 for bulk endpoints that bill per item)."""
         cost = API_COSTS.get(service, 0.0)
-        self._totals[service] += cost
-        self._counts[service] += 1
+        self._totals[service] += cost * n
+        self._counts[service] += n
 
     @property
     def total_cost(self) -> float:

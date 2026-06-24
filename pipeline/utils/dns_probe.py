@@ -5,7 +5,7 @@ import logging
 
 import aiodns
 
-from pipeline.constants import DNS_TLDS, SERVICE_BACKOFF
+from pipeline.constants import DNS_RESOLVER_TIMEOUT_S, DNS_RESOLVER_TRIES, DNS_TLDS, SERVICE_BACKOFF
 from pipeline.utils.backoff import with_backoff
 from pipeline.utils.text import generate_domain_stems
 
@@ -40,7 +40,7 @@ async def probe_domains(
         return (None, None)
 
     # Use the shared resolver when available; create a fallback only if needed.
-    _resolver = resolver or aiodns.DNSResolver(timeout=3, tries=1)
+    _resolver = resolver or aiodns.DNSResolver(timeout=DNS_RESOLVER_TIMEOUT_S, tries=DNS_RESOLVER_TRIES)
     base, max_delay = SERVICE_BACKOFF["dns"]
 
     async def _probe_one(domain: str) -> tuple[str, str | None]:

@@ -16,6 +16,8 @@ from pipeline.consumers.bbops_async import BbopsAsyncConsumer
 from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
 from pipeline.dispatcher import Dispatcher
 from pipeline._dispatch_helpers import confidence_tier
+from pipeline.utils.text import domain_confidence_tier
+from pipeline.utils.owner_inference import owner_confidence_tier
 from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
@@ -25,6 +27,12 @@ from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline import db
+from pipeline.constants import (
+    DNS_RESOLVER_TIMEOUT_S,
+    DNS_RESOLVER_TRIES,
+    SERPER_BUCKET_CAPACITY,
+    SERPER_BUCKET_REFILL_RATE,
+)
 from pipeline.metrics import serve_metrics
 
 
@@ -81,7 +89,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
         if not config.producer_only:
             # --- Racknerd consumer setup ---
-            shared_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+            shared_resolver = aiodns.DNSResolver(timeout=DNS_RESOLVER_TIMEOUT_S, tries=DNS_RESOLVER_TRIES)
             rk_helo_kwargs: dict = {}
             if config.racknerd_helo_hostname:
                 rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
@@ -154,7 +162,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     _zuhal_bucket,
                     concurrency=config.zuhal_concurrency,
                     dry_run=config.dry_run,
-                    max_attempts=config.max_attempts,
+                    max_attempts=1,  # paid call fires once — never retried in-call
                     jitter=config.backoff_jitter,
                 )
                 logger.info(
@@ -175,8 +183,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 api_key=config.serper_api_key,
                 session=session,
                 rate_limiter=TokenBucket(
-                    capacity=5,
-                    refill_rate=2.0,
+                    capacity=SERPER_BUCKET_CAPACITY,
+                    refill_rate=SERPER_BUCKET_REFILL_RATE,
                     initial_tokens=0,
                 ),
                 dry_run=config.dry_run,
@@ -466,9 +474,10 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
     async with conn.execute(
         """
         SELECT unique_id, business_name, agent_name, state,
-               candidate_email, zuhal_status, confidence_score,
-               discovery_source, final_verdict,
-               racknerd_status, bbops_status
+               candidate_email, zuhal_status, confidence_score, domain_confidence,
+               owner_confidence, discovery_source, final_verdict,
+               racknerd_status, bbops_status,
+               canonical_status, canonical_source, zb_status, zb_sub_status
           FROM records WHERE record_state = 'VALIDATED'
         """
     ) as cursor:
@@ -478,26 +487,39 @@ async def _write_outputs(conn, config: PipelineConfig) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "unique_id", "business_name", "agent_name", "state",
-            "email", "final_verdict", "confidence_tier", "confidence_score", "verified",
+            "email", "canonical_status", "canonical_source",
+            "final_verdict", "confidence_tier", "confidence_score",
+            "domain_confidence", "domain_confidence_tier",
+            "owner_confidence", "owner_confidence_tier", "verified",
             "discovery_method", "validation_method",
             "racknerd_verdict", "bbops_verdict", "zuhal_verdict",
+            "zb_status", "zb_sub_status",
         ])
         for row in rows:
             fv = row["final_verdict"] or row["zuhal_status"]
             rk = row["racknerd_status"] or ""
             bb = row["bbops_status"] or ""
             zs = row["zuhal_status"]
+            dc = row["domain_confidence"]
+            oc = row["owner_confidence"]
             writer.writerow([
                 row["unique_id"], row["business_name"], row["agent_name"],
-                row["state"], row["candidate_email"], fv,
+                row["state"], row["candidate_email"],
+                row["canonical_status"] or "", row["canonical_source"] or "",
+                fv,
                 confidence_tier(int(row["confidence_score"] or 0)),
                 int(row["confidence_score"] or 0),
+                round(dc, 3) if dc is not None else "",
+                domain_confidence_tier(dc) if dc is not None else "",
+                round(oc, 3) if oc is not None else "",
+                owner_confidence_tier(oc) if oc is not None else "",
                 _is_verified(fv),
                 row["discovery_source"] or "unknown",
                 _validation_method(rk, bb, zs),
                 rk,
                 bb,
                 _zuhal_verdict(zs),
+                row["zb_status"] or "", row["zb_sub_status"] or "",
             ])
     logger.info("Wrote %d validated emails to %s", len(rows), csv_path)
 
@@ -531,12 +553,11 @@ async def main() -> None:
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
+        "harvest_enabled",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
-        "serper_rate_limit",
-        "max_attempts", "backoff_base_dns", "backoff_base_serper",
-        "backoff_max_dns", "backoff_max_serper", "backoff_jitter",
-        "max_cost", "max_consecutive_errors", "max_dispatch_attempts", "max_requeue_count", "dry_run",
-        "enrichment_source", "ignore_cache", "run_id", "notify_pipe",
+        "max_attempts", "backoff_jitter",
+        "max_cost", "max_dispatch_attempts", "max_requeue_count", "dry_run",
+        "ignore_cache", "run_id", "notify_pipe",
         "zuhal_concurrency", "zuhal_rate_limit", "zuhal_on_both_invalid",
     ]:
         val = getattr(args, field_name, None)

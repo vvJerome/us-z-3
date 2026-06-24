@@ -17,7 +17,11 @@ Default: `all`
 | `unit` | `pytest tests/unit/ -q` | ~5s | Pure logic, no I/O |
 | `integration` | `pytest tests/integration/ -q` | ~15s | Real SQLite, no API calls |
 | `e2e` | `pytest tests/e2e/ -q` | ~90s | Subprocess pipeline runs |
-| `all` | `pytest tests/ -q` | ~120s | Full suite (119 tests) |
+| `all` | `pytest tests/ -q` | ~120s | Full suite (515 tests) |
+
+For the full quality gate (style + types + coverage composite), run `./scripts/lint.sh`
+(flake8 + mypy + pytest --cov). The Stop hook also runs the suite automatically at the
+end of any turn that changed Python.
 
 ## Implementation
 
@@ -36,5 +40,5 @@ esac
 ## On failure
 
 - Unit failures → logic bug, fix before anything else
-- Integration failures → SQLite schema mismatch or db.py helper bug
+- Integration failures → SQLite schema mismatch or a `db/` package helper bug
 - E2e failures → check if API keys are exhausted (use `--dry-run` flag in that test)

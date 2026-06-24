@@ -23,7 +23,7 @@ import aiosqlite
 
 from pipeline.db import State
 from pipeline.utils.rate_limiter import TokenBucket
-from pipeline.utils.zuhal_client import ZuhalClient
+from pipeline.utils.zuhal_client import ZuhalClient, ZuhalCreditsExhaustedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +79,9 @@ async def run(db_path: str, rate_limit: int, dry_run: bool) -> None:
 
                 try:
                     result = await client.validate(email)
+                except ZuhalCreditsExhaustedError:
+                    logger.warning("Zuhal credits exhausted — stopping; %s left for resume", uid)
+                    break
                 except Exception as exc:
                     logger.warning("Zuhal error for %s: %s — skipping", email, exc)
                     await conn.execute(

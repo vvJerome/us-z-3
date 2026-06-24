@@ -36,6 +36,7 @@ class ZuhalClient:
         self.dry_run = dry_run
         self.max_attempts = max_attempts
         self.jitter = jitter
+        self._credits_exhausted = False  # set on first 402; degrades instead of halting
         self._base, self._max_delay = SERVICE_BACKOFF["zuhal"]
         self._sem = asyncio.Semaphore(concurrency)
         self._breaker = aiobreaker.CircuitBreaker(
@@ -85,6 +86,10 @@ class ZuhalClient:
             return await self._validate_inner(email)
 
     async def _validate_inner(self, email: str) -> ValidationResult:
+        if self._credits_exhausted:
+            # Already saw a 402 — short-circuit so concurrent workers don't each
+            # re-hit the dead endpoint. The dispatcher defers the record.
+            raise ZuhalCreditsExhaustedError()
         if self.dry_run:
             return ValidationResult(
                 email=email,
@@ -147,7 +152,8 @@ class ZuhalClient:
                 raise PipelineHaltError("Zuhal API key invalid or expired (401)")
 
             if status == 402:
-                raise PipelineHaltError("Zuhal credit balance exhausted (402)")
+                self._credits_exhausted = True
+                raise ZuhalCreditsExhaustedError()
 
             if status == 429:
                 logger.warning("Zuhal 429 — circuit breaker will count this failure")
@@ -195,6 +201,8 @@ class ZuhalClient:
         Falls back to empty dict on any non-auth error so callers can retry via
         single-verify path.
         """
+        if self._credits_exhausted:
+            raise ZuhalCreditsExhaustedError()
         if self.dry_run:
             return {e: "valid" for e in emails}
 
@@ -218,7 +226,8 @@ class ZuhalClient:
             if resp.status == 401:
                 raise PipelineHaltError("Zuhal API key invalid or expired (401)")
             if resp.status == 402:
-                raise PipelineHaltError("Zuhal credit balance exhausted (402)")
+                self._credits_exhausted = True
+                raise ZuhalCreditsExhaustedError()
             resp.raise_for_status()
             data = await resp.json()
 
@@ -301,6 +310,12 @@ class ZuhalClient:
 
 class ZuhalCircuitOpenError(Exception):
     """Raised when Zuhal's circuit breaker is open — service is temporarily unavailable."""
+
+
+class ZuhalCreditsExhaustedError(Exception):
+    """Raised on a Zuhal 402 — paid balance is out. Recoverable: the worker stops
+    and leaves records in NEEDS_ZUHAL for resume after top-up, rather than halting
+    the whole pipeline (which would also kill the producer + SMTP work in flight)."""
 
 
 class _RetryableHTTPError(Exception):

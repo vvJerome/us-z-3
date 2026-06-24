@@ -3,6 +3,7 @@
 
 # Python
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -48,3 +49,8 @@ local/
 # Data
 input/
 output/
+.coverage*
+.my_py_cache/
+
+# Enhancement-list working files (source spec, not part of the repo)
+Copy of Enrichment Engine Enhancement Lists*.csv

@@ -13,14 +13,22 @@ import aiohttp
 import aiosqlite
 
 from pipeline.config import PipelineConfig
-from pipeline.constants import FALLBACK_DOMAIN_BLOCKLIST
+from pipeline.constants import (
+    DNS_RESOLVER_TIMEOUT_S,
+    DNS_RESOLVER_TRIES,
+    FALLBACK_DOMAIN_BLOCKLIST,
+    HEARTBEAT_INTERVAL_S,
+    SERPER_BUCKET_CAPACITY,
+    SERPER_BUCKET_REFILL_RATE,
+)
 from pipeline.models import InputRecord, PipelineHaltError
 from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.dns_probe import probe_domains
 from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
-from pipeline.utils.text import assign_email_strategy, domain_match_score as _domain_match_score, is_org_agent, parse_name
+from pipeline.utils.text import assign_email_strategy, domain_match_score as _domain_match_score, is_org_agent, parse_name, score_domain_confidence
+from pipeline.utils.owner_inference import score_owner_confidence
 from pipeline.utils.notify import create_notify_pipe, signal_consumer
 from pipeline import db
 from pipeline.db import State
@@ -54,7 +62,7 @@ class ProducerWorker:
         self._enrichment_sem = asyncio.Semaphore(config.serper_concurrency)
         # Shared resolver: one c-ares context per producer → avoids per-record setup
         # overhead and enables negative-TTL caching across records.
-        self._dns_resolver = aiodns.DNSResolver(timeout=3, tries=1)
+        self._dns_resolver = aiodns.DNSResolver(timeout=DNS_RESOLVER_TIMEOUT_S, tries=DNS_RESOLVER_TRIES)
 
         # Dynamic fallback domain blocklist.
         # Starts from the static seed; grows when a domain is seen as first-organic
@@ -65,8 +73,8 @@ class ProducerWorker:
 
         # 2 calls/second sustained, burst cap 5, starts empty to prevent startup burst.
         _serper_bucket = TokenBucket(
-            capacity=5,
-            refill_rate=2.0,
+            capacity=SERPER_BUCKET_CAPACITY,
+            refill_rate=SERPER_BUCKET_REFILL_RATE,
             initial_tokens=0,
         )
 
@@ -85,7 +93,7 @@ class ProducerWorker:
             except Exception as exc:
                 logger.debug("Producer heartbeat failed: %s", exc)
             try:
-                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
+                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=HEARTBEAT_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass
 
@@ -310,12 +318,7 @@ class ProducerWorker:
                         fallback_blocklist=self._fallback_blocklist,
                         conn=self.conn,
                     )
-                    if not self._serper.last_was_cache_hit:
-                        self.cost_tracker.record_call("serper_producer")
-                    # Record any extra cost from site: fallback retries
-                    for _ in range(self._serper._fallback_calls):
-                        self.cost_tracker.record_call("serper_producer")
-                    self._serper._fallback_calls = 0
+                    self._serper.charge_costs(self.cost_tracker, "serper_producer")
 
                 result["serper_enriched"] = 1
                 _serper_ms = int((time.monotonic() - _dns_t0) * 1000) - _dns_ms
@@ -324,9 +327,13 @@ class ProducerWorker:
                 result["_trace"].append({"stage": "serper", "outcome": "hit" if serper_result.candidate_emails or serper_result.candidate_domain else "miss", "ms": _serper_ms})
                 if serper_result.candidate_domain:
                     enrichment_domain = serper_result.candidate_domain
-                    result["discovery_source"] = "serper"
+                    # serper_fallback = first-organic guess, not a name/KG match — lower
+                    # domain confidence; the dispatcher reads this in pre_score().
                     if serper_result.is_fallback_domain:
+                        result["discovery_source"] = "serper_fallback"
                         self._record_fallback_domain(serper_result.candidate_domain)
+                    else:
+                        result["discovery_source"] = "serper"
                 elif serper_result.candidate_emails:
                     result["discovery_source"] = "serper"
 
@@ -366,6 +373,10 @@ class ProducerWorker:
 
         effective_domain = domain or enrichment_domain
         result["discovery_attempts"] = 1
+        result["domain_confidence"] = score_domain_confidence(
+            record.business_name, effective_domain, result["discovery_source"]
+        )
+        result["owner_confidence"] = score_owner_confidence(record, has_website=bool(effective_domain))
 
         if all_candidates:
             result["candidate_emails"] = json.dumps(all_candidates)
@@ -419,6 +430,8 @@ class ProducerWorker:
             "strategy": strategy,
             "is_org_agent": org_agent,
             "mx_provider": None,
+            "domain_confidence": None,
+            "owner_confidence": None,
             "record_state": State.RAW,
             "_trace": [],
         }

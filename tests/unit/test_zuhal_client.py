@@ -7,9 +7,11 @@ import aiohttp
 import pytest
 
 from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.models import PipelineHaltError
 from pipeline.utils.zuhal_client import (
     ZuhalCircuitOpenError,
     ZuhalClient,
+    ZuhalCreditsExhaustedError,
     _RetryableHTTPError,
 )
 
@@ -163,3 +165,20 @@ class TestBulkValidateJobCreatedCallback:
 
         await client.bulk_validate(["test@example.com"], on_job_created=_on_job_created)
         assert received == []
+
+
+async def test_credits_exhausted_flag_short_circuits_without_calling_api():
+    """Once _credits_exhausted is set, validate() raises ZuhalCreditsExhaustedError
+    (recoverable, NOT PipelineHaltError) without touching the API."""
+    client = _client(max_attempts=1)
+    client._call_api = AsyncMock(side_effect=AssertionError("API must not be called"))
+    client._credits_exhausted = True
+
+    with pytest.raises(ZuhalCreditsExhaustedError):
+        await client.validate("a@example.com")
+    client._call_api.assert_not_called()
+
+
+async def test_credits_exhausted_is_not_pipeline_halt():
+    """A 402 degrades (recoverable) instead of halting the whole pipeline."""
+    assert not issubclass(ZuhalCreditsExhaustedError, PipelineHaltError)

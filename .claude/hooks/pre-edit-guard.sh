@@ -15,6 +15,18 @@ if [[ "$FILE_PATH" == *"/.env" ]] || [[ "$FILE_PATH" == ".env" ]]; then
   exit 2
 fi
 
+# Never create CSVs inside the repo — they are data, not source (see .claude/rules/git.md).
+# output/, runs/, and local/ are gitignored data dirs, so CSVs there are fine.
+if [[ "$FILE_PATH" == *.csv ]]; then
+  case "$FILE_PATH" in
+    */output/*|output/*|*/runs/*|runs/*|*/local/*|local/*) : ;;  # ignored data dirs — allow
+    *)
+      echo "BLOCKED: do not create CSV files in the repo ($FILE_PATH). CSVs are data — put them under output/, runs/, or local/ (gitignored)." >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Warn on sensitive paths (allow but flag)
 SENSITIVE_PATTERNS=("*secret*" "*/credentials*" "*private_key*" "*.pem" "*.p12")
 for pat in "${SENSITIVE_PATTERNS[@]}"; do

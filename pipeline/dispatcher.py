@@ -14,95 +14,41 @@ from pipeline.constants import (
     DISPATCH_POLL_MAX_INTERVAL_S,
     INFRA_RETRY_BASE_MINUTES,
     INFRA_RETRY_MULTIPLIER,
+    HEARTBEAT_INTERVAL_S,
+    NOTIFY_POLL_TIMEOUT_S,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
 from pipeline.consumers.racknerd import RacknerdConsumer
-from pipeline.utils.zuhal_client import ZuhalClient, ZuhalCircuitOpenError
+from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline.utils.serper_client import SerperClient
-from pipeline.models import BackendVerdict, PipelineHaltError, ReconcileResult
+from pipeline.models import BackendVerdict, PipelineHaltError
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.ms_verify import check_microsoft_email_async, is_microsoft_mx
+from pipeline.utils.ms_verify import is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
+from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.text import parse_name
+from pipeline.harvest import harvest, infer_templates
 from pipeline import db
+from pipeline import dispatch_probes as dp
+from pipeline import dispatch_verdicts as dv
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
+    catch_all_confidence_floor,
     compute_confidence_score,
+    pre_score,
     record_pattern,
+)
+from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests)
+    DEFINITIVE,
+    INCONCLUSIVE,
+    greylisting_retry_after,
+    reconcile,
+    valid_email_format,
 )
 
 logger = logging.getLogger("pipeline.dispatcher")
 
-
-def _valid_email_format(email: str) -> bool:
-    """Return False for emails whose local part violates RFC 5321 basics (e.g. ...@domain)."""
-    parts = email.split("@")
-    if len(parts) != 2:
-        return False
-    local = parts[0]
-    return bool(local) and not local.startswith(".") and not local.endswith(".") and ".." not in local
-
-
-# Statuses that indicate the backend actually ran and returned a definitive answer
-_DEFINITIVE: frozenset[str] = frozenset({"valid", "invalid", "catch_all"})
-# Statuses that mean "couldn't reach server" — should not count as invalid
-_INCONCLUSIVE: frozenset[str] = frozenset({"error", "blocked", "not_run"})
-
-
-# ---------------------------------------------------------------------------
-# Reconciliation (OR-of-valids)
-# ---------------------------------------------------------------------------
-
-def reconcile(
-    racknerd: BackendVerdict | None,
-    bbops: BackendVerdict | None,
-) -> ReconcileResult:
-    """
-    OR-of-valids policy:
-    - Either backend valid/catch_all → accept
-    - Both definitively invalid (no errors) → reject
-    - Mixed error/inconclusive → unknown, re-queue without burning attempt
-    - Tunnel down special-case → re-queue without burning attempt
-    """
-    rk = racknerd.status if racknerd else "not_run"
-    bb = bbops.status if bbops else "not_run"
-
-    # Tunnel-down special case: don't burn attempt
-    if rk == "error" and (racknerd and "tunnel not up" in racknerd.message):
-        return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
-
-    # OR-of-valids
-    if rk == "valid" or bb == "valid":
-        return ReconcileResult(final_verdict="valid", should_write=True, is_terminal=True)
-
-    if rk == "catch_all" or bb == "catch_all":
-        return ReconcileResult(final_verdict="catch_all", should_write=True, is_terminal=True)
-
-    # Both definitively invalid (no errors mixed in)
-    if rk == "invalid" and bb == "invalid":
-        return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
-
-    if rk == "invalid" and bb in _INCONCLUSIVE:
-        # not_run = backend intentionally disabled; treat as definitive invalid
-        if bb == "not_run":
-            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
-        # One said invalid, one errored — can't trust the invalid verdict alone
-        return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
-
-    if rk in _INCONCLUSIVE and bb == "invalid":
-        # not_run = backend intentionally disabled; treat as definitive invalid
-        if rk == "not_run":
-            return ReconcileResult(final_verdict="invalid", should_write=True, is_terminal=False)
-        return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
-
-    # Both inconclusive
-    return ReconcileResult(final_verdict="unknown", should_write=False, is_terminal=False)
-
-
-def _greylisting_retry_after(minutes: int = 30) -> str:
-    """Return an ISO timestamp N minutes from now for a greylisting hold."""
-    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _infra_retry_after(requeue_count: int) -> str:
@@ -122,6 +68,7 @@ def _verifier_agreement(rk: str, bb: str) -> str:
     if bb_ok:
         return "bbops_only"
     return "unknown"
+
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +107,12 @@ class Dispatcher:
         self.stop_event = stop_event or asyncio.Event()
         self.zuhal = zuhal
         self.serper = serper
+        self.harvest_enabled = config.harvest_enabled
+        # ponytail: one global bucket throttles ALL harvests combined (no burst); swap for
+        # per-host buckets only if a single global RPS becomes the throughput bottleneck.
+        self._harvest_rl = TokenBucket(
+            capacity=1, refill_rate=config.harvest_rps, initial_tokens=0,
+        ) if config.harvest_enabled else None
         self._sem = asyncio.Semaphore(config.dispatch_concurrency)
         self._write_lock = asyncio.Lock()
         self._notify_reader: asyncio.StreamReader | None = None
@@ -220,7 +173,7 @@ class Dispatcher:
 
                 if self._notify_reader:
                     try:
-                        await asyncio.wait_for(self._notify_reader.read(1), timeout=30.0)
+                        await asyncio.wait_for(self._notify_reader.read(1), timeout=NOTIFY_POLL_TIMEOUT_S)
                     except (asyncio.TimeoutError, asyncio.IncompleteReadError):
                         pass
                 else:
@@ -257,70 +210,173 @@ class Dispatcher:
                 return
             await self._process_record(row)
 
+    async def _fail(self, unique_id: str, reason: str, *args: object, failure_reason: str | None = None) -> None:
+        """Terminal VALIDATION_FAILED write + stats bump. `reason` is a %-format string."""
+        logger.warning("Record %s: " + reason + " — marking VALIDATION_FAILED", unique_id, *args)
+        async with self._write_lock:
+            kw: dict[str, object] = {} if failure_reason is None else {"failure_reason": failure_reason}
+            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED, **kw)
+        self.stats["validation_failed"] += 1
+
+    async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
+        """Check dispatch budget and parse candidate_emails; mark VALIDATION_FAILED and return None if it can't proceed."""
+        unique_id = row["unique_id"]
+        # dispatch_attempts counts only re-queues where a real verdict was obtained.
+        # requeue_count counts every re-queue including infra transients — the safety valve
+        # that terminates records stuck in a permanent infra failure loop.
+        attempts = row["dispatch_attempts"] or 0
+        requeues = row["requeue_count"] or 0
+        if attempts >= self.config.max_dispatch_attempts:
+            await self._fail(unique_id, "hit max dispatch attempts (%d)", attempts)
+            return None
+        if requeues >= self.config.max_requeue_count:
+            fr = "infra_loop" if (row["dispatch_attempts"] or 0) == 0 else "max_attempts"
+            await self._fail(unique_id, "hit max requeue count (%d)", requeues, failure_reason=fr)
+            return None
+        raw_candidates = row["candidate_emails"]
+        if not raw_candidates:
+            await self._fail(unique_id, "no candidate_emails")
+            return None
+        try:
+            return json.loads(raw_candidates)
+        except (json.JSONDecodeError, TypeError):
+            await self._fail(unique_id, "invalid candidate_emails JSON")
+            return None
+
+    async def _write_validated(
+        self,
+        unique_id: str,
+        email: str,
+        rk: BackendVerdict,
+        bb: BackendVerdict,
+        final_verdict: str,
+        score: float,
+        attempts_delta: int,
+        pending_trace: list[dict],
+        first: str,
+        last: str,
+        candidate_domain: str,
+        mx_provider: str | None,
+        log_msg: str,
+        *log_args: object,
+        verifier_agreement: str | None = None,
+    ) -> None:
+        """Single VALIDATED write path: dual-verdict + trace flush + pattern learning + stats + log."""
+        async with self._write_lock:
+            await db.update_record_dual(
+                self.conn,
+                unique_id,
+                State.VALIDATED,
+                racknerd_status=rk.status,
+                racknerd_message=rk.message,
+                racknerd_verified_at=rk.verified_at,
+                bbops_status=bb.status,
+                bbops_message=bb.message,
+                bbops_verified_at=bb.verified_at,
+                final_verdict=final_verdict,
+                candidate_email=email,
+                confidence_score=float(score),
+                dispatch_attempts_delta=attempts_delta,
+                verifier_agreement=verifier_agreement,
+            )
+            await db.flush_process_trace(self.conn, unique_id, pending_trace)
+        await record_pattern(self.conn, email, first, last, candidate_domain, mx_provider, success=True)
+        self.stats["validated"] += 1
+        logger.info(log_msg, *log_args)
+
+    async def _inject_harvest_fallback(
+        self, unique_id: str, candidates: list[str], first: str, last: str,
+        strategy: str, mx_provider: str | None, domain: str,
+    ) -> int:
+        """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
+        try:
+            result = await harvest(
+                domain, rate_limiter=self._harvest_rl, timeout_s=self.config.harvest_timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
+            return 0
+        existing = set(candidates)
+        new: list[str] = []
+        # House convention first: a scraped name paired to a harvested email reveals the
+        # template, so generate OUR officer's address with it (synthetic top-ranked pattern).
+        templates = infer_templates(result.emails, result.officers, domain)
+        if templates:
+            rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
+            # strategy is always "with"/"without" from the row; mypy sees only str.
+            for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
+                if c not in existing:
+                    new.append(c)
+                    existing.add(c)
+        for e in result.emails:  # then the literal harvested addresses
+            if e not in existing:
+                new.append(e)
+                existing.add(e)
+        candidates.extend(new)
+        logger.info(
+            "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
+            unique_id, domain, len(result.emails), len(result.officers), len(new),
+            " [BLOCKED]" if result.blocked else "",
+        )
+        return len(new)
+
+    async def _inject_serper_fallback(
+        self, unique_id: str, row: aiosqlite.Row, candidates: list[str]
+    ) -> bool:
+        """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
+        if self.cost_tracker.ceiling_reached():
+            logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
+            await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+            return True
+        existing = set(candidates)
+        raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
+        new_emails = [e for e in raw_emails if e not in existing]
+        try:
+            await db.mark_serper_enriched(self.conn, unique_id)
+        except Exception as exc:
+            logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
+        self.serper.charge_costs(self.cost_tracker, "serper_dispatcher")
+        if new_emails:
+            candidates.extend(new_emails)
+            logger.info(
+                "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
+                unique_id, len(new_emails), self.serper.last_was_cache_hit,
+            )
+        else:
+            logger.debug("Serper fallback for %s: no candidates found", unique_id)
+        return False
+
     async def _process_record(self, row: aiosqlite.Row) -> None:
         unique_id = row["unique_id"]
-        raw_candidates = row["candidate_emails"]
-
-        # dispatch_attempts counts only re-queues where a real verdict was obtained.
-        # requeue_count counts every re-queue including infra transients — it is the
-        # safety valve that terminates records stuck in permanent infra failure loops.
-        dispatch_attempts = row["dispatch_attempts"] or 0
-        requeue_count = row["requeue_count"] or 0
-        tunnel_requeue_count = row["tunnel_requeue_count"] or 0
-        bbops_requeue_count = row["bbops_requeue_count"] or 0
-        if dispatch_attempts >= self.config.max_dispatch_attempts:
-            logger.warning(
-                "Record %s hit max dispatch attempts (%d) — marking VALIDATION_FAILED",
-                unique_id, dispatch_attempts,
-            )
-            async with self._write_lock:
-                await db.update_record_status(
-                    self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="max_attempts"
-                )
-            self.stats["validation_failed"] += 1
-            return
-        if requeue_count >= self.config.max_requeue_count:
-            logger.warning(
-                "Record %s hit max requeue count (%d) — marking VALIDATION_FAILED",
-                unique_id, requeue_count,
-            )
-            async with self._write_lock:
-                await db.update_record_status(
-                    self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="infra_loop"
-                )
-            self.stats["validation_failed"] += 1
-            return
-
-        if not raw_candidates:
-            logger.warning("No candidate_emails for %s — marking failed", unique_id)
-            await db.update_record_status(
-                self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="no_candidates"
-            )
-            self.stats["validation_failed"] += 1
-            return
-
-        try:
-            candidates: list[str] = json.loads(raw_candidates)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Invalid candidate_emails JSON for %s", unique_id)
-            await db.update_record_status(
-                self.conn, unique_id, State.VALIDATION_FAILED, failure_reason="no_candidates"
-            )
-            self.stats["validation_failed"] += 1
+        candidates = await self._load_candidates(row)
+        if candidates is None:
             return
 
         mx_provider = row["mx_provider"]
         candidate_domain = row["candidate_domain"] or ""
         strategy = row["strategy"] or "without"
         agent_name = row["agent_name"] or ""
+        domain_confidence = row["domain_confidence"]
+        tunnel_requeue_count = row["tunnel_requeue_count"] or 0
+        bbops_requeue_count = row["bbops_requeue_count"] or 0
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
         serper_enriched = bool(row["serper_enriched"])
-        dms: float | None = row["domain_match_score"]
+        # Catch-all acceptance bar, raised for providers where catch-all is the default.
+        catch_all_floor = catch_all_confidence_floor(self.config.catch_all_min_confidence, mx_provider)
+
+        # Identity-first: try the strongest candidates before paid verification.
+        candidates.sort(
+            key=lambda e: pre_score(e, candidate_domain, strategy, agent_name, domain_confidence),
+            reverse=True,
+        )
 
         pending_trace: list[dict] = []
         cost_skipped = False
         original_count = len(candidates)
+        # fb_boundary moves out as harvest injects candidates, so they're tried before paid Serper.
+        fb_boundary = original_count
+        harvested = False
         i = 0
         last_rk: BackendVerdict | None = None
         last_bb: BackendVerdict | None = None
@@ -329,7 +385,7 @@ class Dispatcher:
         while i < len(candidates):
             email = candidates[i]
             i += 1
-            if not _valid_email_format(email):
+            if not valid_email_format(email):
                 logger.debug("Skipping malformed candidate %s for %s", email, unique_id)
                 pending_trace.append({"stage": "format_skip", "outcome": "invalid", "email": email})
                 continue
@@ -339,34 +395,29 @@ class Dispatcher:
                 cost_skipped = True
                 break
 
+            candidate_score = pre_score(
+                email, candidate_domain, strategy, agent_name, domain_confidence
+            )
+            # Low-confidence candidates don't earn paid Zuhal rescue (flag default 0.0 = off).
+            skip_paid = candidate_score < self.config.zuhal_min_confidence
+
             # MS probe pre-filter (free, only for Microsoft-managed domains)
             if use_ms_probe:
-                ms_status, ms_trace = await self._ms_probe(email)
+                ms_status, ms_trace = await dp.ms_probe(email)
                 pending_trace.append(ms_trace)
 
                 if ms_status == "valid":
-                    score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name, domain_match_score=dms)
-                    async with self._write_lock:
-                        await db.update_record_dual(
-                            self.conn,
-                            unique_id,
-                            State.VALIDATED,
-                            racknerd_status="ms_valid",
-                            racknerd_message="MS GetCredentialType probe",
-                            racknerd_verified_at=None,
-                            bbops_status="not_run",
-                            bbops_message="skipped — MS probe hit",
-                            bbops_verified_at=None,
-                            final_verdict="valid",
-                            candidate_email=email,
-                            confidence_score=float(score),
-                            dispatch_attempts_delta=0,  # MS probe is free, don't count
-                            verifier_agreement="ms_only",
-                        )
-                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                    self.stats["validated"] += 1
-                    logger.info("MS-validated (no SMTP): %s → %s", unique_id, email)
+                    score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name)
+                    await self._write_validated(
+                        unique_id, email,
+                        BackendVerdict("ms_valid", "MS GetCredentialType probe", None),
+                        BackendVerdict("not_run", "skipped — MS probe hit", None),
+                        "valid", score,
+                        0,  # MS probe is free, don't count against dispatch_attempts
+                        pending_trace, _first, _last, candidate_domain, mx_provider,
+                        "MS-validated (no SMTP): %s → %s", unique_id, email,
+                        verifier_agreement="ms_only",
+                    )
                     return
 
                 if ms_status == "invalid":
@@ -382,7 +433,7 @@ class Dispatcher:
             t_rk = time.monotonic()
             try:
                 rk_verdict = await asyncio.wait_for(
-                    self._safe_racknerd(email), timeout=timeout
+                    dp.safe_racknerd(self.racknerd, email), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at="")
@@ -392,32 +443,26 @@ class Dispatcher:
             })
             last_rk = rk_verdict
 
-            # Racknerd valid/catch_all: bbops not needed
-            if rk_verdict.status in ("valid", "catch_all"):
+            # Racknerd valid: accept. catch_all: accept only if identity confidence
+            # clears the gate (flag default 0.0 = accept all, current behavior);
+            # below the gate, fall through to bbops for a second signal.
+            if rk_verdict.status == "valid" or (
+                rk_verdict.status == "catch_all"
+                and candidate_score >= catch_all_floor
+            ):
                 score = compute_confidence_score(
-                    email, candidate_domain, strategy, rk_verdict.status, agent_name, domain_match_score=dms
+                    email, candidate_domain, strategy, rk_verdict.status, agent_name
                 )
-                async with self._write_lock:
-                    await db.update_record_dual(
-                        self.conn,
-                        unique_id,
-                        State.VALIDATED,
-                        racknerd_status=rk_verdict.status,
-                        racknerd_message=rk_verdict.message,
-                        racknerd_verified_at=rk_verdict.verified_at,
-                        bbops_status="not_run",
-                        bbops_message="skipped — Racknerd hit",
-                        bbops_verified_at=None,
-                        final_verdict=rk_verdict.status,
-                        candidate_email=email,
-                        confidence_score=float(score),
-                        dispatch_attempts_delta=1,
-                        verifier_agreement="racknerd_only",
-                    )
-                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                self.stats["validated"] += 1
-                logger.info("Racknerd-validated (bbops skipped): %s → %s", unique_id, email)
+                await self._write_validated(
+                    unique_id, email,
+                    rk_verdict,
+                    BackendVerdict("not_run", "skipped — Racknerd hit", None),
+                    rk_verdict.status, score,
+                    1,
+                    pending_trace, _first, _last, candidate_domain, mx_provider,
+                    "Racknerd-validated (bbops skipped): %s → %s", unique_id, email,
+                    verifier_agreement="racknerd_only",
+                )
                 return
 
             # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
@@ -440,7 +485,7 @@ class Dispatcher:
             t_bb = time.monotonic()
             try:
                 bb_verdict = await asyncio.wait_for(
-                    self._safe_bbops(row["id"], email), timeout=timeout
+                    dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at="")
@@ -452,15 +497,34 @@ class Dispatcher:
             })
             last_bb = bb_verdict
 
+            # bbops error: apply per-infra requeue budget (only when no Zuhal fallback;
+            # with Zuhal configured, handle_inconclusive owns the error/unknown path)
+            if bb_verdict.status == "error" and self.zuhal is None:
+                if bbops_requeue_count < self.config.max_bbops_requeues:
+                    retry_after = _infra_retry_after(bbops_requeue_count)
+                    async with self._write_lock:
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=False,
+                            retry_after=retry_after, infra_type="bbops",
+                        )
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (bbops error, retry after %s)", unique_id, retry_after)
+                    return
+                # bbops budget exhausted — count rk verdict if definitive, skip to next candidate
+                if rk_verdict.status in DEFINITIVE:
+                    any_real_test = True
+                logger.debug("bbops requeue limit hit for %s — skipping candidate %s", unique_id, email)
+                continue
+
             result = reconcile(rk_verdict, bb_verdict)
 
-            if rk_verdict.status in _DEFINITIVE or bb_verdict.status in _DEFINITIVE:
+            if rk_verdict.status in DEFINITIVE or bb_verdict.status in DEFINITIVE:
                 any_real_test = True
 
             # Disagreement detection (only when both gave definitive verdicts)
             if (
-                rk_verdict.status in _DEFINITIVE
-                and bb_verdict.status in _DEFINITIVE
+                rk_verdict.status in DEFINITIVE
+                and bb_verdict.status in DEFINITIVE
                 and rk_verdict.status != bb_verdict.status
             ):
                 self.stats["disagreements"] += 1
@@ -470,205 +534,47 @@ class Dispatcher:
                 )
 
             if not result.should_write:
-                # Count attempt only when at least one backend gave a definitive verdict.
-                # Both-error or error+not_run are pure infra and do not consume the budget.
-                any_real_verdict = (
-                    rk_verdict.status in _DEFINITIVE or bb_verdict.status in _DEFINITIVE
+                action = await dv.handle_inconclusive(
+                    self, unique_id, email, rk_verdict, bb_verdict,
+                    candidate_domain, strategy, agent_name, _first, _last,
+                    mx_provider, skip_paid, pending_trace,
                 )
+                if action == "cost_skipped":
+                    cost_skipped = True
+                    break
+                return
 
-                # Greylisting: Racknerd got a 4xx temporary SMTP deferral — hold for 30 min.
-                rk_is_4xx = (
-                    rk_verdict.status == "error"
-                    and "(4xx temporary)" in (rk_verdict.message or "")
-                )
-                greylist_hold = _greylisting_retry_after() if rk_is_4xx else None
-
-                if self.zuhal is not None:
-                    if self.config.zuhal_decoupled:
-                        # Backpressure: pause handoffs when Zuhal backlog is too deep.
-                        # Count is cached for 5 seconds to avoid per-record DB queries.
-                        if self.config.zuhal_backpressure_threshold > 0:
-                            now = time.monotonic()
-                            if now - self._bp_last_checked >= 5.0:
-                                self._bp_cached_count = await db.count_needs_zuhal(self.conn)
-                                self._bp_last_checked = now
-                            if self._bp_cached_count >= self.config.zuhal_backpressure_threshold:
-                                logger.debug(
-                                    "Zuhal backpressure: backlog=%d >= threshold=%d — pausing %.1fs",
-                                    self._bp_cached_count,
-                                    self.config.zuhal_backpressure_threshold,
-                                    self.config.zuhal_backpressure_sleep_s,
-                                )
-                                await asyncio.sleep(self.config.zuhal_backpressure_sleep_s)
-                        async with self._write_lock:
-                            await db.handoff_to_zuhal(
-                                self.conn,
-                                unique_id,
-                                racknerd_status=rk_verdict.status if rk_verdict else "not_run",
-                                racknerd_message=rk_verdict.message if rk_verdict else "",
-                                racknerd_verified_at=rk_verdict.verified_at if rk_verdict else None,
-                                bbops_status=bb_verdict.status if bb_verdict else "not_run",
-                                bbops_message=bb_verdict.message if bb_verdict else "",
-                                bbops_verified_at=bb_verdict.verified_at if bb_verdict else None,
-                                candidate_email=email,
-                            )
-                            await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                        self.stats["handed_off_to_zuhal"] += 1
-                        logger.debug("Handed off to Zuhal queue: %s → %s", unique_id, email)
-                        return
-
-                    if self.cost_tracker.ceiling_reached():
-                        logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
-                        await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
-                        cost_skipped = True
-                        break
-                    zuhal_status, zuhal_trace = await self._zuhal_probe(email)
-                    pending_trace.append(zuhal_trace)
-
-                    if zuhal_status == "circuit_open":
-                        # No re-queue — skip Zuhal for this candidate and try next
-                        logger.warning("Zuhal circuit open for %s — skipping, trying next candidate", unique_id)
-                        continue
-
-                    if zuhal_status == "accept-all":
-                        zuhal_status = "catch_all"
-                    terminal = zuhal_status in ("valid", "catch_all")
-                    state = State.VALIDATED if terminal else State.VALIDATION_FAILED
-                    score = compute_confidence_score(
-                        email, candidate_domain, strategy, zuhal_status, agent_name, domain_match_score=dms
-                    )
-                    async with self._write_lock:
-                        await db.update_record_dual(
-                            self.conn,
-                            unique_id,
-                            state,
-                            racknerd_status=rk_verdict.status,
-                            racknerd_message=rk_verdict.message,
-                            racknerd_verified_at=rk_verdict.verified_at,
-                            bbops_status=bb_verdict.status,
-                            bbops_message=bb_verdict.message,
-                            bbops_verified_at=bb_verdict.verified_at,
-                            final_verdict=zuhal_status,
-                            candidate_email=email,
-                            confidence_score=float(score),
-                            zuhal_status_override=zuhal_status,
-                            dispatch_attempts_delta=1,
-                            verifier_agreement="zuhal_only" if terminal else None,
-                        )
-                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    self.cost_tracker.record_call("zuhal")
-                    if terminal:
-                        await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                        self.stats["validated"] += 1
-                        logger.info(
-                            "Zuhal-validated: %s → %s [zuhal=%s]",
-                            unique_id, email, zuhal_status,
-                        )
-                    else:
-                        self.stats["validation_failed"] += 1
-                        logger.debug(
-                            "Zuhal fallback terminal: %s → %s (%s)",
-                            unique_id, email, zuhal_status,
-                        )
-                    return
-                else:
-                    if bbops_requeue_count < self.config.max_bbops_requeues:
-                        retry_after = greylist_hold or _infra_retry_after(bbops_requeue_count)
-                        async with self._write_lock:
-                            await db.requeue_record(
-                                self.conn, unique_id,
-                                increment_attempts=any_real_verdict,
-                                retry_after=retry_after,
-                                infra_type="bbops",
-                            )
-                        self.stats["requeued"] += 1
-                        if rk_is_4xx:
-                            logger.debug("Re-queued %s (greylisted — 4xx hold until %s)", unique_id, greylist_hold)
-                        else:
-                            logger.debug("Re-queued %s (bbops inconclusive, retry after %s)", unique_id, retry_after)
-                        return
-                    # bbops limit reached — skip this candidate, try next
-                    logger.debug("bbops requeue limit hit for %s — skipping candidate %s", unique_id, email)
-
-            if result.final_verdict in ("valid", "catch_all"):
+            if result.final_verdict == "valid" or (
+                result.final_verdict == "catch_all"
+                and candidate_score >= catch_all_floor
+            ):
                 score = compute_confidence_score(
-                    email, candidate_domain, strategy, result.final_verdict, agent_name, domain_match_score=dms
+                    email, candidate_domain, strategy, result.final_verdict, agent_name
                 )
-                async with self._write_lock:
-                    await db.update_record_dual(
-                        self.conn,
-                        unique_id,
-                        State.VALIDATED,
-                        racknerd_status=rk_verdict.status,
-                        racknerd_message=rk_verdict.message,
-                        racknerd_verified_at=rk_verdict.verified_at,
-                        bbops_status=bb_verdict.status,
-                        bbops_message=bb_verdict.message,
-                        bbops_verified_at=bb_verdict.verified_at,
-                        final_verdict=result.final_verdict,
-                        candidate_email=email,
-                        confidence_score=float(score),
-                        dispatch_attempts_delta=1,
-                        verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
-                    )
-                    await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                self.stats["validated"] += 1
-                logger.info(
+                await self._write_validated(
+                    unique_id, email, rk_verdict, bb_verdict,
+                    result.final_verdict, score,
+                    1,
+                    pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Validated %s → %s [rk=%s bb=%s]",
                     unique_id, email, rk_verdict.status, bb_verdict.status,
+                    verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
                 )
                 return
 
             # Both invalid — optional Zuhal rescue when zuhal_on_both_invalid is enabled
-            if self.zuhal is not None and self.config.zuhal_on_both_invalid:
-                if self.cost_tracker.ceiling_reached():
-                    logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
-                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
+            if self.zuhal is not None and self.config.zuhal_on_both_invalid and not skip_paid:
+                action = await dv.rescue_both_invalid(
+                    self, unique_id, email, rk_verdict, bb_verdict,
+                    candidate_domain, strategy, agent_name, _first, _last,
+                    mx_provider, pending_trace,
+                )
+                if action == "cost_skipped":
                     cost_skipped = True
                     break
-                zuhal_status, zuhal_trace = await self._zuhal_probe(email)
-                pending_trace.append(zuhal_trace)
-
-                if zuhal_status == "circuit_open":
-                    # No re-queue — skip Zuhal for this candidate and try next
-                    logger.warning("Zuhal circuit open (both-invalid rescue) for %s — skipping", unique_id)
-                    continue
-
-                if zuhal_status == "accept-all":
-                    zuhal_status = "catch_all"
-                if zuhal_status in ("valid", "catch_all"):
-                    score = compute_confidence_score(
-                        email, candidate_domain, strategy, zuhal_status, agent_name, domain_match_score=dms
-                    )
-                    async with self._write_lock:
-                        await db.update_record_dual(
-                            self.conn,
-                            unique_id,
-                            State.VALIDATED,
-                            racknerd_status=rk_verdict.status,
-                            racknerd_message=rk_verdict.message,
-                            racknerd_verified_at=rk_verdict.verified_at,
-                            bbops_status=bb_verdict.status,
-                            bbops_message=bb_verdict.message,
-                            bbops_verified_at=bb_verdict.verified_at,
-                            final_verdict=zuhal_status,
-                            candidate_email=email,
-                            confidence_score=float(score),
-                            zuhal_status_override=zuhal_status,
-                            dispatch_attempts_delta=1,
-                            verifier_agreement="zuhal_only",
-                        )
-                        await db.flush_process_trace(self.conn, unique_id, pending_trace)
-                    self.cost_tracker.record_call("zuhal")
-                    await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=True)
-                    self.stats["validated"] += 1
-                    logger.info(
-                        "Zuhal-rescued both-invalid: %s → %s [zuhal=%s]",
-                        unique_id, email, zuhal_status,
-                    )
+                if action == "terminal":
                     return
-                # Zuhal also invalid/error — fall through to try next candidate
+                # None → Zuhal also invalid/error — fall through to try next candidate
 
             # invalid — record pattern miss and try next candidate
             await record_pattern(self.conn, email, _first, _last, candidate_domain, mx_provider, success=False)
@@ -677,36 +583,21 @@ class Dispatcher:
                 email, unique_id, result.final_verdict,
             )
 
-            # After exhausting original pattern candidates, inject Serper enrichment.
-            # Serper was skipped in the producer (DNS hit) — call it now as a fallback
-            # so we only pay $0.001 when patterns actually fail, not upfront.
-            if i == original_count and not serper_enriched and self.serper and candidate_domain:
-                if self.cost_tracker.ceiling_reached():
-                    logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
-                    await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
-                    cost_skipped = True
-                    break
-                serper_enriched = True  # prevent re-injection on subsequent loops
-                existing = set(candidates[:original_count])
-                raw_emails = await self._serper_enrich(unique_id, row)
-                new_emails = [e for e in raw_emails if e not in existing]
-                try:
-                    await db.mark_serper_enriched(self.conn, unique_id)
-                except Exception as exc:
-                    logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
-                if not self.serper.last_was_cache_hit:
-                    self.cost_tracker.record_call("serper_dispatcher")
-                for _ in range(self.serper._fallback_calls):
-                    self.cost_tracker.record_call("serper_dispatcher")
-                self.serper._fallback_calls = 0
-                if new_emails:
-                    candidates.extend(new_emails)
-                    logger.info(
-                        "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
-                        unique_id, len(new_emails), self.serper.last_was_cache_hit,
+            # Patterns exhausted: free harvest first, then paid Serper if harvest is empty.
+            if i == fb_boundary and candidate_domain:
+                if self.harvest_enabled and not harvested:
+                    harvested = True
+                    added = await self._inject_harvest_fallback(
+                        unique_id, candidates, _first, _last, strategy, mx_provider, candidate_domain,
                     )
-                else:
-                    logger.debug("Serper fallback for %s: no candidates found", unique_id)
+                    if added:
+                        fb_boundary += added
+                        continue  # try harvested candidates before paying for Serper
+                if not serper_enriched and self.serper:
+                    serper_enriched = True  # prevent re-injection on subsequent loops
+                    if await self._inject_serper_fallback(unique_id, row, candidates):
+                        cost_skipped = True
+                        break
 
         if cost_skipped:
             return
@@ -736,84 +627,6 @@ class Dispatcher:
         self.stats["validation_failed"] += 1
         logger.debug("All candidates failed for %s (failure_reason=%s)", unique_id, failure_reason)
 
-    async def _zuhal_probe(self, email: str) -> tuple[str, dict]:
-        t0 = time.monotonic()
-        status: str
-        try:
-            result = await self.zuhal.validate(email)  # type: ignore[union-attr]
-            status = result.verdict
-        except PipelineHaltError:
-            raise
-        except ZuhalCircuitOpenError:
-            status = "circuit_open"
-        except Exception as exc:
-            logger.debug("Zuhal probe error for %s: %s", email, exc)
-            status = "error"
-        ms = int((time.monotonic() - t0) * 1000)
-        return status, {"stage": "zuhal_fallback", "outcome": status, "ms": ms, "email": email}
-
-    async def _serper_enrich(self, unique_id: str, row: aiosqlite.Row) -> list[str]:
-        """Call Serper for a DNS-hit record whose patterns all failed. Returns snippet emails."""
-        assert self.serper is not None
-        try:
-            result = await self.serper.enrich(
-                business_name=row["business_name"] or "",
-                agent_name=row["agent_name"] if (row["strategy"] or "without") == "with" else None,
-                state=row["state"] or "",
-                domain_hint=row["candidate_domain"] or None,
-                strategy=row["strategy"] or "without",
-                conn=self.conn,
-            )
-            return result.candidate_emails
-        except Exception as exc:
-            logger.warning("Serper fallback error for %s: %s", unique_id, exc)
-            return []
-
-    # Log a warning when this many MS probes have been attempted in the current window
-    _MS_ALERT_WINDOW: int = 100
-    # Error rate above this fraction triggers the warning
-    _MS_ERROR_THRESHOLD: float = 0.5
-
-    async def _ms_probe(self, email: str) -> tuple[str, dict]:
-        t0 = time.monotonic()
-        try:
-            result = await check_microsoft_email_async(email)
-        except Exception as exc:
-            logger.debug("MS probe error for %s: %s", email, exc)
-            result = {"status": "error"}
-        ms = int((time.monotonic() - t0) * 1000)
-        status = result.get("status", "error")
-
-        self._ms_total += 1
-        if status == "error":
-            self._ms_errors += 1
-        if self._ms_total >= self._MS_ALERT_WINDOW:
-            rate = self._ms_errors / self._ms_total
-            if rate >= self._MS_ERROR_THRESHOLD:
-                logger.error(
-                    "MS probe degraded: %d/%d errors (%.0f%%) in last %d probes — "
-                    "Microsoft domains falling through to paid SMTP",
-                    self._ms_errors, self._ms_total, rate * 100, self._ms_total,
-                )
-            self._ms_total = 0
-            self._ms_errors = 0
-
-        return status, {"stage": "ms_api", "outcome": status, "ms": ms, "email": email}
-
-    async def _safe_racknerd(self, email: str) -> BackendVerdict:
-        try:
-            return await self.racknerd.verify(email)
-        except Exception as exc:
-            return BackendVerdict(status="error", message=str(exc), verified_at="")
-
-    async def _safe_bbops(self, record_id: int, email: str) -> BackendVerdict:
-        try:
-            return await self.bbops.verify(record_id, email)
-        except BbopsUnhealthy:
-            raise
-        except Exception as exc:
-            return BackendVerdict(status="error", message=str(exc), verified_at="")
-
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -821,6 +634,6 @@ class Dispatcher:
             except Exception as exc:
                 logger.debug("Dispatcher heartbeat failed: %s", exc)
             try:
-                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=30.0)
+                await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=HEARTBEAT_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass

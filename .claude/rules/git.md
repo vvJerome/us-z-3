@@ -43,8 +43,9 @@ docs: split architecture doc into technical and overview
 - `*.db`, `*.db-shm`, `*.db-wal` (SQLite files)
 - `.venv/` (virtual environment)
 - `__pycache__/`, `*.pyc`
+- `*.csv` — **never commit CSVs.** They are data/spec, not source. Keep them under `output/`, `runs/`, or `local/` (all gitignored). The `pre-edit-guard.sh` hook blocks creating a CSV anywhere else, and `stop-audit.sh` flags any tracked CSV.
 
-All of these are in `.gitignore`. If you accidentally stage one, run `git rm --cached <file>`.
+All of these are in `.gitignore`. If you accidentally stage one, run `git rm --cached <file>`. If one slipped into the **tip** commit, `git rm --cached <file> && git commit --amend --no-edit` removes it from history; force-push with `--force-with-lease`.
 
 ## PR template
 

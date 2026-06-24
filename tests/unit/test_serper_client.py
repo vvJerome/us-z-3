@@ -8,6 +8,7 @@ import aiohttp
 import pytest
 
 from pipeline import db
+from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.rate_limiter import TokenBucket
 
@@ -251,6 +252,33 @@ async def test_short_name_fallback_increments_fallback_calls():
 
     # 2 calls: primary + 4th fallback; fallback_calls should reflect the extra call
     assert client._fallback_calls == 1
+
+
+# ── charge_costs ──────────────────────────────────────────────────────────────
+
+async def test_charge_costs_primary_plus_fallback_then_resets():
+    """A live call + N fallback retries → 1+N charges; _fallback_calls resets to 0."""
+    client = _client()
+    client.last_was_cache_hit = False
+    client._fallback_calls = 1
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.counts.get("serper_dispatcher", 0) == 2  # 1 primary + 1 fallback
+    assert client._fallback_calls == 0
+
+
+async def test_charge_costs_cache_hit_only_charges_fallbacks():
+    """Cache hit → primary call is free; only fallback retries are charged."""
+    client = _client()
+    client.last_was_cache_hit = True
+    client._fallback_calls = 0
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.counts.get("serper_dispatcher", 0) == 0
 
 
 # ── Serper credits exhaustion ─────────────────────────────────────────────────

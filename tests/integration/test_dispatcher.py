@@ -76,6 +76,53 @@ async def _insert_discovered(conn, unique_id: str, email: str = "test@example.co
 
 
 class TestDispatcherReconciliation:
+    async def test_harvest_fallback_validates_scraped_email(self, test_db, config):
+        """With --harvest, after patterns fail SMTP a harvested email is tried and validates."""
+        from pipeline.harvest import HarvestResult
+
+        await test_db.execute(
+            """
+            INSERT INTO records
+                (unique_id, business_name, agent_name, record_state,
+                 candidate_emails, candidate_email, candidate_domain,
+                 strategy, mx_provider, serper_enriched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                "rec1", "Acme Co", "John Doe", State.DISCOVERED,
+                json.dumps(["guess@acme.com"]), "guess@acme.com", "acme.com",
+                "with", "gmail.com",
+            ),
+        )
+        await test_db.commit()
+
+        # Racknerd: the pattern guess fails, the harvested address validates.
+        async def rk_verify(email, *a, **k):
+            ok = email == "owner@acme.com"
+            return BackendVerdict("valid" if ok else "invalid", "", "2026-05-04T00:00:00Z")
+        rk = MagicMock()
+        rk.verify = AsyncMock(side_effect=rk_verify)
+        bb = _mock_bbops("invalid", "550")
+
+        harvest_cfg = config.model_copy(update={"harvest_enabled": True})
+        dispatcher = Dispatcher(harvest_cfg, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        with patch(
+            "pipeline.dispatcher.harvest",
+            AsyncMock(return_value=HarvestResult(emails=["owner@acme.com"])),
+        ):
+            await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, candidate_email, racknerd_status "
+            "FROM records WHERE unique_id = ?", ("rec1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["candidate_email"] == "owner@acme.com"  # the harvested address won
+        assert row["racknerd_status"] == "valid"
+
     async def test_racknerd_valid_skips_bbops(self, test_db, config):
         """Racknerd valid short-circuits: bbops is skipped (sequential flow)."""
         await _insert_discovered(test_db, "rec1")
@@ -356,9 +403,10 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"  # bbops verdict surfaces as final
 
-    async def test_dispatcher_serper_fallback_calls_reset_and_costed(self, test_db, config):
-        """When the Serper 4th fallback fires inside the dispatcher, _fallback_calls is
-        reset after each record and the extra API call is charged to cost_tracker."""
+    async def test_dispatcher_serper_fallback_charges_via_charge_costs(self, test_db, config):
+        """After patterns are exhausted the dispatcher delegates cost accounting to
+        SerperClient.charge_costs (which owns the cache-hit/fallback math, unit-tested
+        separately) rather than reaching into its private counters."""
         from pipeline.utils.serper_client import SerperClient
         from pipeline.models import EnrichmentResult
 
@@ -387,17 +435,15 @@ class TestDispatcherReconciliation:
             candidate_emails=[], candidate_domain=None,
         ))
         serper.last_was_cache_hit = False
-        serper._fallback_calls = 1  # simulate 4th fallback having fired
 
         cost_tracker = CostTracker(max_cost=10.0)
         dispatcher = Dispatcher(config, test_db, rk, bb, cost_tracker, serper=serper)
         rows = await db.fetch_pending_validation(test_db, limit=10)
         await dispatcher._process_record(rows[0])
 
-        # 1 primary call + 1 fallback call = 2 serper_dispatcher charges
-        assert cost_tracker.counts.get("serper_dispatcher", 0) == 2
-        # _fallback_calls must be reset so subsequent records start clean
-        assert serper._fallback_calls == 0
+        # The dispatcher must hand cost accounting to charge_costs with its own service tag,
+        # exactly once — never charge the tracker directly or peek at private counters.
+        serper.charge_costs.assert_called_once_with(cost_tracker, "serper_dispatcher")
 
     async def test_cost_ceiling_before_serper_fallback_marks_cost_skipped(self, test_db, config):
         """Cost ceiling hit after all patterns fail but before Serper fallback → COST_SKIPPED."""
@@ -517,7 +563,7 @@ class TestDispatcherReconciliation:
 
         await _insert_discovered(test_db, "rec1")
         future = (
-            datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
         ).strftime("%Y-%m-%d %H:%M:%S")
         await test_db.execute(
             "UPDATE records SET retry_after = ? WHERE unique_id = 'rec1'", (future,)
@@ -548,6 +594,34 @@ async def _insert_discovered_with_counts(
             State.DISCOVERED,
             json.dumps([email]), email, "example.com", "with", "gmail.com",
             tunnel_requeue_count, bbops_requeue_count,
+        ),
+    )
+    await conn.commit()
+
+
+def _mock_zuhal(verdict: str):
+    from pipeline.models import ValidationResult
+    z = MagicMock()
+    z.validate = AsyncMock(return_value=ValidationResult(
+        email="test@example.com", verdict=verdict, score=0.0,
+        is_disposable=False, raw_status="", http_status=200,
+    ))
+    return z
+
+
+async def _insert_with_candidates(conn, unique_id, candidates, *, discovery_source=None):
+    await conn.execute(
+        """
+        INSERT INTO records
+            (unique_id, business_name, agent_name, record_state,
+             candidate_emails, candidate_email, candidate_domain, strategy,
+             mx_provider, discovery_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            unique_id, "Test Corp", "John Doe", State.DISCOVERED,
+            json.dumps(candidates), candidates[0], "example.com", "with",
+            "gmail.com", discovery_source,
         ),
     )
     await conn.commit()
@@ -587,7 +661,6 @@ class TestInfraRequeueLimit:
             "SELECT record_state, bbops_status FROM records WHERE unique_id = ?", ("rec1",)
         ) as cur:
             row = await cur.fetchone()
-        # Record moved to a terminal state (not re-queued) — bbops was called
         assert row["record_state"] != State.DISCOVERED
         bb.verify.assert_called_once()
 
@@ -668,7 +741,7 @@ class TestFailureReason:
             dispatch_backend_timeout_s=5.0,
             dispatch_poll_interval_s=0.1,
             dispatch_chunk_size=10,
-            max_bbops_requeues=0,  # immediately skip on bbops error
+            max_bbops_requeues=0,
         )
         await _insert_discovered_with_counts(test_db, "rec1")
         rk = _mock_racknerd("error", "some error")
@@ -722,3 +795,127 @@ class TestFailureReason:
         ) as cur:
             row = await cur.fetchone()
         assert row["failure_reason"] == "infra_loop"
+
+
+class TestCatchAllConfidenceGate:
+    async def test_catch_all_accepted_by_default(self, test_db, config):
+        """catch_all_min_confidence default 0.0 → catch_all accepted (unchanged behavior)."""
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("catch_all", "250 accepts all")
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, final_verdict FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["final_verdict"] == "catch_all"
+        bb.verify.assert_not_called()
+
+    async def test_catch_all_below_gate_not_validated(self, test_db, config):
+        """With the gate raised above the candidate's pre_score, a catch_all is not accepted."""
+        config = config.model_copy(update={"catch_all_min_confidence": 3.0})
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("catch_all", "250 accepts all")
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        bb.verify.assert_called_once()
+
+
+class TestZuhalConfidenceGate:
+    async def test_low_confidence_skips_decoupled_handoff(self, test_db, config):
+        """zuhal_min_confidence above pre_score → unknown re-queues instead of going to Zuhal."""
+        config = config.model_copy(update={"zuhal_min_confidence": 10.0})
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=_mock_zuhal("valid"))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.DISCOVERED
+        assert dispatcher.stats["handed_off_to_zuhal"] == 0
+
+    async def test_default_confidence_hands_off_to_zuhal(self, test_db, config):
+        """Default 0.0 gate → unknown verdict still hands off to Zuhal queue."""
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("error", "timeout")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=_mock_zuhal("valid"))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.NEEDS_ZUHAL
+        assert dispatcher.stats["handed_off_to_zuhal"] == 1
+
+    async def test_low_confidence_skips_both_invalid_rescue(self, test_db, config):
+        """zuhal_on_both_invalid rescue is skipped for low-confidence candidates."""
+        config = config.model_copy(update={
+            "zuhal_on_both_invalid": True, "zuhal_min_confidence": 10.0,
+        })
+        await _insert_discovered(test_db, "rec1")
+        rk = _mock_racknerd("invalid", "550")
+        bb = _mock_bbops("invalid", "550")
+        zuhal = _mock_zuhal("valid")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None), zuhal=zuhal)
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATION_FAILED
+        zuhal.validate.assert_not_called()
+
+
+class TestCandidateReorder:
+    async def test_higher_confidence_candidate_tried_first(self, test_db, config):
+        """Candidates are sorted by pre_score; the name-matching one is probed before the weak one."""
+        await _insert_with_candidates(
+            test_db, "rec1", ["zzz@example.com", "john.doe@example.com"]
+        )
+
+        async def verify(email):
+            status = "valid" if email == "john.doe@example.com" else "invalid"
+            return BackendVerdict(status=status, message="", verified_at="2026-05-04T00:00:00Z")
+
+        rk = MagicMock()
+        rk.verify = AsyncMock(side_effect=verify)
+        bb = _mock_bbops("invalid", "550")
+        dispatcher = Dispatcher(config, test_db, rk, bb, CostTracker(None))
+
+        rows = await db.fetch_pending_validation(test_db, limit=10)
+        await dispatcher._process_record(rows[0])
+
+        async with test_db.execute(
+            "SELECT record_state, candidate_email FROM records WHERE unique_id = 'rec1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["record_state"] == State.VALIDATED
+        assert row["candidate_email"] == "john.doe@example.com"
+        assert rk.verify.call_count == 1

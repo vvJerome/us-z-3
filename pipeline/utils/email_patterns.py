@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pipeline.constants import MAX_WITHOUT_CANDIDATES
@@ -57,6 +58,46 @@ def _expand_personal(template: str, first: str, last: str, domain: str) -> str |
     return mapping.get(template)
 
 
+# Common given-name <-> diminutive groups. Bidirectional: any member maps to the
+# others. ponytail: a static map of the frequent cases, not a name-science library —
+# research shows nickname expansion has unproven yield, so we keep it small and rank
+# these variants last. Grow the list if misses warrant it.
+_NICKNAME_GROUPS: list[set[str]] = [
+    {"robert", "bob", "rob", "bobby"}, {"william", "will", "bill", "billy"},
+    {"richard", "rick", "rich", "dick"}, {"james", "jim", "jimmy", "jamie"},
+    {"john", "jack", "johnny"}, {"michael", "mike", "mick"},
+    {"charles", "charlie", "chuck"}, {"thomas", "tom", "tommy"},
+    {"joseph", "joe", "joey"}, {"edward", "ed", "eddie", "ted"},
+    {"daniel", "dan", "danny"}, {"matthew", "matt"}, {"anthony", "tony"},
+    {"christopher", "chris"}, {"nicholas", "nick"}, {"benjamin", "ben"},
+    {"elizabeth", "liz", "beth", "betty"}, {"margaret", "maggie", "meg", "peggy"},
+    {"katherine", "kate", "kathy", "katie"}, {"jennifer", "jen", "jenny"},
+    {"patricia", "pat", "patty", "tricia"}, {"deborah", "deb", "debbie"},
+    {"susan", "sue", "suzie"}, {"rebecca", "becca", "becky"},
+]
+_NICKNAME_MAP: dict[str, list[str]] = {
+    name: sorted(group - {name})
+    for group in _NICKNAME_GROUPS
+    for name in group
+}
+
+
+def _nickname_variants(first: str) -> list[str]:
+    """Known diminutives/given-name forms for a first name, or [] if none."""
+    return _NICKNAME_MAP.get(first.lower(), []) if first else []
+
+
+def _surname_variants(last: str) -> list[str]:
+    """Single-part surnames from a compound/hyphenated last name, or [] if simple.
+
+    "smith-jones" -> ["smith", "jones"]; the raw form is handled by the caller.
+    """
+    if not last:
+        return []
+    parts = [p for p in re.split(r"[-\s]+", last) if p]
+    return parts if len(parts) > 1 else []
+
+
 def generate_personal_patterns(first: str, last: str, domain: str) -> list[str]:
     return [
         email
@@ -87,12 +128,29 @@ def generate_ranked_candidates(
     """
     if strategy == "with":
         templates = _reorder_personal(rankings)
-        candidates = [
+        # Compound surname ("smith-jones", "de la cruz"): companies usually pick one
+        # part or drop the separator. Lead with the top-ranked template for the raw
+        # surname AND each part, so every part surfaces within the cap before the
+        # lower-ranked templates of the raw surname fill the remaining slots.
+        surnames = [last, *_surname_variants(last)]
+        lead = [
             email
-            for t in templates
+            for sv in surnames
+            if (email := _expand_personal(templates[0], first, sv, domain)) is not None
+        ]
+        # Nickname/given-name forms (Bob<->Robert) for the raw surname only — ranked
+        # after the primary leads, before lower-ranked templates, so they make the cap.
+        nick = [
+            email
+            for fn in _nickname_variants(first)
+            if (email := _expand_personal(templates[0], fn, last, domain)) is not None
+        ]
+        rest = [
+            email
+            for t in templates[1:]
             if (email := _expand_personal(t, first, last, domain)) is not None
         ]
-        return candidates[:max_candidates]
+        return list(dict.fromkeys(lead + nick + rest))[:max_candidates]
     else:
         templates = _reorder_generic(rankings)
         if not domain:
