@@ -62,18 +62,18 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--strategy", default="auto", choices=["auto", "with", "without"],
                         help="Email discovery strategy")
 
-    # Producer concurrency
-    parser.add_argument("--dns-concurrency", type=int, default=100, help="DNS semaphore size")
-    parser.add_argument("--serper-concurrency", type=int, default=15, help="Serper semaphore size")
+    # Producer concurrency (default=None → PipelineConfig/.env is the source of truth)
+    parser.add_argument("--dns-concurrency", type=int, default=None, help="DNS semaphore size")
+    parser.add_argument("--serper-concurrency", type=int, default=None, help="Serper semaphore size")
 
-    # Dispatcher
-    parser.add_argument("--dispatch-concurrency", type=int, default=20,
+    # Dispatcher (default=None → PipelineConfig/.env is the source of truth)
+    parser.add_argument("--dispatch-concurrency", type=int, default=None,
                         help="Concurrent records in dispatcher")
-    parser.add_argument("--dispatch-backend-timeout-s", type=float, default=60.0,
+    parser.add_argument("--dispatch-backend-timeout-s", type=float, default=None,
                         help="Per-backend timeout in seconds")
-    parser.add_argument("--dispatch-poll-interval-s", type=float, default=5.0,
+    parser.add_argument("--dispatch-poll-interval-s", type=float, default=None,
                         help="Dispatcher poll interval when queue is empty")
-    parser.add_argument("--dispatch-chunk-size", type=int, default=50,
+    parser.add_argument("--dispatch-chunk-size", type=int, default=None,
                         help="Records claimed per poll cycle")
 
     # Racknerd
@@ -88,11 +88,11 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
     parser.add_argument("--racknerd-ssh-user", default=None, help="SSH username")
     parser.add_argument("--racknerd-ssh-key", default=None, help="SSH private key path")
-    parser.add_argument("--racknerd-ssh-port", type=int, default=22, help="SSH port")
-    parser.add_argument("--racknerd-socks-port", type=int, default=1080, help="Local SOCKS5 port")
-    parser.add_argument("--racknerd-concurrency", type=int, default=10,
+    parser.add_argument("--racknerd-ssh-port", type=int, default=None, help="SSH port")
+    parser.add_argument("--racknerd-socks-port", type=int, default=None, help="Local SOCKS5 port")
+    parser.add_argument("--racknerd-concurrency", type=int, default=None,
                         help="Concurrent SMTP probes via Racknerd")
-    parser.add_argument("--racknerd-smtp-timeout-s", type=float, default=15.0,
+    parser.add_argument("--racknerd-smtp-timeout-s", type=float, default=None,
                         help="Per-SMTP-operation timeout")
     parser.add_argument("--racknerd-helo", dest="racknerd_helo_hostname", default=None,
                         help="SMTP EHLO/MAIL FROM domain (overrides RACKNERD_HELO_HOSTNAME env). "
