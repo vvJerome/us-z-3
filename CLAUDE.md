@@ -440,9 +440,29 @@ echo '{"scale_to": 6}' > output/fleet/control.json
 python -m pipeline.fleet teardown --yes        # deletes only fleet-provisioned servers
 ```
 
+### Autonomous benchmark (provision → validate → tear down)
+
+One command, default config — point it at a dataset and it provisions a fresh fleet,
+waits for sshd, runs the real validation path, prints the SMTP verdict distribution, and
+**always tears the fleet down** (a `finally` plus a backup trap, so a crash/`kill`/Ctrl-C
+never leaks servers). No per-run scripts.
+
+```bash
+# Verdict distribution only
+python -m pipeline.fleet benchmark --input input/<file> --count 5
+# With a deliverability-accuracy score (email,zb_status CSV ground truth)
+python -m pipeline.fleet benchmark --input input/<file> --count 5 --ground-truth gt.csv
+scripts/cherry_benchmark.sh --input input/<file> --count 5   # thin wrapper, same flags
+```
+
+Zuhal rescue is off by default (it measures the SMTP fleet; pass `--with-zuhal` to keep
+the paid rescue on). `summarize()` reports per-record **decisive accuracy** (definitive
+verdicts that match ground-truth deliverability) and **coverage** (decided / attempted).
+
 Fleet package: `pipeline/fleet/` (cherry_client, provisioner, worker, health, balancer,
-manager, control, wiring, `__main__` = the provision/status/teardown CLI). Durable backup:
-`pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled with `BACKUP_ENABLED=true`.
+manager, control, wiring, benchmark, `__main__` = the provision/status/teardown/benchmark
+CLI). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled with
+`BACKUP_ENABLED=true`.
 
 ---
 
