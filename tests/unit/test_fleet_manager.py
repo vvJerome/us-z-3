@@ -2,6 +2,9 @@
 
 import asyncio
 
+import pytest
+
+from pipeline.fleet import manager as manager_mod
 from pipeline.fleet.manager import FleetManager
 from pipeline.fleet.worker import FleetWorker
 from pipeline.models import BackendVerdict
@@ -122,3 +125,22 @@ async def test_same_email_sticks_to_its_worker():
     mgr._by_id[other].inflight = 0   # load-balancer alone would prefer this one
     second = (await mgr.verify("a@b.com")).probe_host
     assert second == first
+
+
+async def test_probe_cancellation_propagates():
+    # A CancelledError during shutdown must propagate, never become an "error" verdict.
+    class _Cancelling:
+        async def verify(self, email):
+            raise asyncio.CancelledError()
+
+    mgr = FleetManager([FleetWorker(worker_id="w1", verifier=_Cancelling(), concurrency=10)])
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.verify("a@b.com")
+
+
+async def test_affinity_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(manager_mod, "FLEET_AFFINITY_MAX", 5)
+    mgr = FleetManager([_worker("w1", "valid")])
+    for i in range(50):
+        await mgr.verify(f"u{i}@b.com")
+    assert len(mgr._affinity) <= 5

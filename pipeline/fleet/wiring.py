@@ -18,6 +18,7 @@ import aiodns
 
 from pipeline import db
 from pipeline.config import PipelineConfig
+from pipeline.constants import FLEET_PTR_LOOKUP_TIMEOUT_S
 from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer
 from pipeline.fleet.cherry_client import CherryClient
 from pipeline.fleet.control import FleetSupervisor
@@ -39,6 +40,8 @@ class FleetContext:
     async def aclose(self) -> None:
         for task in self.tasks:
             task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
         for worker in self.manager.workers:
             if worker.tunnel is not None and hasattr(worker.tunnel, "stop"):
                 await worker.tunnel.stop()
@@ -71,10 +74,13 @@ async def _make_worker(
         rk_kwargs["helo_hostname"] = config.racknerd_helo_hostname
     else:
         try:
-            ptr = (await asyncio.to_thread(socket.gethostbyaddr, host.ip))[0]
+            ptr = (await asyncio.wait_for(
+                asyncio.to_thread(socket.gethostbyaddr, host.ip),
+                timeout=FLEET_PTR_LOOKUP_TIMEOUT_S,
+            ))[0]
             if ptr and "." in ptr:
                 rk_kwargs["helo_hostname"] = ptr
-        except OSError:
+        except (OSError, asyncio.TimeoutError):
             pass
     consumer = RacknerdConsumer(
         tunnel,

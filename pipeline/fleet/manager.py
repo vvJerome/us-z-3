@@ -12,8 +12,10 @@ import asyncio
 import datetime
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
+from pipeline.constants import FLEET_AFFINITY_MAX
 from pipeline.fleet.balancer import WorkerLoad, pick_worker
 from pipeline.fleet.worker import FleetWorker
 from pipeline.models import BackendVerdict
@@ -52,7 +54,8 @@ class FleetManager:
         self._domain_sems: dict[str, asyncio.Semaphore] = {}
         # email -> worker_id: a greylisted record must retry from the same worker so the
         # (IP, MAIL FROM, RCPT) triplet matches and the greylist clears instead of re-deferring.
-        self._affinity: dict[str, str] = {}
+        # Bounded LRU so a long run can't grow it without limit (one entry per unique email).
+        self._affinity: OrderedDict[str, str] = OrderedDict()
 
     @property
     def workers(self) -> list[FleetWorker]:
@@ -81,6 +84,12 @@ class FleetManager:
             for w in self._workers
             if w.worker_id not in exclude
         ]
+
+    def _remember_affinity(self, email: str, wid: str) -> None:
+        self._affinity[email] = wid
+        self._affinity.move_to_end(email)
+        if len(self._affinity) > FLEET_AFFINITY_MAX:
+            self._affinity.popitem(last=False)  # evict least-recently-used
 
     def _pick(self, email: str, now: float, tried: set[str]) -> str | None:
         # Stick to the worker that last handled this email (greylist triplet stability) when
@@ -114,7 +123,7 @@ class FleetManager:
                 break
             worker = self._by_id[wid]
             tried.add(wid)
-            self._affinity[email] = wid
+            self._remember_affinity(email, wid)
             verdict = await self._probe(worker, email)
             verdict.probe_host = wid
             worker.record(verdict.status)
@@ -136,8 +145,11 @@ class FleetManager:
         worker.inflight += 1
         try:
             return await worker.verifier.verify(email)
+        except asyncio.CancelledError:
+            raise  # shutdown/cancellation must propagate, not become an "error" verdict
         except Exception as exc:
             # Any verifier failure is a transient error verdict, never an email rejection.
+            logger.warning("worker %s probe failed: %s", worker.worker_id, exc)
             return BackendVerdict(
                 status="error", message=f"worker {worker.worker_id}: {exc}", verified_at=_iso_now()
             )

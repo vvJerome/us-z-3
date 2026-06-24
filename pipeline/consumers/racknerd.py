@@ -13,6 +13,7 @@ import aiodns
 import aiosmtplib
 
 from pipeline.constants import (
+    RACKNERD_MX_CACHE_MAX,
     RACKNERD_MX_CACHE_TTL_S,
     RACKNERD_MX_MAX_HOSTS,
     RACKNERD_SMTP_TIMEOUT_S,
@@ -221,7 +222,7 @@ class RacknerdConsumer:
             except aiodns.error.DNSError:
                 pass
 
-        if len(self._mx_cache) >= 10_000:
+        if len(self._mx_cache) >= RACKNERD_MX_CACHE_MAX:
             # Drop the oldest quarter to bound memory on large runs
             evict = list(self._mx_cache)[: len(self._mx_cache) // 4]
             for k in evict:

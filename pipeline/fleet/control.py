@@ -166,8 +166,8 @@ class FleetSupervisor:
             try:
                 await self.monitor_once()
                 await self.check_control_file()
-            except Exception as exc:
-                logger.error("supervisor cycle error: %s", exc)
+            except Exception:
+                logger.exception("supervisor cycle error")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_s)
             except asyncio.TimeoutError:

@@ -42,6 +42,7 @@ MAX_WITHOUT_CANDIDATES: int = 3
 # --- Racknerd / direct SMTP ---
 RACKNERD_SMTP_TIMEOUT_S: float = 8.0
 RACKNERD_MX_CACHE_TTL_S: int = 3600       # 1 hour MX resolution cache
+RACKNERD_MX_CACHE_MAX: int = 10_000       # evict oldest quarter past this many domains
 RACKNERD_MX_MAX_HOSTS: int = 3            # probe up to N MX hosts per domain
 RACKNERD_SPAMHAUS_WINDOW_S: int = 60      # sliding window for block detection
 RACKNERD_SPAMHAUS_THRESHOLD: int = 100    # blocks in window before cooldown
@@ -53,6 +54,10 @@ TUNNEL_READY_INTERVAL_S: float = 0.5
 TUNNEL_STOP_TIMEOUT_S: float = 3.0
 TUNNEL_BACKOFF_START_S: float = 2.0
 TUNNEL_BACKOFF_MAX_S: float = 60.0
+
+# --- SMTP fleet (pipeline.fleet) ---
+FLEET_PTR_LOOKUP_TIMEOUT_S: float = 5.0   # cap the reverse-DNS lookup so a slow PTR can't block worker startup
+FLEET_AFFINITY_MAX: int = 100_000         # cap the per-email greylist-affinity map (LRU evict oldest)
 
 # --- Dispatcher ---
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
