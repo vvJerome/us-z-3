@@ -362,24 +362,61 @@ def _print_status(summary: dict) -> None:
         cost = stats.get("estimated_cost_usd", 0)
         print(f"\nEstimated cost: ${cost:.4f}")
 
-    terminal_last_5min = summary.get("terminal_last_5min", 0)
     by_state = summary.get("records_by_state", {})
-    pending = sum(
-        by_state.get(s, 0)
-        for s in ("RAW", "DISCOVERING", "DISCOVERED", "VALIDATING", "NEEDS_ZUHAL", "ZUHAL_VALIDATING")
-    )
-    if terminal_last_5min > 0 and pending > 0:
-        rate_per_min = terminal_last_5min / 5.0
-        eta_min = pending / rate_per_min
-        if eta_min < 60:
-            eta_str = f"{eta_min:.0f} min"
-        elif eta_min < 1440:
-            eta_str = f"{eta_min / 60:.1f} hr"
+    t1 = summary.get("terminal_last_1min", 0)
+    t5 = summary.get("terminal_last_5min", 0)
+    t15 = summary.get("terminal_last_15min", 0)
+    r1 = t1 / 1.0
+    r5 = t5 / 5.0
+    r15 = t15 / 15.0
+
+    pending_states = ("RAW", "DISCOVERING", "DISCOVERED", "VALIDATING", "NEEDS_ZUHAL", "ZUHAL_VALIDATING")
+    pending = sum(by_state.get(s, 0) for s in pending_states)
+    retry_backlog = summary.get("retry_backlog", 0)
+    fresh = pending - retry_backlog
+
+    needs_zuhal = by_state.get("NEEDS_ZUHAL", 0) + by_state.get("ZUHAL_VALIDATING", 0)
+    zuhal_rate = summary.get("zuhal_terminal_last_5min", 0) / 5.0
+
+    terminal_by_state = summary.get("terminal_by_state_5min", {})
+
+    if any((r1, r5, r15)):
+        print("\nThroughput:")
+        print(f"  1 min:  {r1:>7.1f} records/min")
+        print(f"  5 min:  {r5:>7.1f} records/min")
+        print(f"  15 min: {r15:>7.1f} records/min")
+
+        if terminal_by_state:
+            print("\n  Per-state (last 5 min):")
+            label_map = {
+                "VALIDATED": "validated",
+                "VALIDATION_FAILED": "validation_failed",
+                "DISCOVERY_FAILED": "discovery_failed",
+                "COST_SKIPPED": "cost_skipped",
+            }
+            for state, label in label_map.items():
+                count = terminal_by_state.get(state, 0)
+                if count:
+                    print(f"    {label:.<26} {count / 5.0:>6.1f}/min")
+
+        if needs_zuhal and zuhal_rate > 0:
+            print(f"\n  Zuhal queue: {needs_zuhal:,} pending  ({zuhal_rate:.1f}/min draining)")
+
+    if pending > 0:
+        rate = r5 or r15 or r1
+        if rate > 0:
+            eta_min = pending / rate
+            if eta_min < 60:
+                eta_str = f"{eta_min:.0f} min"
+            elif eta_min < 1440:
+                eta_str = f"{eta_min / 60:.1f} hr"
+            else:
+                eta_str = f"{eta_min / 1440:.1f} days"
+            pending_detail = f"{fresh:,} fresh + {retry_backlog:,} retries" if retry_backlog else f"{pending:,}"
+            print(f"\nPending: {pending_detail}  →  ETA: {eta_str}")
         else:
-            eta_str = f"{eta_min / 1440:.1f} days"
-        print(f"\nThroughput (5 min): {rate_per_min:.1f} records/min")
-        print(f"Pending: {pending:,}  →  ETA: {eta_str}")
-    elif pending == 0:
+            print(f"\nPending: {pending:,}  (throughput window empty — ETA unavailable)")
+    else:
         print("\nAll records processed.")
 
     print()
