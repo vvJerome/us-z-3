@@ -68,10 +68,22 @@ async def test_wait_ssh_ready_detects_open_and_closed_ports():
     assert ready == []
 
 
+class _FakeClient:
+    """Minimal Cherry client for the teardown sweep: no orphans in the project."""
+    async def list_servers(self, project_id):
+        return []
+
+    async def delete_server(self, server_id):
+        return None
+
+
 class _FakeProv:
     def __init__(self, hosts):
         self._hosts = hosts
-        self.torn_down = False
+        self.torn_down = 0
+        self.region = "test-region"
+        self.project_id = 276330
+        self.client = _FakeClient()
 
     async def provision(self, count, key_ids, *, reserve_region=None):
         return self._hosts
@@ -80,11 +92,12 @@ class _FakeProv:
         pass
 
     async def teardown(self):
-        self.torn_down = True
+        self.torn_down += 1
         return [h.server_id for h in self._hosts]
 
 
-async def test_run_benchmark_tears_down_on_validation_failure(monkeypatch):
+async def test_run_benchmark_tears_down_on_validation_failure(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)   # keep output/ artifacts inside the tmp dir
     prov = _FakeProv([FleetHost(worker_id="w1", server_id=11, ip="1.2.3.4", region="r")])
     monkeypatch.setattr(benchmark, "wait_ssh_ready", lambda hosts, **k: _async(["1.2.3.4"]))
 
@@ -93,15 +106,17 @@ async def test_run_benchmark_tears_down_on_validation_failure(monkeypatch):
 
     monkeypatch.setattr(benchmark, "_run_validation", _boom)
     with pytest.raises(RuntimeError):
-        await run_benchmark(prov, count=1, key_ids=[1], input_path="x.jsonl")
-    assert prov.torn_down is True   # finally always tears the fleet down
+        await run_benchmark(prov, count=1, key_ids=[1], input_path="x.jsonl", name="t_fail")
+    assert prov.torn_down >= 1   # finally always tears the fleet down
 
 
-async def test_run_benchmark_raises_and_tears_down_when_no_workers(monkeypatch):
+async def test_run_benchmark_raises_and_tears_down_when_no_workers(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     prov = _FakeProv([])   # provisioned nothing
     with pytest.raises(RuntimeError):
-        await run_benchmark(prov, count=3, key_ids=[1], input_path="x.jsonl")
-    assert prov.torn_down is True
+        await run_benchmark(prov, count=3, key_ids=[1], input_path="x.jsonl", name="t_none",
+                            provision_retries=1, provision_retry_delay_s=0)
+    assert prov.torn_down >= 1
 
 
 def _async(value):

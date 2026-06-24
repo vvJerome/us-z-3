@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 import logging
 import os
 import sqlite3
@@ -87,6 +88,19 @@ class BenchmarkReport:
     @property
     def validated_pct(self) -> float | None:
         return _pct(self.validated, self.matched)
+
+    def as_dict(self) -> dict:
+        return {
+            "records": self.records, "matched": self.matched,
+            "has_ground_truth": self.has_ground_truth,
+            "record_state_distribution": self.state_dist,
+            "cherry_fleet_verdict_distribution": self.fleet_dist,
+            "bbops_verdict_distribution": self.bbops_dist,
+            "final_verdict_distribution": self.final_dist,
+            "validated": self.validated, "validated_pct": self.validated_pct,
+            "fleet_definitive": self.fleet_definitive, "fleet_attempted": self.fleet_attempted,
+            "decisive_accuracy_pct": self.decisive_accuracy_pct, "coverage_pct": self.coverage_pct,
+        }
 
     def render(self) -> str:
         base = self.matched if self.has_ground_truth else self.records
@@ -164,8 +178,66 @@ def summarize(db_path: str | Path, ground_truth_path: str | Path | None = None) 
     return rep
 
 
+def _attach_log_file(path: Path) -> logging.Handler:
+    """Tee every pipeline log record to a durable, per-record-flushed file (the run trail)."""
+    handler = logging.FileHandler(path)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root = logging.getLogger("pipeline")
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    return handler
+
+
+def _detach_log_file(handler: logging.Handler) -> None:
+    logging.getLogger("pipeline").removeHandler(handler)
+    handler.close()
+
+
+def _write_report(out_dir: Path, report: BenchmarkReport) -> None:
+    (out_dir / "benchmark_report.txt").write_text(report.render() + "\n")
+    (out_dir / "benchmark_report.json").write_text(json.dumps(report.as_dict(), indent=2))
+
+
+async def _teardown_fleet(prov: FleetProvisioner, name_prefix: str) -> list[int]:
+    """Inventory teardown PLUS a project sweep of any prefixed orphan (e.g. a stuck deploy)."""
+    deleted = list(await prov.teardown())
+    try:
+        for s in await prov.client.list_servers(prov.project_id):
+            sid = int(s.get("id", 0) or 0)
+            host = str(s.get("hostname", ""))
+            if sid and sid not in deleted and host.startswith(name_prefix):
+                await prov.client.delete_server(sid)
+                deleted.append(sid)
+                logger.warning("swept orphan server %s (%s)", sid, host)
+    except Exception:
+        logger.exception("orphan sweep failed (inventory teardown already done)")
+    return deleted
+
+
+async def _provision_with_retry(
+    prov: FleetProvisioner, count: int, key_ids: list[int], *,
+    reserve_region: str | None, retries: int, retry_delay_s: float, name_prefix: str,
+) -> list[FleetHost]:
+    """Provision `count`; tolerate a partial fleet, retry a 0-result (quota lag) a few times."""
+    for attempt in range(1, retries + 1):
+        hosts = await prov.provision(count, key_ids, reserve_region=reserve_region)
+        if hosts:
+            if len(hosts) < count:
+                logger.warning("provisioned %d/%d worker(s) — proceeding with a partial fleet",
+                               len(hosts), count)
+            return hosts
+        logger.warning("provisioned 0/%d (attempt %d/%d) — sweeping and %s",
+                       count, attempt, retries,
+                       "retrying" if attempt < retries else "giving up")
+        await _teardown_fleet(prov, name_prefix)
+        if attempt < retries:
+            await asyncio.sleep(retry_delay_s)
+    return []
+
+
 async def _run_validation(
-    input_path: str, hosts: list[FleetHost], name: str, *,
+    input_path: str, hosts: list[FleetHost], name: str, log_dir: Path, *,
     with_zuhal: bool, dispatch_concurrency: int | None,
 ) -> Path:
     cmd = [sys.executable, "-m", "pipeline", "run", "-i", input_path, "--name", name,
@@ -173,16 +245,20 @@ async def _run_validation(
     if dispatch_concurrency:
         cmd += ["--dispatch-concurrency", str(dispatch_concurrency)]
     env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"        # stream the child's logs live into validation.log
     if not with_zuhal:
-        env["ZUHAL_API_KEY"] = ""   # benchmark measures the SMTP fleet; paid rescue is orthogonal
+        env["ZUHAL_API_KEY"] = ""        # benchmark measures the SMTP fleet; paid rescue is orthogonal
     env["BACKUP_ENABLED"] = "false"
-    logger.info("validating %s across %d worker(s)", input_path, len(hosts))
-    proc = await asyncio.create_subprocess_exec(*cmd, env=env)
-    try:
-        rc = await proc.wait()
-    except asyncio.CancelledError:
-        proc.terminate()
-        raise
+    logger.info("validating %s across %d worker(s) — child logs → %s/validation.log",
+                input_path, len(hosts), log_dir)
+    with open(log_dir / "validation.log", "a") as logf:
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=logf, stderr=logf)
+        try:
+            rc = await proc.wait()
+        except asyncio.CancelledError:
+            proc.terminate()
+            await proc.wait()
+            raise
     logger.info("validation run exited rc=%s", rc)
     return Path("output") / name / "pipeline.db"
 
@@ -191,23 +267,48 @@ async def run_benchmark(
     prov: FleetProvisioner, *, count: int, key_ids: list[int], input_path: str,
     name: str = "fleet_benchmark", ground_truth: str | None = None,
     with_zuhal: bool = False, dispatch_concurrency: int | None = None,
-    reserve_region: str | None = None,
+    reserve_region: str | None = None, name_prefix: str = "cherry",
+    provision_retries: int = 3, provision_retry_delay_s: float = 120.0,
 ) -> BenchmarkReport:
-    """Provision `count` workers, validate `input_path`, and ALWAYS tear the fleet down."""
+    """Provision `count` workers, validate `input_path`, and ALWAYS tear the fleet down.
+
+    Self-contained: every phase is logged (and flushed) to output/<name>/benchmark.log,
+    the verdict report is written to benchmark_report.{txt,json}, and teardown runs in a
+    finally with a project orphan-sweep — so a crash or signal never leaks a server.
+    """
+    out_dir = Path("output") / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    handler = _attach_log_file(out_dir / "benchmark.log")
+    logger.info("=== benchmark start: input=%s count=%d region=%s name=%s ===",
+                input_path, count, prov.region, name)
     try:
-        hosts = await prov.provision(count, key_ids, reserve_region=reserve_region)
+        logger.info("[1/4] provisioning %d worker(s) in %s ...", count, prov.region)
+        hosts = await _provision_with_retry(
+            prov, count, key_ids, reserve_region=reserve_region,
+            retries=provision_retries, retry_delay_s=provision_retry_delay_s, name_prefix=name_prefix,
+        )
         if not hosts:
-            raise RuntimeError("provisioned 0 workers — check credit/quota/region")
+            raise RuntimeError(f"provisioned 0 workers after {provision_retries} attempt(s)")
         prov.write_inventory(hosts)
-        logger.info("provisioned %d worker(s): %s", len(hosts), [h.ip for h in hosts])
+        logger.info("fleet up: %s", [(h.worker_id, h.ip) for h in hosts])
+        logger.info("[2/4] waiting for sshd on %d worker(s) ...", len(hosts))
         ready = await wait_ssh_ready(hosts)
         missing = [h.ip for h in hosts if h.ip not in ready]
         if missing:
-            logger.warning("workers not ssh-ready in time (tunnel will retry): %s", missing)
+            logger.warning("sshd not ready on %s (tunnel autorestart will retry)", missing)
+        else:
+            logger.info("sshd ready on all %d worker(s)", len(hosts))
+        logger.info("[3/4] validating ...")
         db_path = await _run_validation(
-            input_path, hosts, name, with_zuhal=with_zuhal, dispatch_concurrency=dispatch_concurrency,
+            input_path, hosts, name, out_dir,
+            with_zuhal=with_zuhal, dispatch_concurrency=dispatch_concurrency,
         )
-        return summarize(db_path, ground_truth)
+        report = summarize(db_path, ground_truth)
+        _write_report(out_dir, report)
+        logger.info("report written to %s/benchmark_report.{txt,json}\n%s", out_dir, report.render())
+        return report
     finally:
-        deleted = await prov.teardown()
-        logger.info("teardown: deleted %d worker(s): %s", len(deleted), deleted)
+        logger.info("[4/4] tearing down fleet ...")
+        deleted = await _teardown_fleet(prov, name_prefix)
+        logger.info("=== benchmark done: torn down %d server(s): %s ===", len(deleted), deleted)
+        _detach_log_file(handler)
