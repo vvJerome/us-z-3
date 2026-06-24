@@ -15,7 +15,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
-from pipeline.constants import FLEET_AFFINITY_MAX
+from pipeline.constants import FLEET_AFFINITY_MAX, FLEET_DOMAIN_SEM_MAX
 from pipeline.fleet.balancer import WorkerLoad, pick_worker
 from pipeline.fleet.worker import FleetWorker
 from pipeline.models import BackendVerdict
@@ -49,9 +49,11 @@ class FleetManager:
         self._max_reroutes = max_reroutes
         self._on_outcome = on_outcome
         # Cap concurrent probes per RECIPIENT domain across the whole fleet so we don't trip
-        # provider rate limits (421 4.7.x). One semaphore per domain, created lazily.
+        # provider rate limits (421 4.7.x). One semaphore per domain, created lazily and kept
+        # in an LRU; _domain_active counts holders+waiters so eviction never drops a live gate.
         self._domain_concurrency = max(1, domain_concurrency)
-        self._domain_sems: dict[str, asyncio.Semaphore] = {}
+        self._domain_sems: OrderedDict[str, asyncio.Semaphore] = OrderedDict()
+        self._domain_active: dict[str, int] = {}
         # email -> worker_id: a greylisted record must retry from the same worker so the
         # (IP, MAIL FROM, RCPT) triplet matches and the greylist clears instead of re-deferring.
         # Bounded LRU so a long run can't grow it without limit (one entry per unique email).
@@ -104,12 +106,39 @@ class FleetManager:
     async def verify(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
         """Probe `email`, capped to domain_concurrency concurrent probes per recipient domain."""
         domain = email.rsplit("@", 1)[-1].lower()
+        sem = self._domain_gate(domain)
+        # Mark the domain in-use (holder or waiter) before any await so eviction can't drop it.
+        self._domain_active[domain] = self._domain_active.get(domain, 0) + 1
+        try:
+            async with sem:
+                return await self._verify_inner(email, mx_provider)
+        finally:
+            remaining = self._domain_active.get(domain, 1) - 1
+            if remaining <= 0:
+                self._domain_active.pop(domain, None)
+            else:
+                self._domain_active[domain] = remaining
+
+    def _domain_gate(self, domain: str) -> asyncio.Semaphore:
         sem = self._domain_sems.get(domain)
-        if sem is None:
-            sem = asyncio.Semaphore(self._domain_concurrency)
-            self._domain_sems[domain] = sem
-        async with sem:
-            return await self._verify_inner(email, mx_provider)
+        if sem is not None:
+            self._domain_sems.move_to_end(domain)
+            return sem
+        if len(self._domain_sems) >= FLEET_DOMAIN_SEM_MAX:
+            self._evict_idle_domain_gates()
+        sem = asyncio.Semaphore(self._domain_concurrency)
+        self._domain_sems[domain] = sem
+        return sem
+
+    def _evict_idle_domain_gates(self) -> None:
+        # Drop least-recently-used gates that nobody is holding or waiting on. Live gates
+        # (in _domain_active) are never evicted, so the map may briefly exceed the cap when
+        # every entry is in flight — bounded by dispatch concurrency, not by distinct domains.
+        for d in list(self._domain_sems):
+            if len(self._domain_sems) < FLEET_DOMAIN_SEM_MAX:
+                break
+            if d not in self._domain_active:
+                del self._domain_sems[d]
 
     async def _verify_inner(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
         """Probe `email` via the least-loaded healthy worker, rerouting on IP blocks."""

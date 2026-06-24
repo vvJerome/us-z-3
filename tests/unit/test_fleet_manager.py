@@ -144,3 +144,25 @@ async def test_affinity_cache_is_bounded(monkeypatch):
     for i in range(50):
         await mgr.verify(f"u{i}@b.com")
     assert len(mgr._affinity) <= 5
+
+
+async def test_domain_gate_map_is_bounded(monkeypatch):
+    # Sequential probes to distinct domains: each is idle once done, so the gate map
+    # stays within the cap instead of growing one entry per recipient domain.
+    monkeypatch.setattr(manager_mod, "FLEET_DOMAIN_SEM_MAX", 5)
+    mgr = FleetManager([_worker("w1", "valid")], domain_concurrency=2)
+    for i in range(50):
+        await mgr.verify(f"u@d{i}.com")
+    assert len(mgr._domain_sems) <= 5
+
+
+def test_evict_idle_domain_gates_keeps_live_gate(monkeypatch):
+    # An in-flight domain (holder/waiter) must never be evicted, even under cap pressure.
+    monkeypatch.setattr(manager_mod, "FLEET_DOMAIN_SEM_MAX", 3)
+    mgr = FleetManager([_worker("w1", "valid")], domain_concurrency=2)
+    for d in ("a.com", "b.com", "c.com", "d.com", "e.com"):
+        mgr._domain_sems[d] = asyncio.Semaphore(2)
+    mgr._domain_active["c.com"] = 1  # c.com has an in-flight probe
+    mgr._evict_idle_domain_gates()
+    assert "c.com" in mgr._domain_sems
+    assert len(mgr._domain_sems) <= 3

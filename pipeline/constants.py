@@ -58,6 +58,7 @@ TUNNEL_BACKOFF_MAX_S: float = 60.0
 # --- SMTP fleet (pipeline.fleet) ---
 FLEET_PTR_LOOKUP_TIMEOUT_S: float = 5.0   # cap the reverse-DNS lookup so a slow PTR can't block worker startup
 FLEET_AFFINITY_MAX: int = 100_000         # cap the per-email greylist-affinity map (LRU evict oldest)
+FLEET_DOMAIN_SEM_MAX: int = 10_000        # cap the per-recipient-domain semaphore map (evict idle LRU only)
 
 # --- Dispatcher ---
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
