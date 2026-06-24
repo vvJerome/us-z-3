@@ -53,3 +53,8 @@ output/
 
 # Enhancement-list working files (source spec, not part of the repo)
 Copy of Enrichment Engine Enhancement Lists*.csv
+improvements/
+alpha_combined.csv
+
+# Infrastructure-as-code lives in its own repo (github.com/alpharomercoma/vps-terraform)
+vps-terraform/
