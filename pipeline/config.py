@@ -24,6 +24,7 @@ class PipelineConfig(BaseSettings):
     output_dir: Path = Path("output")
     db_path: Path = Path("output/pipeline.db")
     log_dir: Path = Path("output/logs")
+    master_db: Path | None = None
 
     # --- Scope ---
     limit: int | None = None

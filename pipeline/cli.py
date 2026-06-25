@@ -46,6 +46,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output-dir", default=None, help="Override output directory")
     parser.add_argument("--db", default=None, help="Override SQLite database path")
     parser.add_argument("--log-dir", default=None, help="Override log directory")
+    parser.add_argument("--master-db", default=None, help="Master DB path — flush verified records here every 500 validations")
 
     # Scope
     parser.add_argument("--limit", type=int, default=None, help="Max records to process")

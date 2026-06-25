@@ -236,11 +236,53 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         metrics_task = asyncio.create_task(
             serve_metrics(conn, stop_event), name="metrics"
         )
+
+        if config.master_db:
+            from pipeline.ops.master_db import flush_from_pipeline_db
+
+            async def _master_db_flush_loop() -> None:
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(stop_event.wait()), timeout=60.0
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if stop_event.is_set():
+                        break
+                    try:
+                        ins, upd = await asyncio.to_thread(
+                            flush_from_pipeline_db, config.master_db, config.db_path
+                        )
+                        if ins or upd:
+                            logger.info(
+                                "Master DB flush: %d new, %d updated → %s",
+                                ins, upd, config.master_db,
+                            )
+                    except Exception as exc:
+                        logger.warning("Master DB flush failed: %s", exc)
+
+            tasks.append(asyncio.create_task(_master_db_flush_loop(), name="master-db-flush"))
+            logger.info("Master DB flush enabled — flushing every 500 records to %s", config.master_db)
+
         try:
             await asyncio.gather(*tasks)
         finally:
             stop_event.set()
             await metrics_task
+            # Final flush on shutdown
+            if config.master_db:
+                try:
+                    ins, upd = await asyncio.to_thread(
+                        flush_from_pipeline_db, config.master_db, config.db_path, flush_every=0
+                    )
+                    if ins or upd:
+                        logger.info(
+                            "Master DB final flush: %d new, %d updated → %s",
+                            ins, upd, config.master_db,
+                        )
+                except Exception as exc:
+                    logger.warning("Master DB final flush failed: %s", exc)
 
     except Exception:
         logger.exception("Pipeline error")
@@ -569,6 +611,8 @@ async def main() -> None:
     config_kwargs["output_dir"] = args.output_dir or str(base_dir)
     config_kwargs["db_path"] = args.db or str(base_dir / "pipeline.db")
     config_kwargs["log_dir"] = args.log_dir or str(base_dir / "logs")
+    if getattr(args, "master_db", None):
+        config_kwargs["master_db"] = args.master_db
     if name and not config_kwargs.get("run_id"):
         config_kwargs["run_id"] = name
 
