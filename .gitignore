@@ -26,6 +26,8 @@ runs/
 
 # Input data (large JSONL files)
 input/
+# Stray data dumps at repo root (PII); real datasets belong under input/
+/*.jsonl
 
 # Logs
 logs/
