@@ -35,6 +35,13 @@ python -m pipeline status --db output/run_20260430/pipeline.db --watch 5
 
 # Re-queue discovery failures for a retry
 python -m pipeline reset --db output/run_20260430/pipeline.db --status discovery_failed
+
+# Patient retry pass: re-queue ONLY the "couldn't verify" failures (timed out / no
+# answer), leaving definitive-invalid records terminal, then re-run the dispatcher
+# with a longer timeout + more attempts so greylisting holds get a fair retry.
+python -m pipeline reset --db output/<run>/pipeline.db --status validation_failed --unverified-only
+RACKNERD_SMTP_TIMEOUT_S=25 python -m pipeline run --consumer-only --cherry-enabled \
+  --name <run> --max-dispatch-attempts 5
 ```
 
 Via the orchestrator (wraps the pipeline with per-officer ID generation and output merging):

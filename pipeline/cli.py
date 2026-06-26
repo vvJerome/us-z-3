@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser.add_argument("--phase", default=None,
                               choices=["dns", "serper"],
                               help="Filter by failure phase")
+    reset_parser.add_argument("--unverified-only", action="store_true",
+                              help="With --status validation_failed: re-queue only failures "
+                                   "without a definitive verdict (timed-out/unverified) for a "
+                                   "patient retry pass; leave definitive-invalid records terminal")
     reset_parser.add_argument("--dry-run", action="store_true",
                               help="Print count without making changes")
 

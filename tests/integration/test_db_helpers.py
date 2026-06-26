@@ -63,6 +63,29 @@ class TestResetFailedRecords:
         async with conn.execute("SELECT record_state FROM records WHERE unique_id='IL-2'") as cur:
             assert (await cur.fetchone())[0] == "DISCOVERED"
 
+    async def test_reset_validation_failed_unverified_only(self, conn):
+        # unverified_only re-queues only "couldn't verify" failures (no definitive
+        # verdict); definitive-invalid records (final_verdict set) stay terminal.
+        await _insert(conn, "IL-INCONCLUSIVE", State.VALIDATION_FAILED)  # final_verdict NULL
+        await conn.execute(
+            "INSERT INTO records (unique_id, record_state, candidate_email, final_verdict) "
+            "VALUES (?, ?, ?, ?)",
+            ("IL-INVALID", State.VALIDATION_FAILED, "a@b.com", "invalid"),
+        )
+        await conn.commit()
+
+        n = await db.reset_failed_records(conn, State.VALIDATION_FAILED, unverified_only=True)
+
+        assert n == 1
+        async with conn.execute(
+            "SELECT record_state FROM records WHERE unique_id='IL-INCONCLUSIVE'"
+        ) as cur:
+            assert (await cur.fetchone())[0] == State.DISCOVERED
+        async with conn.execute(
+            "SELECT record_state FROM records WHERE unique_id='IL-INVALID'"
+        ) as cur:
+            assert (await cur.fetchone())[0] == State.VALIDATION_FAILED
+
 
 class TestZuhalQueueHelpers:
     async def test_count_and_has_pending_zuhal(self, conn):

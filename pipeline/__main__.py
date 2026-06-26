@@ -345,27 +345,26 @@ async def cmd_reset(args) -> None:
 
     conn = await db.init_db(db_path)
 
+    state_map = {
+        "discovery_failed": "DISCOVERY_FAILED",
+        "validation_failed": "VALIDATION_FAILED",
+        "cost_skipped": "COST_SKIPPED",
+    }
+    state = state_map.get(args.status, args.status.upper())
+    unverified_only = getattr(args, "unverified_only", False)
+
     if args.dry_run:
-        state_map = {
-            "discovery_failed": "DISCOVERY_FAILED",
-            "validation_failed": "VALIDATION_FAILED",
-            "cost_skipped": "COST_SKIPPED",
-        }
-        state = state_map.get(args.status, args.status.upper())
-        async with conn.execute(
-            "SELECT COUNT(*) FROM records WHERE record_state = ?", (state,)
-        ) as cursor:
+        sql = "SELECT COUNT(*) FROM records WHERE record_state = ?"
+        if unverified_only:
+            sql += " AND final_verdict IS NULL"
+        async with conn.execute(sql, (state,)) as cursor:
             row = await cursor.fetchone()
             count = row[0] if row else 0
         print(f"Would re-queue {count} records with status '{args.status}'")
     else:
-        state_map = {
-            "discovery_failed": "DISCOVERY_FAILED",
-            "validation_failed": "VALIDATION_FAILED",
-            "cost_skipped": "COST_SKIPPED",
-        }
-        state = state_map.get(args.status, args.status.upper())
-        count = await db.reset_failed_records(conn, state, args.phase)
+        count = await db.reset_failed_records(
+            conn, state, args.phase, unverified_only=unverified_only
+        )
         print(f"Re-queued {count} records")
 
     await conn.close()
