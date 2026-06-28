@@ -87,7 +87,7 @@ class TestInitDb:
                 cols = {r[1] for r in await cur.fetchall()}
             assert "owner_confidence" in cols
             async with conn.execute("PRAGMA user_version") as cur:
-                assert (await cur.fetchone())[0] == 11
+                assert (await cur.fetchone())[0] == 13
             # Existing row survived the migration; new column defaults to NULL.
             async with conn.execute(
                 "SELECT owner_confidence FROM records WHERE unique_id = 'r1'"
@@ -547,3 +547,269 @@ class TestProcessTrace:
         assert len(trace) == 2
         assert trace[0]["stage"] == "stage1"
         assert trace[1]["stage"] == "stage2"
+
+
+class TestRequeueRecord:
+    """Test requeue_record infra_type counter tracking."""
+
+    async def _insert(self, conn: aiosqlite.Connection, uid: str) -> None:
+        await conn.execute(
+            "INSERT INTO records (unique_id, record_state, candidate_emails) VALUES (?, ?, ?)",
+            (uid, State.VALIDATING, '["x@y.com"]'),
+        )
+        await conn.commit()
+
+    async def test_requeue_increments_requeue_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False)
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 0
+        assert row["bbops_requeue_count"] == 0
+
+    async def test_requeue_tunnel_type_increments_tunnel_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="tunnel")
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 1
+        assert row["bbops_requeue_count"] == 0
+
+    async def test_requeue_bbops_type_increments_bbops_count(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="bbops")
+        async with test_db.execute(
+            "SELECT requeue_count, tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["requeue_count"] == 1
+        assert row["tunnel_requeue_count"] == 0
+        assert row["bbops_requeue_count"] == 1
+
+    async def test_tunnel_and_bbops_counts_are_independent(self, test_db):
+        await self._insert(test_db, "r1")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="tunnel")
+        await db.requeue_record(test_db, "r1", increment_attempts=False, infra_type="bbops")
+        async with test_db.execute(
+            "SELECT tunnel_requeue_count, bbops_requeue_count FROM records WHERE unique_id = ?",
+            ("r1",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["tunnel_requeue_count"] == 1
+        assert row["bbops_requeue_count"] == 1
+
+
+class TestFailureReason:
+    """Test that update_record_dual and update_record_status write failure_reason."""
+
+    async def test_update_record_status_sets_failure_reason(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            ("r1", State.VALIDATING),
+        )
+        await test_db.commit()
+        await db.update_record_status(test_db, "r1", State.VALIDATION_FAILED, failure_reason="infra_loop")
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "infra_loop"
+
+    async def test_update_record_dual_sets_failure_reason_none_does_not_overwrite(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state, failure_reason) VALUES (?, ?, ?)",
+            ("r2", State.VALIDATING, "infra_loop"),
+        )
+        await test_db.commit()
+        await db.update_record_dual(
+            test_db,
+            "r2",
+            State.VALIDATION_FAILED,
+            racknerd_status="invalid",
+            racknerd_message="550",
+            racknerd_verified_at=None,
+            bbops_status="invalid",
+            bbops_message="550",
+            bbops_verified_at=None,
+            final_verdict="invalid",
+            failure_reason=None,
+        )
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r2",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "infra_loop"
+
+    async def test_update_record_dual_sets_failure_reason(self, test_db):
+        await test_db.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            ("r1", State.VALIDATING),
+        )
+        await test_db.commit()
+        await db.update_record_dual(
+            test_db,
+            "r1",
+            State.VALIDATION_FAILED,
+            racknerd_status="invalid",
+            racknerd_message="550",
+            racknerd_verified_at=None,
+            bbops_status="invalid",
+            bbops_message="550",
+            bbops_verified_at=None,
+            final_verdict="invalid",
+            failure_reason="max_attempts",
+        )
+        async with test_db.execute(
+            "SELECT failure_reason FROM records WHERE unique_id = ?", ("r1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["failure_reason"] == "max_attempts"
+
+
+class TestZuhalJobs:
+    """Test zuhal_jobs audit table helpers."""
+
+    async def test_create_zuhal_job_persists_row(self, test_db):
+        await db.create_zuhal_job(test_db, "job_abc123", 500)
+        async with test_db.execute(
+            "SELECT job_id, email_count, status, completed_at FROM zuhal_jobs WHERE job_id = ?",
+            ("job_abc123",),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["job_id"] == "job_abc123"
+        assert row["email_count"] == 500
+        assert row["status"] == "polling"
+        assert row["completed_at"] is None
+
+    async def test_update_zuhal_job_status_complete(self, test_db):
+        await db.create_zuhal_job(test_db, "job_xyz", 100)
+        await db.update_zuhal_job_status(test_db, "job_xyz", "complete")
+        async with test_db.execute(
+            "SELECT status, completed_at FROM zuhal_jobs WHERE job_id = ?", ("job_xyz",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["status"] == "complete"
+        assert row["completed_at"] is not None
+
+    async def test_update_zuhal_job_status_failed(self, test_db):
+        await db.create_zuhal_job(test_db, "job_fail", 50)
+        await db.update_zuhal_job_status(test_db, "job_fail", "failed")
+        async with test_db.execute(
+            "SELECT status, completed_at FROM zuhal_jobs WHERE job_id = ?", ("job_fail",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["status"] == "failed"
+        assert row["completed_at"] is not None
+
+    async def test_create_zuhal_job_idempotent(self, test_db):
+        await db.create_zuhal_job(test_db, "job_dup", 10)
+        await db.create_zuhal_job(test_db, "job_dup", 10)
+        async with test_db.execute(
+            "SELECT COUNT(*) FROM zuhal_jobs WHERE job_id = ?", ("job_dup",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row[0] == 1
+
+
+class TestEmailVerificationCache:
+    """Test email_verification_cache lookup and write helpers."""
+
+    async def test_lookup_returns_none_when_not_cached(self, test_db):
+        result = await db.lookup_email_cache(test_db, "unknown@example.com")
+        assert result is None
+
+    async def test_write_and_lookup_returns_verdict(self, test_db):
+        await db.write_email_cache(test_db, "test@example.com", "valid", "zuhal")
+        result = await db.lookup_email_cache(test_db, "test@example.com")
+        assert result == "valid"
+
+    async def test_lookup_is_case_insensitive(self, test_db):
+        await db.write_email_cache(test_db, "Test@Example.COM", "catch_all", "zuhal")
+        assert await db.lookup_email_cache(test_db, "test@example.com") == "catch_all"
+        assert await db.lookup_email_cache(test_db, "TEST@EXAMPLE.COM") == "catch_all"
+
+    async def test_write_overwrites_existing(self, test_db):
+        await db.write_email_cache(test_db, "x@y.com", "invalid", "zuhal")
+        await db.write_email_cache(test_db, "x@y.com", "valid", "zuhal")
+        result = await db.lookup_email_cache(test_db, "x@y.com")
+        assert result == "valid"
+
+
+class TestVerifierAgreement:
+    """Test that update_record_dual persists verifier_agreement correctly."""
+
+    async def _insert_validating(self, conn, unique_id: str) -> None:
+        await conn.execute(
+            "INSERT INTO records (unique_id, record_state) VALUES (?, ?)",
+            (unique_id, State.VALIDATING),
+        )
+        await conn.commit()
+
+    async def test_verifier_agreement_written_when_provided(self, test_db):
+        await self._insert_validating(test_db, "va1")
+        await db.update_record_dual(
+            test_db, "va1", State.VALIDATED,
+            racknerd_status="valid", racknerd_message="250 ok", racknerd_verified_at=None,
+            bbops_status="valid", bbops_message="ok", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="a@b.com",
+            verifier_agreement="both",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va1",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "both"
+
+    async def test_verifier_agreement_null_when_omitted(self, test_db):
+        await self._insert_validating(test_db, "va2")
+        await db.update_record_dual(
+            test_db, "va2", State.VALIDATION_FAILED,
+            racknerd_status="invalid", racknerd_message="550", racknerd_verified_at=None,
+            bbops_status="invalid", bbops_message="550", bbops_verified_at=None,
+            final_verdict="invalid",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va2",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] is None
+
+    async def test_verifier_agreement_racknerd_only(self, test_db):
+        await self._insert_validating(test_db, "va3")
+        await db.update_record_dual(
+            test_db, "va3", State.VALIDATED,
+            racknerd_status="valid", racknerd_message="250 ok", racknerd_verified_at=None,
+            bbops_status="not_run", bbops_message="skipped", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="c@d.com",
+            verifier_agreement="racknerd_only",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va3",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "racknerd_only"
+
+    async def test_verifier_agreement_zuhal_only(self, test_db):
+        await self._insert_validating(test_db, "va4")
+        await db.update_record_dual(
+            test_db, "va4", State.VALIDATED,
+            racknerd_status="invalid", racknerd_message="550", racknerd_verified_at=None,
+            bbops_status="invalid", bbops_message="550", bbops_verified_at=None,
+            final_verdict="valid", candidate_email="e@f.com",
+            zuhal_status_override="valid",
+            verifier_agreement="zuhal_only",
+        )
+        async with test_db.execute(
+            "SELECT verifier_agreement FROM records WHERE unique_id = ?", ("va4",)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["verifier_agreement"] == "zuhal_only"

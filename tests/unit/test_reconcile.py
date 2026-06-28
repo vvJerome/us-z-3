@@ -2,7 +2,7 @@
 
 import pytest
 
-from pipeline.dispatcher import reconcile
+from pipeline.dispatcher import reconcile, _verifier_agreement
 from pipeline.models import BackendVerdict
 
 
@@ -85,3 +85,26 @@ class TestReconcileOrOfValids:
         result = reconcile(None, None)
         assert result.final_verdict == "unknown"
         assert result.should_write is False
+
+
+class TestVerifierAgreement:
+    def test_both_valid(self):
+        assert _verifier_agreement("valid", "valid") == "both"
+
+    def test_racknerd_valid_bbops_invalid(self):
+        assert _verifier_agreement("valid", "invalid") == "racknerd_only"
+
+    def test_bbops_valid_racknerd_not_run(self):
+        assert _verifier_agreement("not_run", "valid") == "bbops_only"
+
+    def test_racknerd_catch_all_bbops_not_run(self):
+        assert _verifier_agreement("catch_all", "not_run") == "racknerd_only"
+
+    def test_both_catch_all(self):
+        assert _verifier_agreement("catch_all", "catch_all") == "both"
+
+    def test_both_invalid_returns_unknown(self):
+        assert _verifier_agreement("invalid", "invalid") == "unknown"
+
+    def test_racknerd_error_bbops_valid(self):
+        assert _verifier_agreement("error", "valid") == "bbops_only"

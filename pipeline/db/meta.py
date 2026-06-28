@@ -112,6 +112,45 @@ async def get_status_summary(conn: aiosqlite.Connection) -> dict:
     ) as cursor:
         summary["records_by_verdict"] = {row[0]: row[1] async for row in cursor}
 
+    # Rolling throughput across three windows
+    _TERMINAL = "('VALIDATED', 'VALIDATION_FAILED', 'COST_SKIPPED', 'DISCOVERY_FAILED')"
+    for minutes, key in ((1, "terminal_last_1min"), (5, "terminal_last_5min"), (15, "terminal_last_15min")):
+        async with conn.execute(
+            f"SELECT COUNT(*) FROM records"
+            f" WHERE record_state IN {_TERMINAL}"
+            f" AND updated_at >= datetime('now', '-{minutes} minutes')"
+        ) as cursor:
+            row = await cursor.fetchone()
+            summary[key] = row[0] if row else 0
+
+    # Per-state terminal rate (last 5 min)
+    async with conn.execute(
+        f"SELECT record_state, COUNT(*) FROM records"
+        f" WHERE record_state IN {_TERMINAL}"
+        f" AND updated_at >= datetime('now', '-5 minutes')"
+        f" GROUP BY record_state"
+    ) as cursor:
+        summary["terminal_by_state_5min"] = {row[0]: row[1] async for row in cursor}
+
+    # Zuhal queue drain rate (last 5 min)
+    async with conn.execute(
+        "SELECT COUNT(*) FROM records"
+        " WHERE record_state IN ('VALIDATED', 'VALIDATION_FAILED')"
+        " AND zuhal_status NOT IN ('dual_valid', 'dual_catch_all', 'dual_invalid', 'ms_valid')"
+        " AND zuhal_status IS NOT NULL"
+        " AND updated_at >= datetime('now', '-5 minutes')"
+    ) as cursor:
+        row = await cursor.fetchone()
+        summary["zuhal_terminal_last_5min"] = row[0] if row else 0
+
+    # Retry backlog: DISCOVERED records already attempted at least once
+    async with conn.execute(
+        "SELECT COUNT(*) FROM records"
+        " WHERE record_state = 'DISCOVERED' AND dispatch_attempts > 0"
+    ) as cursor:
+        row = await cursor.fetchone()
+        summary["retry_backlog"] = row[0] if row else 0
+
     return summary
 
 

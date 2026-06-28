@@ -33,6 +33,7 @@ def compute_confidence_score(
     strategy: str,
     verdict: str,
     agent_name: str = "",
+    domain_match_score: float | None = None,
 ) -> int:
     """Return an additive confidence score 0–4 for a validated email.
 
@@ -67,6 +68,15 @@ def compute_confidence_score(
             score += 1
         if verdict == "valid":
             score += 1
+
+    # Cap score when the discovered domain is a weak match for the business name.
+    # Thresholds are intentionally loose (<0.2 / <0.5) because abbreviation domains
+    # (ncrg.com for "NC Restaurant Group") score ~0.25–0.38 and should not be hard-penalized.
+    if domain_match_score is not None:
+        if domain_match_score < 0.2:
+            score = min(score, 1)   # truly unrelated domain → force low
+        elif domain_match_score < 0.5:
+            score = min(score, 2)   # weak match → cap at medium
 
     return score
 

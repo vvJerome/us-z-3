@@ -215,10 +215,35 @@ class ZuhalDispatcher:
         if not emails:
             return len(no_email_rows)
 
+        # Apply cached verdicts immediately — no upload needed for these
+        cached_hits: dict[str, str] = {}
+        for e in emails:
+            verdict = await db.lookup_email_cache(self.conn, e.lower())
+            if verdict is not None:
+                cached_hits[e.lower()] = verdict
+
+        for email_lower, verdict in cached_hits.items():
+            row = id_by_email[email_lower]
+            trace_entry = {"stage": "zuhal_fallback", "outcome": verdict, "cache_hit": True, "email": email_lower}
+            await self._apply_verdict(row, verdict, bulk=True, trace_entry=trace_entry)
+
+        emails = [e for e in emails if e.lower() not in cached_hits]
+        id_by_email = {k: v for k, v in id_by_email.items() if k not in cached_hits}
+
+        if not emails:
+            return len(cached_hits) + len(no_email_rows)
+
         unique_ids = list(id_by_email.values())
 
         async def _heartbeat() -> None:
             await db.touch_zuhal_validating(self.conn, [r["unique_id"] for r in unique_ids])
+
+        _job_id: list[str] = []
+
+        async def _on_job_created(job_id: str) -> None:
+            _job_id.append(job_id)
+            async with self._write_lock:
+                await db.create_zuhal_job(self.conn, job_id, len(emails))
 
         try:
             verdicts = await self.zuhal.bulk_validate(
@@ -226,6 +251,7 @@ class ZuhalDispatcher:
                 poll_interval_s=self.config.zuhal_bulk_poll_interval_s,
                 max_poll_minutes=self.config.zuhal_bulk_stale_timeout_minutes,
                 on_poll=_heartbeat,
+                on_job_created=_on_job_created,
             )
         except PipelineHaltError:
             raise
@@ -256,6 +282,13 @@ class ZuhalDispatcher:
         for email_lower, row in id_by_email.items():
             status = verdicts.get(email_lower, "unknown")
             await self._apply_verdict(row, status, bulk=True)
+            if status in ("valid", "catch_all", "invalid"):
+                async with self._write_lock:
+                    await db.write_email_cache(self.conn, email_lower, status, "zuhal")
+
+        if _job_id:
+            async with self._write_lock:
+                await db.update_zuhal_job_status(self.conn, _job_id[0], "complete")
 
         self.stats["bulk_batches"] += 1
         processed = len(emails) + len(no_email_rows)
@@ -283,6 +316,13 @@ class ZuhalDispatcher:
             async with self._write_lock:
                 await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
             self.stats["cost_skipped"] += 1
+            return
+
+        cached = await db.lookup_email_cache(self.conn, email)
+        if cached is not None:
+            logger.debug("Zuhal cache hit for %s (%s) — skipping API call", email, cached)
+            trace_entry = {"stage": "zuhal_fallback", "outcome": cached, "cache_hit": True, "email": email}
+            await self._apply_verdict(row, cached, bulk=False, trace_entry=trace_entry)
             return
 
         t0 = time.monotonic()
@@ -323,6 +363,9 @@ class ZuhalDispatcher:
         trace_entry = {"stage": "zuhal_fallback", "outcome": status, "ms": elapsed_ms, "email": email}
 
         self.cost_tracker.record_call("zuhal")
+        if status in ("valid", "catch_all", "invalid"):
+            async with self._write_lock:
+                await db.write_email_cache(self.conn, email, status, "zuhal")
         await self._apply_verdict(row, status, bulk=False, trace_entry=trace_entry)
 
     async def _fail_batch(self, rows: list[aiosqlite.Row], log_msg: str, *args: object) -> int:
@@ -378,7 +421,7 @@ class ZuhalDispatcher:
         # which requeue_zuhal never advanced, so it never closed. ZeroBounce handles unknowns.
         terminal = status in ("valid", "catch_all")
         record_state = State.VALIDATED if terminal else State.VALIDATION_FAILED
-        score = compute_confidence_score(email, candidate_domain, strategy, status, agent_name)
+        score = compute_confidence_score(email, candidate_domain, strategy, status, agent_name, domain_match_score=row["domain_match_score"])
 
         if trace_entry is None:
             trace_entry = {"stage": "zuhal_fallback", "outcome": status, "bulk": bulk, "email": email}
@@ -399,6 +442,7 @@ class ZuhalDispatcher:
                 confidence_score=float(score),
                 zuhal_status_override=status,
                 dispatch_attempts_delta=0,
+                verifier_agreement="zuhal_only" if terminal else None,
             )
             await db.append_process_trace(self.conn, unique_id, trace_entry)
 

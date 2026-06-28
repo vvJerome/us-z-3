@@ -13,6 +13,7 @@ from pipeline._dispatch_helpers import (
     record_pattern,
     GENERIC_PREFIXES,
 )
+from pipeline.utils.text import domain_match_score
 
 
 class TestCatchAllConfidenceFloor:
@@ -224,3 +225,85 @@ class TestRecordPattern:
              patch("pipeline._dispatch_helpers.db.record_pattern_result", new_callable=AsyncMock) as mock_db:
             await record_pattern(conn, "john.doe@acme.com", "john", "doe", "acme.com", "google", success=True)
             mock_db.assert_called_once_with(conn, "google", "{first}.{last}", success=True)
+
+
+class TestDomainMatchScore:
+    def test_exact_match(self):
+        assert domain_match_score("Smith Plumbing LLC", "smithplumbing.com") == 1.0
+
+    def test_partial_match_above_zero(self):
+        score = domain_match_score("Smith Plumbing LLC", "smithelectrical.com")
+        assert score > 0.0  # shares "smith"
+
+    def test_unrelated_domain_is_low(self):
+        score = domain_match_score("Smith Plumbing LLC", "yelp.com")
+        assert score < 0.2
+
+    def test_abbreviation_domain_nonzero(self):
+        # "NC Restaurant Group" → "ncrg.com" — abbreviation, fuzzy gives ~0.25
+        score = domain_match_score("NC Restaurant Group", "ncrg.com")
+        assert score > 0.0  # not zero — fuzzy picks up partial signal
+
+    def test_dns_hit_gets_full_score(self):
+        assert domain_match_score("Acme Corp", "acmecorp.com") == 1.0
+
+    def test_www_prefix_stripped(self):
+        assert domain_match_score("Smith Plumbing LLC", "www.smithplumbing.com") == 1.0
+
+    def test_empty_inputs_return_zero(self):
+        assert domain_match_score("", "acme.com") == 0.0
+        assert domain_match_score("Acme Corp", "") == 0.0
+
+
+class TestDomainMatchScoreCap:
+    def test_truly_unrelated_domain_caps_to_low(self):
+        # score < 0.2 → force low tier (≤ 1)
+        score = compute_confidence_score(
+            "john.smith@yelp.com",
+            "yelp.com",
+            strategy="with",
+            verdict="valid",
+            agent_name="John Smith",
+            domain_match_score=0.05,
+        )
+        assert score <= 1
+
+    def test_weak_match_caps_to_medium(self):
+        # 0.2 ≤ score < 0.5 → cap at medium (≤ 2)
+        score = compute_confidence_score(
+            "john.smith@smithelectrical.com",
+            "smithelectrical.com",
+            strategy="with",
+            verdict="valid",
+            agent_name="John Smith",
+            domain_match_score=0.35,
+        )
+        assert score <= 2
+
+    def test_strong_match_no_cap(self):
+        score = compute_confidence_score(
+            "john.smith@smithplumbing.com",
+            "smithplumbing.com",
+            strategy="with",
+            verdict="valid",
+            agent_name="John Smith",
+            domain_match_score=1.0,
+        )
+        assert score >= 3
+
+    def test_none_match_score_no_cap(self):
+        # Old records with NULL domain_match_score must not be penalized
+        score = compute_confidence_score(
+            "john.smith@smithplumbing.com",
+            "smithplumbing.com",
+            strategy="with",
+            verdict="valid",
+            agent_name="John Smith",
+            domain_match_score=None,
+        )
+        assert score >= 3
+
+    def test_abbreviation_domain_at_most_medium(self):
+        # ~0.25 fuzzy score for abbreviation → medium cap at worst, not low
+        score_raw = domain_match_score("NC Restaurant Group", "ncrg.com")
+        assert score_raw >= 0.2  # avoids the hard low-tier cap

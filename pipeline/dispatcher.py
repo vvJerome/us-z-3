@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -11,6 +12,8 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
+    INFRA_RETRY_BASE_MINUTES,
+    INFRA_RETRY_MULTIPLIER,
     HEARTBEAT_INTERVAL_S,
     NOTIFY_POLL_TIMEOUT_S,
 )
@@ -45,6 +48,27 @@ from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests
 )
 
 logger = logging.getLogger("pipeline.dispatcher")
+
+
+
+def _infra_retry_after(requeue_count: int) -> str:
+    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
+    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
+    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _verifier_agreement(rk: str, bb: str) -> str:
+    rk_ok = rk in ("valid", "catch_all")
+    bb_ok = bb in ("valid", "catch_all")
+    if rk_ok and bb_ok:
+        return "both"
+    if rk_ok:
+        return "racknerd_only"
+    if bb_ok:
+        return "bbops_only"
+    return "unknown"
+
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +126,9 @@ class Dispatcher:
             "requeued": 0,
             "handed_off_to_zuhal": 0,
         }
+        # MS probe health tracking: warn when error rate exceeds threshold
+        self._ms_total: int = 0
+        self._ms_errors: int = 0
 
     async def run(self) -> None:
         base_interval = self.config.dispatch_poll_interval_s
@@ -183,11 +210,12 @@ class Dispatcher:
                 return
             await self._process_record(row)
 
-    async def _fail(self, unique_id: str, reason: str, *args: object) -> None:
+    async def _fail(self, unique_id: str, reason: str, *args: object, failure_reason: str | None = None) -> None:
         """Terminal VALIDATION_FAILED write + stats bump. `reason` is a %-format string."""
         logger.warning("Record %s: " + reason + " — marking VALIDATION_FAILED", unique_id, *args)
         async with self._write_lock:
-            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED)
+            kw: dict[str, object] = {} if failure_reason is None else {"failure_reason": failure_reason}
+            await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED, **kw)
         self.stats["validation_failed"] += 1
 
     async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
@@ -202,7 +230,8 @@ class Dispatcher:
             await self._fail(unique_id, "hit max dispatch attempts (%d)", attempts)
             return None
         if requeues >= self.config.max_requeue_count:
-            await self._fail(unique_id, "hit max requeue count (%d)", requeues)
+            fr = "infra_loop" if (row["dispatch_attempts"] or 0) == 0 else "max_attempts"
+            await self._fail(unique_id, "hit max requeue count (%d)", requeues, failure_reason=fr)
             return None
         raw_candidates = row["candidate_emails"]
         if not raw_candidates:
@@ -230,6 +259,7 @@ class Dispatcher:
         mx_provider: str | None,
         log_msg: str,
         *log_args: object,
+        verifier_agreement: str | None = None,
     ) -> None:
         """Single VALIDATED write path: dual-verdict + trace flush + pattern learning + stats + log."""
         async with self._write_lock:
@@ -247,6 +277,7 @@ class Dispatcher:
                 candidate_email=email,
                 confidence_score=float(score),
                 dispatch_attempts_delta=attempts_delta,
+                verifier_agreement=verifier_agreement,
             )
             await db.flush_process_trace(self.conn, unique_id, pending_trace)
         await record_pattern(self.conn, email, first, last, candidate_domain, mx_provider, success=True)
@@ -326,6 +357,8 @@ class Dispatcher:
         strategy = row["strategy"] or "without"
         agent_name = row["agent_name"] or ""
         domain_confidence = row["domain_confidence"]
+        tunnel_requeue_count = row["tunnel_requeue_count"] or 0
+        bbops_requeue_count = row["bbops_requeue_count"] or 0
         _first, _, _last = parse_name(agent_name)
         use_ms_probe = is_microsoft_mx(mx_provider)
         serper_enriched = bool(row["serper_enriched"])
@@ -347,6 +380,7 @@ class Dispatcher:
         i = 0
         last_rk: BackendVerdict | None = None
         last_bb: BackendVerdict | None = None
+        any_real_test = False  # True when any candidate got a definitive backend verdict
 
         while i < len(candidates):
             email = candidates[i]
@@ -382,6 +416,7 @@ class Dispatcher:
                         0,  # MS probe is free, don't count against dispatch_attempts
                         pending_trace, _first, _last, candidate_domain, mx_provider,
                         "MS-validated (no SMTP): %s → %s", unique_id, email,
+                        verifier_agreement="ms_only",
                     )
                     return
 
@@ -426,18 +461,25 @@ class Dispatcher:
                     1,
                     pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Racknerd-validated (bbops skipped): %s → %s", unique_id, email,
+                    verifier_agreement="racknerd_only",
                 )
                 return
 
-            # Tunnel down: pure infra, re-queue without burning dispatch_attempts
+            # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
             if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
-                async with self._write_lock:
-                    await db.requeue_record(
-                        self.conn, unique_id, increment_attempts=False, retry_after=None
-                    )
-                self.stats["requeued"] += 1
-                logger.debug("Re-queued %s (SSH tunnel not up)", unique_id)
-                return
+                if tunnel_requeue_count < self.config.max_tunnel_requeues:
+                    retry_after = _infra_retry_after(tunnel_requeue_count)
+                    async with self._write_lock:
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=False,
+                            retry_after=retry_after, infra_type="tunnel",
+                        )
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (SSH tunnel not up, retry after %s)", unique_id, retry_after)
+                    return
+                # Tunnel limit reached — treat as not_run and proceed bbops-only
+                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at="")
+                logger.debug("Tunnel requeue limit hit for %s — proceeding bbops-only", unique_id)
 
             # Racknerd gave blocked/error/invalid — run bbops
             t_bb = time.monotonic()
@@ -455,7 +497,29 @@ class Dispatcher:
             })
             last_bb = bb_verdict
 
+            # bbops error: apply per-infra requeue budget (only when no Zuhal fallback;
+            # with Zuhal configured, handle_inconclusive owns the error/unknown path)
+            if bb_verdict.status == "error" and self.zuhal is None:
+                if bbops_requeue_count < self.config.max_bbops_requeues:
+                    retry_after = _infra_retry_after(bbops_requeue_count)
+                    async with self._write_lock:
+                        await db.requeue_record(
+                            self.conn, unique_id, increment_attempts=False,
+                            retry_after=retry_after, infra_type="bbops",
+                        )
+                    self.stats["requeued"] += 1
+                    logger.debug("Re-queued %s (bbops error, retry after %s)", unique_id, retry_after)
+                    return
+                # bbops budget exhausted — count rk verdict if definitive, skip to next candidate
+                if rk_verdict.status in DEFINITIVE:
+                    any_real_test = True
+                logger.debug("bbops requeue limit hit for %s — skipping candidate %s", unique_id, email)
+                continue
+
             result = reconcile(rk_verdict, bb_verdict)
+
+            if rk_verdict.status in DEFINITIVE or bb_verdict.status in DEFINITIVE:
+                any_real_test = True
 
             # Disagreement detection (only when both gave definitive verdicts)
             if (
@@ -494,6 +558,7 @@ class Dispatcher:
                     pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Validated %s → %s [rk=%s bb=%s]",
                     unique_id, email, rk_verdict.status, bb_verdict.status,
+                    verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
                 )
                 return
 
@@ -538,6 +603,12 @@ class Dispatcher:
             return
 
         # All candidates exhausted — write last SMTP verdicts so we know what ran
+        if last_rk and last_rk.status == "blocked":
+            failure_reason = "provider_blocked"
+        elif not any_real_test:
+            failure_reason = "infra_loop"
+        else:
+            failure_reason = "max_attempts"
         async with self._write_lock:
             await db.update_record_dual(
                 self.conn,
@@ -550,10 +621,11 @@ class Dispatcher:
                 bbops_message=last_bb.message if last_bb else None,
                 bbops_verified_at=last_bb.verified_at if last_bb else None,
                 final_verdict="invalid",
+                failure_reason=failure_reason,
             )
             await db.flush_process_trace(self.conn, unique_id, pending_trace)
         self.stats["validation_failed"] += 1
-        logger.debug("All candidates failed for %s", unique_id)
+        logger.debug("All candidates failed for %s (failure_reason=%s)", unique_id, failure_reason)
 
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
