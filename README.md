@@ -17,8 +17,6 @@ Given a list of businesses from public filing records, this pipeline:
 4. **Escalates unresolved records** — uses paid third-party verifiers only when free methods are inconclusive
 5. **Learns from every outcome** — feeds results back into ranking so future runs get smarter and cheaper
 
-At 300k records, typical cost is ~$300 in Serper credits plus $15–75 in Zuhal rescue credits depending on how many records both SMTP backends reject. Microsoft and DNS probes are free. bbops is a fixed contract cost.
-
 ---
 
 ## Infrastructure Overview
@@ -49,7 +47,7 @@ At 300k records, typical cost is ~$300 in Serper credits plus $15–75 in Zuhal 
 ```
 
 **Why Hetzner for the pipeline, Cherry Servers for SMTP:**
-The pipeline code runs on Hetzner (€39/month bare metal — stable, always-on). All SMTP probes exit through Cherry Servers, whose IP addresses have clean reputations — mail servers accept connections from them. Hetzner's own IP is never exposed to mail servers.
+The pipeline code runs on Hetzner. All SMTP probes exit through Cherry Servers, whose IP addresses have clean reputations — mail servers accept connections from them. Hetzner's own IP is never exposed to mail servers.
 
 > **Cherry Servers fleet** (`feat/cherry-fleet-migration`) is implemented and in alpha testing. It provisions, monitors, and tears down Cherry egress workers automatically via the Cherry Servers API. See [Cherry Fleet](#cherry-servers-smtp-fleet-alpha) below.
 
@@ -180,9 +178,9 @@ Cost ceiling hit before Zuhal → COST_SKIPPED
 
 ---
 
-## Key Enhancements (June 2026)
+## Key Enhancements
 
-### Domain & Identity Confidence (Jerome)
+### Domain & Identity Confidence
 
 **Business-to-domain confidence scoring** — Every discovered domain gets a `domain_confidence` score (0.0–1.0) computed from word overlap and fuzzy matching between the business name and the domain. DNS hits start at high confidence. Serper hits are scored — a weak match caps the record's `confidence_tier` even if the email later verifies as deliverable. This prevents a technically valid email at the wrong business from being treated as a high-quality contact.
 
@@ -200,7 +198,7 @@ Cost ceiling hit before Zuhal → COST_SKIPPED
 
 ---
 
-### Operational Reliability (Sara)
+### Operational Reliability
 
 **Per-MX SpamhausGuard** — SMTP cooldowns are isolated per recipient MX provider. A Spamhaus block on one provider (e.g., Proofpoint) no longer freezes probes to unrelated providers (e.g., Google Workspace). Each provider has an independent sliding-window block counter and cooldown timer.
 
@@ -228,9 +226,9 @@ Cost ceiling hit before Zuhal → COST_SKIPPED
 
 ---
 
-## Cherry Servers SMTP Fleet (Alpha)
+## Cherry Servers SMTP Fleet
 
-> **Branch:** `feat/cherry-fleet-migration` — implemented, in alpha testing, not yet merged to main.
+> **Branch:** `feat/cherry-fleet-migration`
 
 **The IP reputation problem:** Budget VPS providers (Racknerd, Contabo, Hostinger) have IP ranges that end up in Spamhaus blocklists because other customers on the same network send spam. When the pipeline's egress IP is blocklisted, Gmail, Microsoft, and Proofpoint reject connections before even seeing the RCPT command.
 
