@@ -47,6 +47,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db", default=None, help="Override SQLite database path")
     parser.add_argument("--log-dir", default=None, help="Override log directory")
     parser.add_argument("--master-db", default=None, help="Master DB path — flush verified records here every 500 validations")
+    parser.add_argument("--enrichment-cache-db", default=None,
+                        help="Persistent Serper enrichment cache, shared across runs (default: cache is per-run only)")
 
     # Scope
     parser.add_argument("--limit", type=int, default=None, help="Max records to process")

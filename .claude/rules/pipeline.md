@@ -25,6 +25,8 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 
 - One `aiodns.DNSResolver` per producer run — created in `__init__`, passed to every `probe_domains()` call.
 - Serper enrichment_cache is keyed by `(business_name_norm, agent_name_norm, state, provider)` — normalize with `.lower().strip()` before any cache lookup or write.
+- Cache writes only fire on a successful discovery (`result.candidate_emails` or `result.candidate_domain` non-empty), and store whichever query actually won (primary or one of the 4 fallbacks) — never the primary's raw response if a fallback later succeeded. A "found nothing" response is never cached.
+- The cache connection is `self.cache_conn` (producer) / `self.cache_conn` (dispatcher), not `self.conn` — it defaults to the per-run `conn` but points at a separate persistent file when `--enrichment-cache-db` is set, so successful discoveries survive across separate runs (e.g. retries fed via a new `--name`).
 - Fallback domain blocklist: any domain that appears as first-organic fallback for 2+ different businesses is promoted to `_fallback_blocklist` at runtime. Static seed is in `constants.FALLBACK_DOMAIN_BLOCKLIST`.
 - `process_trace` must have an entry for every stage that ran: `dns`, `patterns`, `serper`, and (if applicable) `input`.
 - `owner_confidence` (registered-agent → owner likelihood) is computed at discovery via `owner_inference.score_owner_confidence(record, has_website=bool(effective_domain))` and written like `domain_confidence`. It's a heuristic baseline, not ML — commercial-agent detection uses a light normalize (never `normalize_business_name`, which strips the very service-name tokens).

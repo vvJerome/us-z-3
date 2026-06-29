@@ -54,6 +54,11 @@ async def cmd_run(args, config: PipelineConfig) -> None:
     conn = await db.init_db(config.db_path)
     logger.info("Database initialized: %s", config.db_path)
 
+    cache_conn = conn
+    if config.enrichment_cache_db:
+        cache_conn = await db.init_db(config.enrichment_cache_db)
+        logger.info("Persistent Serper cache enabled: %s", config.enrichment_cache_db)
+
     stop_event = asyncio.Event()
 
     def _signal_handler():
@@ -83,7 +88,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
     try:
         if not config.consumer_only:
-            producer = ProducerWorker(config, conn, cost_tracker, session, stop_event)
+            producer = ProducerWorker(config, conn, cost_tracker, session, stop_event, cache_conn=cache_conn)
             tasks.append(asyncio.create_task(producer.run(), name="producer"))
             logger.info("Producer worker started")
 
@@ -202,6 +207,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 stop_event=stop_event,
                 zuhal=zuhal_client,
                 serper=dispatcher_serper,
+                cache_conn=cache_conn,
             )
             smtp_done_event = asyncio.Event()
 
@@ -329,6 +335,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
         await session.close()
         await conn.close()
+        if cache_conn is not conn:
+            await cache_conn.close()
         logger.info("Pipeline shutdown complete. Cost: $%.4f", cost_tracker.total_cost)
 
 
@@ -613,6 +621,8 @@ async def main() -> None:
     config_kwargs["log_dir"] = args.log_dir or str(base_dir / "logs")
     if getattr(args, "master_db", None):
         config_kwargs["master_db"] = args.master_db
+    if getattr(args, "enrichment_cache_db", None):
+        config_kwargs["enrichment_cache_db"] = args.enrichment_cache_db
     if name and not config_kwargs.get("run_id"):
         config_kwargs["run_id"] = name
 

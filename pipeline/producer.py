@@ -51,9 +51,11 @@ class ProducerWorker:
         cost_tracker: CostTracker,
         session: aiohttp.ClientSession,
         stop_event: asyncio.Event | None = None,
+        cache_conn: aiosqlite.Connection | None = None,
     ) -> None:
         self.config = config
         self.conn = conn
+        self.cache_conn = cache_conn if cache_conn is not None else conn
         self.cost_tracker = cost_tracker
         self.session = session
         self.stop_event = stop_event or asyncio.Event()
@@ -316,7 +318,7 @@ class ProducerWorker:
                         domain,
                         strategy,
                         fallback_blocklist=self._fallback_blocklist,
-                        conn=self.conn,
+                        conn=self.cache_conn,
                     )
                     self._serper.charge_costs(self.cost_tracker, "serper_producer")
 
