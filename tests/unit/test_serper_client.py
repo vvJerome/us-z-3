@@ -328,6 +328,28 @@ async def test_charge_costs_cache_hit_only_charges_fallbacks():
     assert cost.counts.get("serper_dispatcher", 0) == 0
 
 
+async def test_charge_costs_cache_hit_records_cache_hit():
+    """Cache hit increments cost_tracker.cache_hits so hit rate is measurable."""
+    client = _client()
+    client.last_was_cache_hit = True
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.cache_hits == 1
+
+
+async def test_charge_costs_live_call_does_not_record_cache_hit():
+    """A live (non-cached) call leaves cost_tracker.cache_hits at 0."""
+    client = _client()
+    client.last_was_cache_hit = False
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.cache_hits == 0
+
+
 # ── Serper credits exhaustion ─────────────────────────────────────────────────
 
 async def test_credits_exhausted_returns_empty_result_not_pipeline_halt():

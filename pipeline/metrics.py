@@ -35,7 +35,7 @@ async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
     # Cost + API call counts
     async with conn.execute(
         "SELECT estimated_cost_usd, serper_producer_calls, serper_dispatcher_calls, "
-        "zuhal_calls, racknerd_probes, bbops_probes, backend_disagreements "
+        "zuhal_calls, racknerd_probes, bbops_probes, backend_disagreements, serper_cache_hits "
         "FROM stats ORDER BY rowid DESC LIMIT 1"
     ) as cur:
         row = await cur.fetchone()
@@ -52,6 +52,7 @@ async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
             ):
                 lines.append(f'pipeline_api_calls_total{{service="{svc}"}} {n or 0}')
             lines.append(f"pipeline_backend_disagreements_total {row[6] or 0}")
+            lines.append(f"pipeline_serper_cache_hits_total {row[7] or 0}")
 
     body = "\n".join(lines) + "\n"
     return aiohttp.web.Response(text=body, content_type="text/plain")

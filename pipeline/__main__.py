@@ -329,6 +329,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 discovery_misses=disc_failed_n,
                 validated=validated_n,
                 validation_failed=failed_n,
+                serper_cache_hits=cost_tracker.cache_hits,
                 **{f"{k}_calls": v for k, v in cost_tracker.counts.items()},
             )
 

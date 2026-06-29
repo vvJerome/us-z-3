@@ -10,7 +10,7 @@ _log = logging.getLogger("pipeline.db")
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS stats (
     validation_failed        INTEGER DEFAULT 0,
     serper_producer_calls    INTEGER DEFAULT 0,
     serper_dispatcher_calls  INTEGER DEFAULT 0,
+    serper_cache_hits        INTEGER DEFAULT 0,
     zuhal_calls              INTEGER DEFAULT 0,
     racknerd_probes          INTEGER DEFAULT 0,
     bbops_probes             INTEGER DEFAULT 0,
@@ -283,6 +284,11 @@ _V13_MIGRATIONS: list[str] = [
     "ALTER TABLE records ADD COLUMN verifier_agreement TEXT",
 ]
 
+# Migration statements for schema v14
+_V14_MIGRATIONS: list[str] = [
+    "ALTER TABLE stats ADD COLUMN serper_cache_hits INTEGER DEFAULT 0",
+]
+
 # Migration statements for schema v10 — verdict-field standardization (additive).
 _V10_MIGRATIONS: list[str] = [
     "ALTER TABLE records ADD COLUMN zb_status TEXT",
@@ -372,6 +378,7 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (11, _V11_MIGRATIONS),
         (12, _V12_MIGRATIONS),
         (13, _V13_MIGRATIONS),
+        (14, _V14_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:

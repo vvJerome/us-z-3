@@ -13,12 +13,18 @@ class CostTracker:
         self.max_cost = max_cost
         self._totals: dict[str, float] = defaultdict(float)
         self._counts: dict[str, int] = defaultdict(int)
+        self.cache_hits: int = 0
 
     def record_call(self, service: str, n: int = 1) -> None:
         """Record n paid calls (n>1 for bulk endpoints that bill per item)."""
         cost = API_COSTS.get(service, 0.0)
         self._totals[service] += cost * n
         self._counts[service] += n
+
+    def record_cache_hit(self) -> None:
+        """Record a free enrichment_cache hit (Serper) — no cost, but worth counting
+        to measure whether the cache is actually paying for itself."""
+        self.cache_hits += 1
 
     @property
     def total_cost(self) -> float:
@@ -45,4 +51,5 @@ class CostTracker:
             "total_cost_usd": round(self.total_cost, 4),
             "calls": dict(self._counts),
             "cost_by_service": {k: round(v, 4) for k, v in self._totals.items()},
+            "cache_hits": self.cache_hits,
         }

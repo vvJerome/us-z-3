@@ -87,7 +87,7 @@ class TestInitDb:
                 cols = {r[1] for r in await cur.fetchall()}
             assert "owner_confidence" in cols
             async with conn.execute("PRAGMA user_version") as cur:
-                assert (await cur.fetchone())[0] == 13
+                assert (await cur.fetchone())[0] == db.SCHEMA_VERSION
             # Existing row survived the migration; new column defaults to NULL.
             async with conn.execute(
                 "SELECT owner_confidence FROM records WHERE unique_id = 'r1'"
