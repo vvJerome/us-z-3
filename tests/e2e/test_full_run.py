@@ -140,6 +140,39 @@ class TestFullPipelineRun:
 
         assert db_path.exists()
 
+    def test_enrichment_cache_db_flag_creates_separate_file(self, tmp_path: Path):
+        """--enrichment-cache-db creates its own file, distinct from --db."""
+        input_file = tmp_path / "input.jsonl"
+        with open(input_file, "w") as f:
+            f.write(json.dumps({"unique_id": "test", "business_name": "Test Corp"}) + "\n")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        db_path = tmp_path / "pipeline.db"
+        cache_db_path = tmp_path / "enrichment_cache.db"
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pipeline",
+                "--dry-run", "--producer-only",
+                "-i", str(input_file),
+                "-o", str(output_dir),
+                "--db", str(db_path),
+                "--enrichment-cache-db", str(cache_db_path),
+                "--limit", "1",
+            ],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            timeout=30,
+            env=_test_env(),
+        )
+
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout.decode()}\nstderr: {result.stderr.decode()}"
+        )
+        assert db_path.exists()
+        assert cache_db_path.exists()
+
     def test_pipeline_invalid_input_file(self, tmp_path: Path):
         """Pipeline handles missing input file gracefully."""
         nonexistent = tmp_path / "missing.jsonl"

@@ -25,6 +25,10 @@ class PipelineConfig(BaseSettings):
     db_path: Path = Path("output/pipeline.db")
     log_dir: Path = Path("output/logs")
     master_db: Path | None = None
+    # Persists enrichment_cache across runs (default: cache lives only in this
+    # run's db_path, so a fresh --name run starts empty). Point every run at the
+    # same file to stop paying for Serper hits already resolved in a prior run.
+    enrichment_cache_db: Path | None = None
 
     # --- Scope ---
     limit: int | None = None

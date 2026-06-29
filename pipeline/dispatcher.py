@@ -98,9 +98,11 @@ class Dispatcher:
         stop_event: asyncio.Event | None = None,
         zuhal: ZuhalClient | None = None,
         serper: SerperClient | None = None,
+        cache_conn: aiosqlite.Connection | None = None,
     ) -> None:
         self.config = config
         self.conn = conn
+        self.cache_conn = cache_conn if cache_conn is not None else conn
         self.racknerd = racknerd
         self.bbops = bbops
         self.cost_tracker = cost_tracker
@@ -329,7 +331,7 @@ class Dispatcher:
             await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
             return True
         existing = set(candidates)
-        raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
+        raw_emails = await dp.serper_enrich(self.serper, self.cache_conn, unique_id, row)
         new_emails = [e for e in raw_emails if e not in existing]
         try:
             await db.mark_serper_enriched(self.conn, unique_id)
