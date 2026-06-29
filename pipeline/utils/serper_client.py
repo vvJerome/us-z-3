@@ -66,7 +66,7 @@ class SerperClient:
     def charge_costs(self, cost_tracker, service: str) -> None:
         """Charge for the last enrich() call (free on cache hit) plus its site: fallback retries, then reset the counter."""
         if self.last_was_cache_hit:
-            cost_tracker.record_cache_hit()
+            cost_tracker.cache_hits += 1
         else:
             cost_tracker.record_call(service)
         for _ in range(self._fallback_calls):

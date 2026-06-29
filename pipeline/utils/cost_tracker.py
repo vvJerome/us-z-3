@@ -21,11 +21,6 @@ class CostTracker:
         self._totals[service] += cost * n
         self._counts[service] += n
 
-    def record_cache_hit(self) -> None:
-        """Record a free enrichment_cache hit (Serper) — no cost, but worth counting
-        to measure whether the cache is actually paying for itself."""
-        self.cache_hits += 1
-
     @property
     def total_cost(self) -> float:
         return sum(self._totals.values())
