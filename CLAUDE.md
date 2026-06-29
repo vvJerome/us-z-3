@@ -86,8 +86,7 @@ us-z-3/
 │   │   ├── ingest_zerobounce.py    # Join /zerobounced CSV back to records (ZB = ground truth)
 │   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
 │   │   ├── normalize_zuhaled.py    # Upgrade legacy {Email,Status} zuhaled files
-│   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
-│   │   └── build_summary.py        # Write summary_counts.csv (hardcoded May 2026 run)
+│   │   └── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
 │   ├── consumers/
 │   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
 │   │   └── bbops_async.py  # Async bbops.io batch verifier (Backend 2)
