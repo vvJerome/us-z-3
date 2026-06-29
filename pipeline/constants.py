@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # pipeline/constants.py
 #
 # Single source of truth for all hardcoded values in the pipeline.
@@ -8,7 +10,7 @@
 API_COSTS: dict[str, float] = {
     "serper_producer": 0.001,     # DNS-miss path: Serper called in producer
     "serper_dispatcher": 0.001,   # fallback: Serper called in dispatcher after patterns exhausted
-    "zuhal": 0.0005,              # rescue backend — runs after both SMTP backends return invalid
+    "zuhal": 0.001,               # rescue backend; tiered pricing — $0.001/credit @ 10k tier (drops to $0.0005 @ 250k)
 }
 
 # --- Exponential backoff parameters (base_seconds, max_seconds) per service ---
@@ -58,6 +60,13 @@ TUNNEL_BACKOFF_MAX_S: float = 60.0
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
 DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD: int = 3
 
+# --- Infra re-queue backoff ---
+# Backoff schedule for tunnel-down and bbops-error re-queues.
+# Delay (minutes) = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
+# With base=5 and multiplier=3: attempt 0→5min, 1→15min, 2→45min
+INFRA_RETRY_BASE_MINUTES: int = 5
+INFRA_RETRY_MULTIPLIER: float = 3.0
+
 # MX-host substrings where a catch-all / accept-all result is least trustworthy:
 # providers that accept-all by default, and security gateways that answer 250 for
 # every address (Proofpoint, Mimecast, Barracuda). A catch-all from these needs
@@ -78,7 +87,6 @@ def is_untrustworthy_catchall_mx(mx_provider: str | None) -> bool:
         return False
     lp = mx_provider.lower()
     return any(p in lp for p in CATCHALL_UNTRUSTWORTHY_MX)
-
 
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.

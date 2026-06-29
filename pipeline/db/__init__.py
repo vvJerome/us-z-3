@@ -36,6 +36,10 @@ from pipeline.db.zuhal_queue import (  # noqa: F401
     touch_zuhal_validating,
     recover_stale_zuhal_validating,
     requeue_zuhal,
+    create_zuhal_job,
+    update_zuhal_job_status,
+    lookup_email_cache,
+    write_email_cache,
 )
 from pipeline.db.meta import (  # noqa: F401
     get_checkpoint,

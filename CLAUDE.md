@@ -87,8 +87,7 @@ us-z-3/
 │   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
 │   │   ├── normalize_zuhaled.py    # Upgrade legacy {Email,Status} zuhaled files
 │   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
-│   │   ├── zuhal_usage_report.py   # Real Zuhal credit/cost usage: live verdicts + bulk CSV submissions
-│   │   └── build_summary.py        # Write summary_counts.csv (hardcoded May 2026 run)
+│   │   └── zuhal_usage_report.py   # Real Zuhal credit/cost usage: live verdicts + bulk CSV submissions
 │   ├── consumers/
 │   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
 │   │   └── bbops_async.py  # Async bbops.io batch verifier (Backend 2)
@@ -169,6 +168,8 @@ InputRecord (RAW)
 - Serper starts empty (`initial_tokens=0`) — no startup 429 bursts.
 - Serper credit exhaustion degrades to `DISCOVERY_FAILED`; run continues.
 - Use `--ignore-cache` to bypass enrichment_cache on re-runs against fresh data.
+- `enrichment_cache` only stores successful discoveries (a candidate domain or email found) — a "found nothing" response is never cached, so retrying a `DISCOVERY_FAILED` record always gets a fresh Serper attempt, never a free replay of the old miss.
+- By default the cache lives inside that run's `pipeline.db`, so a fresh `--name` run starts empty. Pass `--enrichment-cache-db PATH` to point every run at the same file — businesses already resolved in a prior run cost nothing on retries or later runs.
 
 ### Stage 2 — Dispatcher (per candidate_email, in rank order)
 
@@ -380,6 +381,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--producer-only` | off | Run discovery only (no SSH tunnel, no Racknerd) |
 | `--consumer-only` | off | Run dispatcher only |
 | `--ignore-cache` | off | Bypass Serper enrichment cache (forces live API call) |
+| `--enrichment-cache-db PATH` | none | Persist Serper enrichment cache across runs (default: per-run only, in `db_path`) |
 | `--harvest` | off | Scrape the business website for emails/officers (free) before the paid Serper fallback |
 | `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |

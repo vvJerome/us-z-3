@@ -24,6 +24,11 @@ class PipelineConfig(BaseSettings):
     output_dir: Path = Path("output")
     db_path: Path = Path("output/pipeline.db")
     log_dir: Path = Path("output/logs")
+    master_db: Path | None = None
+    # Persists enrichment_cache across runs (default: cache lives only in this
+    # run's db_path, so a fresh --name run starts empty). Point every run at the
+    # same file to stop paying for Serper hits already resolved in a prior run.
+    enrichment_cache_db: Path | None = None
 
     # --- Scope ---
     limit: int | None = None
@@ -80,6 +85,9 @@ class PipelineConfig(BaseSettings):
     zuhal_concurrency_max: int = Field(default=50, ge=1)
     zuhal_on_both_invalid: bool = False
     zuhal_decoupled: bool = True
+    # Free requeue cap: circuit-open / 429 are unbilled, so a record may bounce
+    # back to NEEDS_ZUHAL this many times before giving up instead of spinning.
+    zuhal_max_circuit_requeues: int = Field(default=5, ge=1)
     # Identity/deliverability gates (0.0 = disabled, current behavior).
     # zuhal_min_confidence: candidates scoring below this skip paid Zuhal rescue.
     # catch_all_min_confidence: catch-all verdicts below this are not auto-accepted.
@@ -112,6 +120,8 @@ class PipelineConfig(BaseSettings):
     max_discovery_retries: int = Field(default=3, ge=0)
     max_dispatch_attempts: int = Field(default=5, ge=1)
     max_requeue_count: int = Field(default=15, ge=1)
+    max_tunnel_requeues: int = Field(default=1, ge=0)
+    max_bbops_requeues: int = Field(default=1, ge=0)
 
     # --- Enrichment ---
     ignore_cache: bool = False

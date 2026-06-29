@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import logging
 import signal
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ from pipeline.zuhal_dispatcher import ZuhalDispatcher
 from pipeline.producer import ProducerWorker
 from pipeline.tunnels.ssh_socks import SshSocksTunnel, TunnelConfig
 from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.logger import setup_logging, get_logger
+from pipeline.utils.logger import setup_logging
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
 from pipeline.utils.zuhal_client import ZuhalClient
@@ -49,10 +50,15 @@ class _NullRacknerd:
 async def cmd_run(args, config: PipelineConfig) -> None:
     """Execute the pipeline (producer + dispatcher or one of them)."""
     setup_logging(config)
-    logger = get_logger("pipeline")
+    logger = logging.getLogger("pipeline")
 
     conn = await db.init_db(config.db_path)
     logger.info("Database initialized: %s", config.db_path)
+
+    cache_conn = conn
+    if config.enrichment_cache_db:
+        cache_conn = await db.init_db(config.enrichment_cache_db)
+        logger.info("Persistent Serper cache enabled: %s", config.enrichment_cache_db)
 
     stop_event = asyncio.Event()
 
@@ -83,7 +89,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
     try:
         if not config.consumer_only:
-            producer = ProducerWorker(config, conn, cost_tracker, session, stop_event)
+            producer = ProducerWorker(config, conn, cost_tracker, session, stop_event, cache_conn=cache_conn)
             tasks.append(asyncio.create_task(producer.run(), name="producer"))
             logger.info("Producer worker started")
 
@@ -162,7 +168,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     _zuhal_bucket,
                     concurrency=config.zuhal_concurrency,
                     dry_run=config.dry_run,
-                    max_attempts=config.max_attempts,
+                    max_attempts=1,  # paid call fires once — never retried in-call
                     jitter=config.backoff_jitter,
                 )
                 logger.info(
@@ -170,6 +176,11 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                     config.zuhal_concurrency,
                     config.zuhal_rate_limit,
                 )
+                remaining = await zuhal_client.check_credits()
+                if remaining is not None:
+                    logger.info("Zuhal credits OK — %d remaining", remaining)
+                else:
+                    logger.info("Zuhal credits check passed (balance not reported)")
             else:
                 logger.info("Zuhal fallback disabled (ZUHAL_API_KEY not set)")
 
@@ -197,6 +208,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                 stop_event=stop_event,
                 zuhal=zuhal_client,
                 serper=dispatcher_serper,
+                cache_conn=cache_conn,
             )
             smtp_done_event = asyncio.Event()
 
@@ -231,11 +243,53 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         metrics_task = asyncio.create_task(
             serve_metrics(conn, stop_event), name="metrics"
         )
+
+        if config.master_db:
+            from pipeline.ops.master_db import flush_from_pipeline_db
+
+            async def _master_db_flush_loop() -> None:
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(stop_event.wait()), timeout=60.0
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if stop_event.is_set():
+                        break
+                    try:
+                        ins, upd = await asyncio.to_thread(
+                            flush_from_pipeline_db, config.master_db, config.db_path
+                        )
+                        if ins or upd:
+                            logger.info(
+                                "Master DB flush: %d new, %d updated → %s",
+                                ins, upd, config.master_db,
+                            )
+                    except Exception as exc:
+                        logger.warning("Master DB flush failed: %s", exc)
+
+            tasks.append(asyncio.create_task(_master_db_flush_loop(), name="master-db-flush"))
+            logger.info("Master DB flush enabled — flushing every 500 records to %s", config.master_db)
+
         try:
             await asyncio.gather(*tasks)
         finally:
             stop_event.set()
             await metrics_task
+            # Final flush on shutdown
+            if config.master_db:
+                try:
+                    ins, upd = await asyncio.to_thread(
+                        flush_from_pipeline_db, config.master_db, config.db_path, flush_every=0
+                    )
+                    if ins or upd:
+                        logger.info(
+                            "Master DB final flush: %d new, %d updated → %s",
+                            ins, upd, config.master_db,
+                        )
+                except Exception as exc:
+                    logger.warning("Master DB final flush failed: %s", exc)
 
     except Exception:
         logger.exception("Pipeline error")
@@ -282,6 +336,8 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
         await session.close()
         await conn.close()
+        if cache_conn is not conn:
+            await cache_conn.close()
         logger.info("Pipeline shutdown complete. Cost: $%.4f", cost_tracker.total_cost)
 
 
@@ -365,6 +421,63 @@ def _print_status(summary: dict) -> None:
         cost = stats.get("estimated_cost_usd", 0)
         print(f"\nEstimated cost: ${cost:.4f}")
 
+    by_state = summary.get("records_by_state", {})
+    t1 = summary.get("terminal_last_1min", 0)
+    t5 = summary.get("terminal_last_5min", 0)
+    t15 = summary.get("terminal_last_15min", 0)
+    r1 = t1 / 1.0
+    r5 = t5 / 5.0
+    r15 = t15 / 15.0
+
+    pending_states = ("RAW", "DISCOVERING", "DISCOVERED", "VALIDATING", "NEEDS_ZUHAL", "ZUHAL_VALIDATING")
+    pending = sum(by_state.get(s, 0) for s in pending_states)
+    retry_backlog = summary.get("retry_backlog", 0)
+    fresh = pending - retry_backlog
+
+    needs_zuhal = by_state.get("NEEDS_ZUHAL", 0) + by_state.get("ZUHAL_VALIDATING", 0)
+    zuhal_rate = summary.get("zuhal_terminal_last_5min", 0) / 5.0
+
+    terminal_by_state = summary.get("terminal_by_state_5min", {})
+
+    if any((r1, r5, r15)):
+        print("\nThroughput:")
+        print(f"  1 min:  {r1:>7.1f} records/min")
+        print(f"  5 min:  {r5:>7.1f} records/min")
+        print(f"  15 min: {r15:>7.1f} records/min")
+
+        if terminal_by_state:
+            print("\n  Per-state (last 5 min):")
+            label_map = {
+                "VALIDATED": "validated",
+                "VALIDATION_FAILED": "validation_failed",
+                "DISCOVERY_FAILED": "discovery_failed",
+                "COST_SKIPPED": "cost_skipped",
+            }
+            for state, label in label_map.items():
+                count = terminal_by_state.get(state, 0)
+                if count:
+                    print(f"    {label:.<26} {count / 5.0:>6.1f}/min")
+
+        if needs_zuhal and zuhal_rate > 0:
+            print(f"\n  Zuhal queue: {needs_zuhal:,} pending  ({zuhal_rate:.1f}/min draining)")
+
+    if pending > 0:
+        rate = r5 or r15 or r1
+        if rate > 0:
+            eta_min = pending / rate
+            if eta_min < 60:
+                eta_str = f"{eta_min:.0f} min"
+            elif eta_min < 1440:
+                eta_str = f"{eta_min / 60:.1f} hr"
+            else:
+                eta_str = f"{eta_min / 1440:.1f} days"
+            pending_detail = f"{fresh:,} fresh + {retry_backlog:,} retries" if retry_backlog else f"{pending:,}"
+            print(f"\nPending: {pending_detail}  →  ETA: {eta_str}")
+        else:
+            print(f"\nPending: {pending:,}  (throughput window empty — ETA unavailable)")
+    else:
+        print("\nAll records processed.")
+
     print()
 
 
@@ -403,7 +516,7 @@ def _zuhal_verdict(zuhal_status: str | None) -> str:
 
 
 async def _write_outputs(conn, config: PipelineConfig) -> None:
-    logger = get_logger("pipeline")
+    logger = logging.getLogger("pipeline")
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -507,6 +620,10 @@ async def main() -> None:
     config_kwargs["output_dir"] = args.output_dir or str(base_dir)
     config_kwargs["db_path"] = args.db or str(base_dir / "pipeline.db")
     config_kwargs["log_dir"] = args.log_dir or str(base_dir / "logs")
+    if getattr(args, "master_db", None):
+        config_kwargs["master_db"] = args.master_db
+    if getattr(args, "enrichment_cache_db", None):
+        config_kwargs["enrichment_cache_db"] = args.enrichment_cache_db
     if name and not config_kwargs.get("run_id"):
         config_kwargs["run_id"] = name
 

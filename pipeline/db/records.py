@@ -136,6 +136,7 @@ async def requeue_record(
     *,
     increment_attempts: bool = True,
     retry_after: str | None = None,
+    infra_type: str | None = None,
 ) -> None:
     """Return a record to DISCOVERED.
 
@@ -148,22 +149,23 @@ async def requeue_record(
 
     retry_after (ISO timestamp) sets a hold: fetch_pending_validation skips
     the record until that time passes. Use for greylisting (SMTP 4xx).
+
+    infra_type="tunnel" increments tunnel_requeue_count; "bbops" increments
+    bbops_requeue_count. These per-infra counters drive exponential backoff.
     """
+    sets = [
+        "record_state = 'DISCOVERED'",
+        "requeue_count = requeue_count + 1",
+        "retry_after = ?",
+        "updated_at = datetime('now')",
+    ]
     if increment_attempts:
-        sql = """UPDATE records
-                    SET record_state = 'DISCOVERED',
-                        dispatch_attempts = dispatch_attempts + 1,
-                        requeue_count = requeue_count + 1,
-                        retry_after = ?,
-                        updated_at = datetime('now')
-                  WHERE unique_id = ?"""
-    else:
-        sql = """UPDATE records
-                    SET record_state = 'DISCOVERED',
-                        requeue_count = requeue_count + 1,
-                        retry_after = ?,
-                        updated_at = datetime('now')
-                  WHERE unique_id = ?"""
+        sets.insert(1, "dispatch_attempts = dispatch_attempts + 1")
+    if infra_type == "tunnel":
+        sets.append("tunnel_requeue_count = tunnel_requeue_count + 1")
+    elif infra_type == "bbops":
+        sets.append("bbops_requeue_count = bbops_requeue_count + 1")
+    sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"
     await conn.execute(sql, (retry_after, unique_id))
     await conn.commit()
 
@@ -204,6 +206,8 @@ async def update_record_dual(
     confidence_score: float | None = None,
     dispatch_attempts_delta: int = 1,
     zuhal_status_override: str | None = None,
+    verifier_agreement: str | None = None,
+    failure_reason: str | None = None,
 ) -> None:
     """Write dual-backend verdicts and advance dispatch_attempts atomically."""
     sets = [
@@ -257,6 +261,14 @@ async def update_record_dual(
     if recon_path is not None:
         sets.append("reconciliation_path = ?")
         values.append(recon_path)
+
+    if verifier_agreement is not None:
+        sets.append("verifier_agreement = ?")
+        values.append(verifier_agreement)
+
+    if failure_reason is not None:
+        sets.append("failure_reason = ?")
+        values.append(failure_reason)
 
     values.append(unique_id)
     sql = f"UPDATE records SET {', '.join(sets)} WHERE unique_id = ?"

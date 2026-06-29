@@ -10,7 +10,7 @@ _log = logging.getLogger("pipeline.db")
 
 _log = logging.getLogger("pipeline.db")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,18 @@ CREATE TABLE IF NOT EXISTS records (
 
     -- Re-queue tracking
     requeue_count       INTEGER DEFAULT 0,
+    tunnel_requeue_count INTEGER DEFAULT 0,
+    bbops_requeue_count INTEGER DEFAULT 0,
     retry_after         TEXT,
+
+    -- Failure diagnostics
+    failure_reason      TEXT,
+
+    -- Domain-to-business match score (0.0–1.0, word overlap + fuzzy)
+    domain_match_score  REAL,
+
+    -- Which backend(s) confirmed this email
+    verifier_agreement  TEXT,
 
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -164,12 +175,28 @@ CREATE TABLE IF NOT EXISTS bbops_jobs (
     PRIMARY KEY (record_id, email)
 );
 
+CREATE TABLE IF NOT EXISTS zuhal_jobs (
+    job_id          TEXT PRIMARY KEY,
+    email_count     INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'polling',
+    created_at      TEXT DEFAULT (datetime('now')),
+    completed_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS email_verification_cache (
+    email_norm      TEXT PRIMARY KEY,
+    verdict         TEXT NOT NULL,
+    provider        TEXT,
+    verified_at     TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(record_state);
 CREATE INDEX IF NOT EXISTS idx_records_unique_id ON records(unique_id);
 CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
 CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business_name_norm, agent_name_norm, state, provider);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
+CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status);
 """
 
 # Migration statements from schema v3 → v4
@@ -223,6 +250,37 @@ _V11_MIGRATIONS: list[str] = [
     # owner_confidence: 0–1 likelihood the registered agent is the business owner,
     # computed at discovery (pipeline.utils.owner_inference).
     "ALTER TABLE records ADD COLUMN owner_confidence REAL",
+]
+
+# Migration statements for schema v12
+_V12_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN tunnel_requeue_count INTEGER DEFAULT 0",
+    "ALTER TABLE records ADD COLUMN bbops_requeue_count INTEGER DEFAULT 0",
+    "ALTER TABLE records ADD COLUMN failure_reason TEXT",
+    "ALTER TABLE records ADD COLUMN domain_match_score REAL",
+    """
+    CREATE TABLE IF NOT EXISTS zuhal_jobs (
+        job_id          TEXT PRIMARY KEY,
+        email_count     INTEGER NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'polling',
+        created_at      TEXT DEFAULT (datetime('now')),
+        completed_at    TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status)",
+    """
+    CREATE TABLE IF NOT EXISTS email_verification_cache (
+        email_norm      TEXT PRIMARY KEY,
+        verdict         TEXT NOT NULL,
+        provider        TEXT,
+        verified_at     TEXT DEFAULT (datetime('now'))
+    )
+    """,
+]
+
+# Migration statements for schema v13
+_V13_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN verifier_agreement TEXT",
 ]
 
 # Migration statements for schema v10 — verdict-field standardization (additive).
@@ -312,6 +370,8 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (9, _V9_MIGRATIONS),
         (10, _V10_MIGRATIONS),
         (11, _V11_MIGRATIONS),
+        (12, _V12_MIGRATIONS),
+        (13, _V13_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:

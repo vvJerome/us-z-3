@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer, _SpamhausGuard
+from pipeline.consumers.racknerd import RacknerdConfig, RacknerdConsumer, _SpamhausGuard, _mx_provider
 from pipeline.constants import (
     RACKNERD_SPAMHAUS_COOLDOWN_S,
     RACKNERD_SPAMHAUS_THRESHOLD,
@@ -217,3 +217,53 @@ class TestRacknerdSmtpResponseParsing:
         with caplog.at_level(logging.WARNING, logger="pipeline.racknerd"):
             RacknerdConfig(helo_hostname="[49.12.127.119]")
         assert any("IP literal" in rec.message for rec in caplog.records)
+
+
+class TestMxProvider:
+    def test_extracts_root_domain(self):
+        assert _mx_provider("aspmx.l.google.com") == "google.com"
+        assert _mx_provider("mx1.pphosted.com") == "pphosted.com"
+        assert _mx_provider("eu-smtp-1.mimecast.com") == "mimecast.com"
+        assert _mx_provider("mail.protection.outlook.com") == "outlook.com"
+
+    def test_two_part_domain_unchanged(self):
+        assert _mx_provider("google.com") == "google.com"
+
+    def test_trailing_dot_stripped(self):
+        assert _mx_provider("aspmx.l.google.com.") == "google.com"
+
+
+class TestPerMxSpamhausGuard:
+    def test_separate_providers_have_independent_cooldowns(self):
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        guard_pp = consumer._guard_for("pphosted.com")
+        guard_goog = consumer._guard_for("google.com")
+
+        for _ in range(RACKNERD_SPAMHAUS_THRESHOLD):
+            guard_pp.record_block()
+
+        assert guard_pp.is_cooling() is True
+        assert guard_goog.is_cooling() is False
+
+    def test_same_provider_returns_same_guard_instance(self):
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        g1 = consumer._guard_for("pphosted.com")
+        g2 = consumer._guard_for("pphosted.com")
+        assert g1 is g2
+
+    def test_different_providers_return_different_guard_instances(self):
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        g1 = consumer._guard_for("pphosted.com")
+        g2 = consumer._guard_for("google.com")
+        assert g1 is not g2
+
+    def test_blocked_provider_does_not_pause_other_providers(self):
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        guard_pp = consumer._guard_for("pphosted.com")
+        guard_goog = consumer._guard_for("google.com")
+
+        for _ in range(RACKNERD_SPAMHAUS_THRESHOLD):
+            guard_pp.record_block()
+
+        # Google guard should return immediately (not cooling)
+        assert not guard_goog.is_cooling()

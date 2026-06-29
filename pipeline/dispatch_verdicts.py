@@ -117,6 +117,7 @@ async def handle_inconclusive(
                 confidence_score=float(score),
                 zuhal_status_override=zuhal_status,
                 dispatch_attempts_delta=1,
+                verifier_agreement="zuhal_only" if terminal else None,
             )
             await db.flush_process_trace(disp.conn, unique_id, pending_trace)
         disp.cost_tracker.record_call("zuhal")
@@ -193,6 +194,7 @@ async def rescue_both_invalid(
                 confidence_score=float(score),
                 zuhal_status_override=zuhal_status,
                 dispatch_attempts_delta=1,
+                verifier_agreement="zuhal_only",
             )
             await db.flush_process_trace(disp.conn, unique_id, pending_trace)
         disp.cost_tracker.record_call("zuhal")

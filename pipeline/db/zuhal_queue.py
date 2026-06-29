@@ -131,3 +131,44 @@ async def requeue_zuhal(conn: aiosqlite.Connection, unique_id: str) -> None:
         (unique_id,),
     )
     await conn.commit()
+
+
+async def create_zuhal_job(conn: aiosqlite.Connection, job_id: str, email_count: int) -> None:
+    """Persist a new bulk job before polling starts (audit trail + crash recovery marker)."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO zuhal_jobs (job_id, email_count, status) VALUES (?, ?, 'polling')",
+        (job_id, email_count),
+    )
+    await conn.commit()
+
+
+async def update_zuhal_job_status(conn: aiosqlite.Connection, job_id: str, status: str) -> None:
+    """Update bulk job status to 'complete' or 'failed'."""
+    await conn.execute(
+        """UPDATE zuhal_jobs
+              SET status = ?,
+                  completed_at = CASE WHEN ? IN ('complete', 'failed') THEN datetime('now') ELSE completed_at END
+            WHERE job_id = ?""",
+        (status, status, job_id),
+    )
+    await conn.commit()
+
+
+async def lookup_email_cache(conn: aiosqlite.Connection, email: str) -> str | None:
+    """Return cached verdict for this email (normalized), or None if not cached."""
+    async with conn.execute(
+        "SELECT verdict FROM email_verification_cache WHERE email_norm = ?",
+        (email.lower().strip(),),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def write_email_cache(conn: aiosqlite.Connection, email: str, verdict: str, provider: str) -> None:
+    """Cache a verified email result to prevent re-paying on duplicates."""
+    await conn.execute(
+        """INSERT OR REPLACE INTO email_verification_cache (email_norm, verdict, provider, verified_at)
+           VALUES (?, ?, ?, datetime('now'))""",
+        (email.lower().strip(), verdict, provider),
+    )
+    await conn.commit()

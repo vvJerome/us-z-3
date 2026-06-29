@@ -27,7 +27,7 @@ from pipeline.utils.dns_probe import probe_domains
 from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.serper_client import SerperClient
-from pipeline.utils.text import assign_email_strategy, is_org_agent, parse_name, score_domain_confidence
+from pipeline.utils.text import assign_email_strategy, domain_match_score as _domain_match_score, is_org_agent, parse_name, score_domain_confidence
 from pipeline.utils.owner_inference import score_owner_confidence
 from pipeline.utils.notify import create_notify_pipe, signal_consumer
 from pipeline import db
@@ -51,9 +51,11 @@ class ProducerWorker:
         cost_tracker: CostTracker,
         session: aiohttp.ClientSession,
         stop_event: asyncio.Event | None = None,
+        cache_conn: aiosqlite.Connection | None = None,
     ) -> None:
         self.config = config
         self.conn = conn
+        self.cache_conn = cache_conn if cache_conn is not None else conn
         self.cost_tracker = cost_tracker
         self.session = session
         self.stop_event = stop_event or asyncio.Event()
@@ -286,6 +288,7 @@ class ProducerWorker:
         if domain:
             result["candidate_domain"] = domain
             result["discovery_source"] = "dns"
+            result["domain_match_score"] = 1.0
             result["mx_provider"] = mx_host
 
             # Query per-MX success stats to reorder templates by historical hit rate
@@ -315,7 +318,7 @@ class ProducerWorker:
                         domain,
                         strategy,
                         fallback_blocklist=self._fallback_blocklist,
-                        conn=self.conn,
+                        conn=self.cache_conn,
                     )
                     self._serper.charge_costs(self.cost_tracker, "serper_producer")
 
@@ -351,6 +354,7 @@ class ProducerWorker:
         # If enrichment found a domain but DNS didn't, generate patterns from it
         if not domain and enrichment_domain:
             result["candidate_domain"] = enrichment_domain
+            result["domain_match_score"] = _domain_match_score(record.business_name, enrichment_domain)
             patterns = generate_ranked_candidates(first, last, enrichment_domain, strategy, rankings=[])
             candidate_emails.extend(patterns)
 
@@ -423,6 +427,7 @@ class ProducerWorker:
             "subdomain_emails": None,
             "candidate_domain": None,
             "discovery_source": None,
+            "domain_match_score": None,
             "discovery_attempts": 0,
             "strategy": strategy,
             "is_org_agent": org_agent,

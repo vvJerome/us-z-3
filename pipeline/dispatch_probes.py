@@ -14,12 +14,19 @@ import aiosqlite
 from pipeline.consumers.bbops_async import BbopsUnhealthy
 from pipeline.models import BackendVerdict, PipelineHaltError
 from pipeline.utils.ms_verify import check_microsoft_email_async
-from pipeline.utils.zuhal_client import ZuhalCircuitOpenError
+from pipeline.utils.zuhal_client import ZuhalCircuitOpenError, ZuhalCreditsExhaustedError
 
 logger = logging.getLogger("pipeline.dispatcher")
 
+# Rolling MS probe error counter — resets every _MS_ALERT_WINDOW probes.
+_ms_total: int = 0
+_ms_errors: int = 0
+_MS_ALERT_WINDOW: int = 100
+_MS_ERROR_THRESHOLD: float = 0.5
+
 
 async def ms_probe(email: str) -> tuple[str, dict]:
+    global _ms_total, _ms_errors
     t0 = time.monotonic()
     try:
         result = await check_microsoft_email_async(email)
@@ -28,6 +35,21 @@ async def ms_probe(email: str) -> tuple[str, dict]:
         result = {"status": "error"}
     ms = int((time.monotonic() - t0) * 1000)
     status = result.get("status", "error")
+
+    _ms_total += 1
+    if status == "error":
+        _ms_errors += 1
+    if _ms_total >= _MS_ALERT_WINDOW:
+        rate = _ms_errors / _ms_total
+        if rate >= _MS_ERROR_THRESHOLD:
+            logger.error(
+                "MS probe degraded: %d/%d errors (%.0f%%) in last %d probes — "
+                "Microsoft domains falling through to paid SMTP",
+                _ms_errors, _ms_total, rate * 100, _ms_total,
+            )
+        _ms_total = 0
+        _ms_errors = 0
+
     return status, {"stage": "ms_api", "outcome": status, "ms": ms, "email": email}
 
 
@@ -39,7 +61,8 @@ async def zuhal_probe(zuhal, email: str) -> tuple[str, dict]:
         status = result.verdict
     except PipelineHaltError:
         raise
-    except ZuhalCircuitOpenError:
+    except (ZuhalCircuitOpenError, ZuhalCreditsExhaustedError):
+        # circuit open OR credits out → defer (re-queue), don't burn as failed.
         status = "circuit_open"
     except Exception as exc:
         logger.debug("Zuhal probe error for %s: %s", email, exc)

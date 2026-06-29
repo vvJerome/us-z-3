@@ -131,10 +131,8 @@ class SerperClient:
                 ),
             )
 
-            if conn is not None:
-                await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
-
             result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
+            winning_data = data
 
             # Fallback: if site:-scoped query returned no emails, retry without site: filter
             if domain_hint and not result.candidate_emails and "site:" in query:
@@ -164,6 +162,7 @@ class SerperClient:
                         query_used=fallback_query,
                         raw_snippets=fallback.raw_snippets,
                     )
+                    winning_data = data2
 
             # Third fallback: agent-name-focused query when primary found neither emails nor domain.
             # Registered agents are often individual lawyers whose contact appears under their name,
@@ -204,6 +203,7 @@ class SerperClient:
                         query_used=agent_query,
                         raw_snippets=agent_result.raw_snippets,
                     )
+                    winning_data = data3
 
             # 4th fallback: for long business names (4+ significant words), retry with
             # first 3 words only. Full legal names like "BREWER-LOWDER-MCCUISTON POST 9010
@@ -243,6 +243,13 @@ class SerperClient:
                         query_used=short_query,
                         raw_snippets=short_result.raw_snippets,
                     )
+                    winning_data = data4
+
+            # Cache only successful discoveries — a "found nothing" response is never
+            # written, so a later retry of a DISCOVERY_FAILED record always gets a
+            # genuinely fresh Serper attempt instead of a free replay of the old miss.
+            if conn is not None and (result.candidate_emails or result.candidate_domain):
+                await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(winning_data))
 
             return result
 

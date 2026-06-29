@@ -127,10 +127,40 @@ def generate_domain_stems(business_name: str) -> list[str]:
     return unique
 
 
-# How the domain was found, as a prior on correctness. DNS-MX hit on a business-name
-# stem is strong; a Serper first-organic guess is weak. Tuned, not learned —
-# ponytail: heuristic prior, replace with a learned calibration once delivery
-# outcomes are collected (CSV items 7/10).
+def domain_match_score(business_name: str, domain: str) -> float:
+    """Score 0.0–1.0: how well a discovered domain matches the business name.
+
+    Takes the max of two signals:
+    - Word overlap: fraction of significant business name words found in the domain stem.
+    - Fuzzy ratio: rapidfuzz character similarity between joined business name and stem.
+
+    Neither signal handles pure abbreviation domains (ncrg.com for "NC Restaurant Group")
+    reliably — those score low (~0.25) and get a medium-tier cap at worst.
+    """
+    if not business_name or not domain:
+        return 0.0
+
+    norm = normalize_business_name(business_name)
+    if not norm:
+        return 0.0
+
+    parts = domain.lower().rstrip(".").split(".")
+    stem = parts[1] if parts[0] == "www" and len(parts) > 1 else parts[0]
+    if not stem:
+        return 0.0
+
+    words = [w for w in norm.split() if len(w) >= 3]
+    if not words:
+        words = norm.split()
+    word_score = sum(1 for w in words if w in stem) / len(words) if words else 0.0
+
+    norm_joined = re.sub(r"\s+", "", norm)
+    fuzzy_score = fuzz.ratio(norm_joined, stem) / 100.0
+
+    return round(max(word_score, fuzzy_score), 3)
+
+
+# How the domain was found, as a prior on correctness.
 _DISCOVERY_PRIOR: dict[str, float] = {
     "input": 0.6, "dns": 0.5, "serper": 0.35, "serper_fallback": 0.1,
 }
@@ -142,8 +172,7 @@ def score_domain_confidence(
     """Business-to-domain match confidence in [0, 1].
 
     Combines how the domain was found (prior) with how well the domain stem agrees
-    with the business name (the strongest corroborating signal we hold). Phone/DBA/
-    social signals from the enhancement spec are not in our input data.
+    with the business name.
     """
     if not domain:
         return 0.0
