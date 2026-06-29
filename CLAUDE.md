@@ -103,7 +103,7 @@ us-z-3/
 │   └── utils/
 │       ├── dns_probe.py    # aiodns MX probe, shared resolver, parallel TLD gather
 │       ├── serper_client.py# Google search enrichment, enrichment_cache integration
-│       ├── zuhal_client.py # Zuhal rescue backend (runs only when both SMTP backends reject)
+│       ├── zuhal_client.py # Zuhal rescue backend (rescues SMTP-inconclusive records; decoupled queue)
 │       ├── ms_verify.py    # MS GetCredentialType probe (free, short-circuits Microsoft domains)
 │       ├── email_patterns.py # Pattern generation + per-MX ranking from pattern_stats
 │       ├── text.py         # Name parsing, domain stem generation, strategy assignment
@@ -183,19 +183,20 @@ InputRecord (RAW)
         invalid → skip candidate
         unknown → continue
 
-[2] Racknerd SMTP first; bbops only when Racknerd can't decide (sequential, lazy)
-        Racknerd valid / catch_all          → VALIDATED ✓ (bbops skipped, bbops_status=not_run)
-        Racknerd tunnel down                → re-queue, no burn
-        else (blocked/error/invalid)        → run bbops, then reconcile():
-          valid / catch_all (either backend) → VALIDATED  ✓
-          blocked (Racknerd)                 → re-queue, no burn (IP block, not email verdict)
-          both invalid                        → [3]
-          mixed error / tunnel down           → re-queue (no attempt burned)
+[2] Cherry fleet / Racknerd SMTP + bbops run CONCURRENTLY (asyncio.gather) as two co-equal
+    checkers — bbops is NOT a fallback. Short-circuits on the first `valid`. Then reconcile():
+        valid / catch_all (either backend)  → VALIDATED  ✓
+        both invalid                         → try next candidate
+                                               (Zuhal rescue is opt-in: --zuhal-on-both-invalid)
+        SMTP inconclusive (1 invalid + 1 error; both error/blocked)
+                                             → [3] if Zuhal configured, else re-queue (no burn)
+        tunnel down                          → re-queue, no burn
 
-[3] Zuhal rescue  (sequential, only when both SMTP → invalid)
+[3] Zuhal rescue (paid) — by default rescues the SMTP-INCONCLUSIVE records (NOT both-invalid),
+    via a decoupled NEEDS_ZUHAL worker pool (zuhal_decoupled, default on)
         valid / accept-all → VALIDATED  ✓
         circuit_open       → re-queue, no burn (auto-heal)
-        else               → try next candidate
+        else               → VALIDATION_FAILED
 
 All pattern candidates fail → harvest (free, --harvest) → Serper fallback (paid) → more candidates
 All candidates exhausted → VALIDATION_FAILED
@@ -215,20 +216,20 @@ browser TLS fingerprint, respects `robots.txt`, and is throttled by one global r
 
 ### OR-of-valids reconciliation conditions
 
-| Racknerd | bbops | Outcome | Note |
-|---|---|---|---|
-| `valid` | any | VALIDATED `valid` | |
-| any | `valid` | VALIDATED `valid` | |
-| `catch_all` | any | VALIDATED `catch_all` | |
-| any | `catch_all` | VALIDATED `catch_all` | |
-| `blocked` | any | re-queue | IP-level block; skip Zuhal |
-| `invalid` | `invalid` | Zuhal rescue | |
-| `invalid` | `error`/`not_run` | re-queue | Can't trust single invalid |
-| `error`/`not_run` | `invalid` | re-queue | Can't trust single invalid |
-| `error` | `error` | re-queue | Both inconclusive |
-| tunnel down | any | re-queue | `"tunnel not up"` in Racknerd message |
+| Racknerd | bbops | `reconcile()` | Default action | Note |
+|---|---|---|---|---|
+| `valid` | any | `valid` | VALIDATED | OR-of-valids — either backend wins |
+| any | `valid` | `valid` | VALIDATED | |
+| `catch_all` | any | `catch_all` | VALIDATED | gated by `catch_all_min_confidence` |
+| any | `catch_all` | `catch_all` | VALIDATED | |
+| `invalid` | `invalid` / `not_run` | `invalid` | try next candidate → VALIDATION_FAILED | Zuhal only with `--zuhal-on-both-invalid` |
+| `invalid` / `not_run` | `invalid` | `invalid` | try next candidate | `not_run` = disabled backend, treated definitive |
+| `invalid` | `error`/`blocked` | `unknown` | Zuhal rescue if configured, else re-queue | single invalid not trusted alone |
+| `error`/`blocked` | `invalid` | `unknown` | Zuhal rescue if configured, else re-queue | |
+| `error`/`blocked` | `error`/`blocked` | `unknown` | Zuhal rescue if configured, else re-queue | both inconclusive |
+| tunnel down | any (no positive) | `unknown` | re-queue, no burn | `"tunnel not up"` in Racknerd message |
 
-**Re-queue** = record returns to `DISCOVERED`. `dispatch_attempts` only increments on terminal verdicts; transient failures do not count against the attempt budget.
+**Re-queue** = record returns to `DISCOVERED`. `dispatch_attempts` increments only when at least one backend returned a definitive verdict (`valid`/`invalid`/`catch_all`); pure-infra outcomes (both inconclusive, tunnel down, Zuhal circuit-open) do not count against the attempt budget.
 
 ---
 
@@ -541,6 +542,6 @@ CLI). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled w
 | Racknerd SMTP | $0 | Fixed VPS cost; no per-probe fee |
 | bbops | Per contract | Async batch verifier; probes all non-MS records |
 | MS probe | $0 | Free; short-circuits all Microsoft 365 / Exchange Online domains |
-| Zuhal | $0.0005 | Rescue only — runs when both Racknerd + bbops return `invalid` |
+| Zuhal | $0.0005 | Rescue for SMTP-inconclusive records (decoupled queue); both-invalid only with `--zuhal-on-both-invalid` |
 
-Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record that fails both SMTP backends (typically 5–15% of records).
+Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record SMTP can't decide (typically 5–15% of records).
