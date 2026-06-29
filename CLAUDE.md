@@ -417,3 +417,18 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | Zuhal | $0.0005 | Rescue only — runs when both Racknerd + bbops return `invalid` |
 
 Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record that fails both SMTP backends (typically 5–15% of records).
+
+---
+
+## Versioning
+
+Annotated git tags mark checkpoints on `main` — documentation only, not wired into CI or `deploy.sh`. Format: `vMAJOR.MINOR.PATCH`.
+
+```bash
+git tag -a v0.2.0 -m "short summary of what landed since the last tag"
+git push origin v0.2.0
+```
+
+- PATCH for a fix/refactor/docs-only change, MINOR for a merged feature, MAJOR for a breaking change to the DB schema or CSV output columns.
+- `v0.1.0` is the starting point.
+- Not the same thing as `SCHEMA_VERSION` in `pipeline/db/schema.py` — that's the SQLite migration counter, unrelated to project releases.
