@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import logging
 import time
@@ -12,8 +11,6 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
-    INFRA_RETRY_BASE_MINUTES,
-    INFRA_RETRY_MULTIPLIER,
     HEARTBEAT_INTERVAL_S,
     NOTIFY_POLL_TIMEOUT_S,
 )
@@ -26,9 +23,7 @@ from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.ms_verify import is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.rate_limiter import TokenBucket
-from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.text import parse_name
-from pipeline.harvest import harvest, infer_templates
 from pipeline import db
 from pipeline import dispatch_probes as dp
 from pipeline import dispatch_verdicts as dv
@@ -36,8 +31,10 @@ from pipeline.db import State
 from pipeline._dispatch_helpers import (
     catch_all_confidence_floor,
     compute_confidence_score,
+    infra_retry_after,
     pre_score,
     record_pattern,
+    verifier_agreement,
 )
 from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests)
     DEFINITIVE,
@@ -48,27 +45,6 @@ from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests
 )
 
 logger = logging.getLogger("pipeline.dispatcher")
-
-
-
-def _infra_retry_after(requeue_count: int) -> str:
-    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
-    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
-    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _verifier_agreement(rk: str, bb: str) -> str:
-    rk_ok = rk in ("valid", "catch_all")
-    bb_ok = bb in ("valid", "catch_all")
-    if rk_ok and bb_ok:
-        return "both"
-    if rk_ok:
-        return "racknerd_only"
-    if bb_ok:
-        return "bbops_only"
-    return "unknown"
-
 
 
 # ---------------------------------------------------------------------------
@@ -286,68 +262,6 @@ class Dispatcher:
         self.stats["validated"] += 1
         logger.info(log_msg, *log_args)
 
-    async def _inject_harvest_fallback(
-        self, unique_id: str, candidates: list[str], first: str, last: str,
-        strategy: str, mx_provider: str | None, domain: str,
-    ) -> int:
-        """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
-        try:
-            result = await harvest(
-                domain, rate_limiter=self._harvest_rl, timeout_s=self.config.harvest_timeout_s,
-            )
-        except Exception as exc:
-            logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
-            return 0
-        existing = set(candidates)
-        new: list[str] = []
-        # House convention first: a scraped name paired to a harvested email reveals the
-        # template, so generate OUR officer's address with it (synthetic top-ranked pattern).
-        templates = infer_templates(result.emails, result.officers, domain)
-        if templates:
-            rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
-            # strategy is always "with"/"without" from the row; mypy sees only str.
-            for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
-                if c not in existing:
-                    new.append(c)
-                    existing.add(c)
-        for e in result.emails:  # then the literal harvested addresses
-            if e not in existing:
-                new.append(e)
-                existing.add(e)
-        candidates.extend(new)
-        logger.info(
-            "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
-            unique_id, domain, len(result.emails), len(result.officers), len(new),
-            " [BLOCKED]" if result.blocked else "",
-        )
-        return len(new)
-
-    async def _inject_serper_fallback(
-        self, unique_id: str, row: aiosqlite.Row, candidates: list[str]
-    ) -> bool:
-        """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
-        if self.cost_tracker.ceiling_reached():
-            logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
-            return True
-        existing = set(candidates)
-        raw_emails = await dp.serper_enrich(self.serper, self.cache_conn, unique_id, row)
-        new_emails = [e for e in raw_emails if e not in existing]
-        try:
-            await db.mark_serper_enriched(self.conn, unique_id)
-        except Exception as exc:
-            logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
-        self.serper.charge_costs(self.cost_tracker, "serper_dispatcher")
-        if new_emails:
-            candidates.extend(new_emails)
-            logger.info(
-                "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
-                unique_id, len(new_emails), self.serper.last_was_cache_hit,
-            )
-        else:
-            logger.debug("Serper fallback for %s: no candidates found", unique_id)
-        return False
-
     async def _process_record(self, row: aiosqlite.Row) -> None:
         unique_id = row["unique_id"]
         candidates = await self._load_candidates(row)
@@ -470,7 +384,7 @@ class Dispatcher:
             # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
             if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
                 if tunnel_requeue_count < self.config.max_tunnel_requeues:
-                    retry_after = _infra_retry_after(tunnel_requeue_count)
+                    retry_after = infra_retry_after(tunnel_requeue_count)
                     async with self._write_lock:
                         await db.requeue_record(
                             self.conn, unique_id, increment_attempts=False,
@@ -503,7 +417,7 @@ class Dispatcher:
             # with Zuhal configured, handle_inconclusive owns the error/unknown path)
             if bb_verdict.status == "error" and self.zuhal is None:
                 if bbops_requeue_count < self.config.max_bbops_requeues:
-                    retry_after = _infra_retry_after(bbops_requeue_count)
+                    retry_after = infra_retry_after(bbops_requeue_count)
                     async with self._write_lock:
                         await db.requeue_record(
                             self.conn, unique_id, increment_attempts=False,
@@ -560,7 +474,7 @@ class Dispatcher:
                     pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Validated %s → %s [rk=%s bb=%s]",
                     unique_id, email, rk_verdict.status, bb_verdict.status,
-                    verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
+                    verifier_agreement=verifier_agreement(rk_verdict.status, bb_verdict.status),
                 )
                 return
 
@@ -589,15 +503,18 @@ class Dispatcher:
             if i == fb_boundary and candidate_domain:
                 if self.harvest_enabled and not harvested:
                     harvested = True
-                    added = await self._inject_harvest_fallback(
+                    added = await dp.inject_harvest_fallback(
                         unique_id, candidates, _first, _last, strategy, mx_provider, candidate_domain,
+                        self._harvest_rl, self.config.harvest_timeout_s,
                     )
                     if added:
                         fb_boundary += added
                         continue  # try harvested candidates before paying for Serper
                 if not serper_enriched and self.serper:
                     serper_enriched = True  # prevent re-injection on subsequent loops
-                    if await self._inject_serper_fallback(unique_id, row, candidates):
+                    if await dp.inject_serper_fallback(
+                        unique_id, row, candidates, self.serper, self.cache_conn, self.conn, self.cost_tracker,
+                    ):
                         cost_skipped = True
                         break
 

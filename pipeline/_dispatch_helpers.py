@@ -1,11 +1,34 @@
 from __future__ import annotations
 
+import datetime
+
 import aiosqlite
 from rapidfuzz import fuzz
+
+from pipeline.constants import INFRA_RETRY_BASE_MINUTES, INFRA_RETRY_MULTIPLIER
 
 from pipeline import db
 from pipeline.constants import is_untrustworthy_catchall_mx
 from pipeline.utils.email_patterns import email_to_template
+
+def infra_retry_after(requeue_count: int) -> str:
+    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
+    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def verifier_agreement(rk: str, bb: str) -> str:
+    rk_ok = rk in ("valid", "catch_all")
+    bb_ok = bb in ("valid", "catch_all")
+    if rk_ok and bb_ok:
+        return "both"
+    if rk_ok:
+        return "racknerd_only"
+    if bb_ok:
+        return "bbops_only"
+    return "unknown"
+
 
 GENERIC_PREFIXES: frozenset[str] = frozenset({
     "info", "contact", "hello", "admin", "support", "sales", "help",

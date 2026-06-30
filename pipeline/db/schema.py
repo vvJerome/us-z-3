@@ -7,9 +7,6 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-
-_log = logging.getLogger("pipeline.db")
-
 SCHEMA_VERSION = 14
 
 

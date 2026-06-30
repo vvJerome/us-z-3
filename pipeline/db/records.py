@@ -170,12 +170,23 @@ async def requeue_record(
     await conn.commit()
 
 
+_ALLOWED_STATUS_FIELDS: frozenset[str] = frozenset({
+    "failure_reason", "candidate_email", "candidate_emails", "confidence_score",
+    "final_verdict", "zuhal_status", "canonical_status", "canonical_source",
+    "reconciliation_path", "record_state",
+})
+
+
 async def update_record_status(
     conn: aiosqlite.Connection,
     unique_id: str,
     record_state: str,
     **extra_fields: object,
 ) -> None:
+    unknown = extra_fields.keys() - _ALLOWED_STATUS_FIELDS
+    if unknown:
+        raise ValueError(f"update_record_status: unknown column(s): {unknown}")
+
     sets = ["record_state = ?", "updated_at = datetime('now')"]
     values: list[object] = [record_state]
 

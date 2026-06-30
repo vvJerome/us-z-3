@@ -109,7 +109,7 @@ class TestDispatcherReconciliation:
 
         rows = await db.fetch_pending_validation(test_db, limit=10)
         with patch(
-            "pipeline.dispatcher.harvest",
+            "pipeline.dispatch_probes.harvest",
             AsyncMock(return_value=HarvestResult(emails=["owner@acme.com"])),
         ):
             await dispatcher._process_record(rows[0])

@@ -371,3 +371,14 @@ class RacknerdConsumer:
                 await asyncio.wait_for(smtp.quit(), timeout=3.0)
             except Exception:
                 pass
+
+
+class NullRacknerd:
+    """Stub used when --no-racknerd is set; always returns not_run so bbops handles validation."""
+
+    async def verify(self, email: str) -> "BackendVerdict":
+        from pipeline.models import BackendVerdict
+        return BackendVerdict(status="not_run", message="racknerd disabled", verified_at="")
+
+    def is_up(self) -> bool:
+        return False
