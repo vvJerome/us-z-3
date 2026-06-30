@@ -29,6 +29,7 @@ import io
 import logging
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,7 +158,7 @@ async def process_one(
     input_path: Path,
     out_path: Path,
     api_key: str,
-    conn,
+    conn: sqlite3.Connection,
     resume_file_id: str | None = None,
     batch_id: str | None = None,
     operator: str = "",

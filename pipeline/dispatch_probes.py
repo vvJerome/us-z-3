@@ -11,16 +11,12 @@ import time
 
 import aiosqlite
 
-from pipeline.consumers.bbops_async import BbopsUnhealthy
-from pipeline.harvest import harvest, infer_templates
+from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
+from pipeline.consumers.racknerd import NullRacknerd, RacknerdConsumer
 from pipeline.models import BackendVerdict, PipelineHaltError
-from pipeline.utils.cost_tracker import CostTracker
-from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.ms_verify import check_microsoft_email_async
-from pipeline.utils.rate_limiter import TokenBucket
-from pipeline.utils.zuhal_client import ZuhalCircuitOpenError, ZuhalCreditsExhaustedError
-from pipeline import db
-from pipeline.db import State
+from pipeline.utils.serper_client import SerperClient
+from pipeline.utils.zuhal_client import ZuhalCircuitOpenError, ZuhalCreditsExhaustedError, ZuhalClient
 
 logger = logging.getLogger("pipeline.dispatcher")
 
@@ -59,7 +55,7 @@ async def ms_probe(email: str) -> tuple[str, dict]:
     return status, {"stage": "ms_api", "outcome": status, "ms": ms, "email": email}
 
 
-async def zuhal_probe(zuhal, email: str) -> tuple[str, dict]:
+async def zuhal_probe(zuhal: ZuhalClient, email: str) -> tuple[str, dict]:
     t0 = time.monotonic()
     status: str
     try:
@@ -77,7 +73,7 @@ async def zuhal_probe(zuhal, email: str) -> tuple[str, dict]:
     return status, {"stage": "zuhal_fallback", "outcome": status, "ms": ms, "email": email}
 
 
-async def serper_enrich(serper, conn: aiosqlite.Connection, unique_id: str, row: aiosqlite.Row) -> list[str]:
+async def serper_enrich(serper: SerperClient, conn: aiosqlite.Connection, unique_id: str, row: aiosqlite.Row) -> list[str]:
     """Call Serper for a DNS-hit record whose patterns all failed. Returns snippet emails."""
     try:
         result = await serper.enrich(
@@ -88,95 +84,25 @@ async def serper_enrich(serper, conn: aiosqlite.Connection, unique_id: str, row:
             strategy=row["strategy"] or "without",
             conn=conn,
         )
-        return result.candidate_emails
+        return list(result.candidate_emails)
+    except PipelineHaltError:
+        raise
     except Exception as exc:
         logger.warning("Serper fallback error for %s: %s", unique_id, exc)
         return []
 
 
-async def safe_racknerd(racknerd, email: str) -> BackendVerdict:
+async def safe_racknerd(racknerd: RacknerdConsumer | NullRacknerd, email: str) -> BackendVerdict:
     try:
         return await racknerd.verify(email)
     except Exception as exc:
-        return BackendVerdict(status="error", message=str(exc), verified_at="")
+        return BackendVerdict(status="error", message=str(exc), verified_at=None)
 
 
-async def safe_bbops(bbops, record_id: int, email: str) -> BackendVerdict:
+async def safe_bbops(bbops: BbopsAsyncConsumer, record_id: int, email: str) -> BackendVerdict:
     try:
         return await bbops.verify(record_id, email)
     except BbopsUnhealthy:
         raise
     except Exception as exc:
-        return BackendVerdict(status="error", message=str(exc), verified_at="")
-
-
-async def inject_harvest_fallback(
-    unique_id: str,
-    candidates: list[str],
-    first: str,
-    last: str,
-    strategy: str,
-    mx_provider: str | None,
-    domain: str,
-    rate_limiter: TokenBucket | None,
-    timeout_s: float,
-) -> int:
-    """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
-    try:
-        result = await harvest(domain, rate_limiter=rate_limiter, timeout_s=timeout_s)
-    except Exception as exc:
-        logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
-        return 0
-    existing = set(candidates)
-    new: list[str] = []
-    templates = infer_templates(result.emails, result.officers, domain)
-    if templates:
-        rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
-        for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
-            if c not in existing:
-                new.append(c)
-                existing.add(c)
-    for e in result.emails:
-        if e not in existing:
-            new.append(e)
-            existing.add(e)
-    candidates.extend(new)
-    logger.info(
-        "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
-        unique_id, domain, len(result.emails), len(result.officers), len(new),
-        " [BLOCKED]" if result.blocked else "",
-    )
-    return len(new)
-
-
-async def inject_serper_fallback(
-    unique_id: str,
-    row: aiosqlite.Row,
-    candidates: list[str],
-    serper,
-    cache_conn: aiosqlite.Connection,
-    conn: aiosqlite.Connection,
-    cost_tracker: CostTracker,
-) -> bool:
-    """Inject Serper enrichment after patterns exhausted; return True if cost-skipped."""
-    if cost_tracker.ceiling_reached():
-        logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
-        await db.update_record_status(conn, unique_id, State.COST_SKIPPED)
-        return True
-    existing = set(candidates)
-    raw_emails = await serper_enrich(serper, cache_conn, unique_id, row)
-    new_emails = [e for e in raw_emails if e not in existing]
-    try:
-        await db.mark_serper_enriched(conn, unique_id)
-    except Exception as exc:
-        logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
-    serper.charge_costs(cost_tracker, "serper_dispatcher")
-    if new_emails:
-        candidates.extend(new_emails)
-        logger.info(
-            "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
-            unique_id, len(new_emails), serper.last_was_cache_hit,
-        )
-    else:
-        logger.debug("Serper fallback for %s: no candidates found", unique_id)
-    return False
+        return BackendVerdict(status="error", message=str(exc), verified_at=None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -33,7 +34,7 @@ from pipeline.constants import (
 from pipeline.metrics import serve_metrics
 
 
-async def cmd_run(args, config: PipelineConfig) -> None:
+async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
     """Execute the pipeline (producer + dispatcher or one of them)."""
     setup_logging(config)
     logger = logging.getLogger("pipeline")
@@ -48,7 +49,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
     stop_event = asyncio.Event()
 
-    def _signal_handler():
+    def _signal_handler() -> None:
         logger.info("Shutdown signal received — stopping workers gracefully")
         stop_event.set()
 
@@ -86,6 +87,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             if config.racknerd_helo_hostname:
                 rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
 
+            racknerd: RacknerdConsumer | NullRacknerd
             if config.racknerd_enabled and config.racknerd_direct:
                 logger.info("Racknerd in direct mode (no SOCKS5 tunnel)")
                 tunnel = None
@@ -120,7 +122,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
             else:
                 logger.info("Racknerd disabled (--no-racknerd) — bbops + Zuhal only")
                 tunnel = None
-                racknerd = NullRacknerd()  # type: ignore[assignment]
+                racknerd = NullRacknerd()
 
             # --- bbops async consumer ---
             bbops_consumer = BbopsAsyncConsumer(
@@ -232,6 +234,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
 
         if config.master_db:
             from pipeline.ops.master_db import flush_from_pipeline_db
+            _master_db_path: Path = config.master_db
 
             async def _master_db_flush_loop() -> None:
                 while not stop_event.is_set():
@@ -245,7 +248,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
                         break
                     try:
                         ins, upd = await asyncio.to_thread(
-                            flush_from_pipeline_db, config.master_db, config.db_path
+                            flush_from_pipeline_db, _master_db_path, config.db_path
                         )
                         if ins or upd:
                             logger.info(
@@ -328,7 +331,7 @@ async def cmd_run(args, config: PipelineConfig) -> None:
         logger.info("Pipeline shutdown complete. Cost: $%.4f", cost_tracker.total_cost)
 
 
-async def cmd_status(args) -> None:
+async def cmd_status(args: argparse.Namespace) -> None:
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
@@ -347,7 +350,7 @@ async def cmd_status(args) -> None:
     await conn.close()
 
 
-async def cmd_reset(args) -> None:
+async def cmd_reset(args: argparse.Namespace) -> None:
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"Database not found: {db_path}")

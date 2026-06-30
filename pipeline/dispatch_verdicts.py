@@ -14,22 +14,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from pipeline import db
 from pipeline import dispatch_probes as dp
 from pipeline.db import State
 from pipeline._dispatch_helpers import compute_confidence_score, record_pattern
+from pipeline.models import BackendVerdict
 from pipeline.reconcile import DEFINITIVE, greylisting_retry_after
+
+if TYPE_CHECKING:
+    from pipeline.dispatcher import Dispatcher
 
 logger = logging.getLogger("pipeline.dispatcher")
 
 
 async def handle_inconclusive(
-    disp,
+    disp: Dispatcher,
     unique_id: str,
     email: str,
-    rk_verdict,
-    bb_verdict,
+    rk_verdict: BackendVerdict,
+    bb_verdict: BackendVerdict,
     candidate_domain: str,
     strategy: str,
     agent_name: str,
@@ -143,11 +148,11 @@ async def handle_inconclusive(
 
 
 async def rescue_both_invalid(
-    disp,
+    disp: Dispatcher,
     unique_id: str,
     email: str,
-    rk_verdict,
-    bb_verdict,
+    rk_verdict: BackendVerdict,
+    bb_verdict: BackendVerdict,
     candidate_domain: str,
     strategy: str,
     agent_name: str,
@@ -164,6 +169,7 @@ async def rescue_both_invalid(
         logger.info("Cost ceiling reached before Zuhal — skipping %s", unique_id)
         await db.update_record_status(disp.conn, unique_id, State.COST_SKIPPED)
         return "cost_skipped"
+    assert disp.zuhal is not None
     zuhal_status, zuhal_trace = await dp.zuhal_probe(disp.zuhal, email)
     pending_trace.append(zuhal_trace)
 

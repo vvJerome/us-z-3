@@ -54,9 +54,12 @@ us-z-3/
 │   ├── __main__.py         # Entry point: cmd_run / cmd_status / cmd_reset
 │   ├── producer.py         # DNS probe + Serper enrichment → fills DISCOVERED queue
 │   ├── dispatcher.py       # Backend coordinator: MS/Racknerd/bbops + candidate loop
+│   ├── zuhal_dispatcher.py # Decoupled Zuhal rescue worker (ZuhalDispatcher, --zuhal-decoupled)
 │   ├── reconcile.py        # OR-of-valids policy + greylisting (pure decision logic)
-│   ├── dispatch_probes.py  # Backend probe wrappers (ms/zuhal/serper/racknerd/bbops)
+│   ├── dispatch_probes.py  # Backend probe wrappers (ms/zuhal/racknerd/bbops) — no DB writes
 │   ├── dispatch_verdicts.py# Zuhal-rescue verdict handling for the candidate loop
+│   ├── _dispatch_helpers.py# Pure scoring helpers + infra retry + fallback injection (DB writes OK)
+│   ├── output.py           # CSV/JSON output writers + status display (write_outputs, print_status)
 │   ├── verdicts.py         # Canonical verdict vocabulary (normalize_verdict + sources)
 │   ├── harvest/            # Website harvester: free email/officer scrape (--harvest)
 │   │   ├── __init__.py     # harvest(domain) → HarvestResult orchestration
@@ -80,8 +83,10 @@ us-z-3/
 │   ├── metrics.py          # Prometheus /metrics endpoint (port 9090)
 │   ├── ops/                # Operator-facing tools (post-pipeline workflows)
 │   │   ├── manifest_init.py        # Backfill manifest from existing CSV outputs
+│   │   ├── master_db.py            # Merge per-run pipeline.db files into a single central DB
 │   │   ├── passoff_watcher.py      # Drip-feed daemon: ingest results → append to combined CSV
 │   │   ├── zuhal_bulk.py           # Submit NEEDS_ZUHAL CSVs to Zuhal Bulk API
+│   │   ├── zuhal_spot_check.py     # Spot-check Zuhal verdicts on a sample of validated records
 │   │   ├── zb_zuhaled.py           # Submit /zuhaled CSVs to ZeroBounce (--min-confidence gate)
 │   │   ├── ingest_zerobounce.py    # Join /zerobounced CSV back to records (ZB = ground truth)
 │   │   ├── zuhal_rescue.py         # Standalone Zuhal rescue pass over VALIDATION_FAILED
@@ -89,7 +94,7 @@ us-z-3/
 │   │   ├── requeue_zuhal_429_burns.py  # Recover records burned by Zuhal 429 bug
 │   │   └── zuhal_usage_report.py   # Real Zuhal credit/cost usage: live verdicts + bulk CSV submissions
 │   ├── consumers/
-│   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1)
+│   │   ├── racknerd.py     # Direct SMTP via SSH SOCKS5 tunnel (Backend 1) + NullRacknerd stub
 │   │   └── bbops_async.py  # Async bbops.io batch verifier (Backend 2)
 │   ├── tunnels/
 │   │   └── ssh_socks.py    # SSH SOCKS5 tunnel supervisor with auto-restart
@@ -100,6 +105,7 @@ us-z-3/
 │       ├── ms_verify.py    # MS GetCredentialType probe (free, short-circuits Microsoft domains)
 │       ├── email_patterns.py # Pattern generation + per-MX ranking from pattern_stats
 │       ├── text.py         # Name parsing, domain stem generation, strategy assignment
+│       ├── owner_inference.py # Registered-agent → business-owner likelihood scoring
 │       ├── cost_tracker.py # Per-service cost accumulator with ceiling check
 │       ├── rate_limiter.py # TokenBucket async rate limiter
 │       ├── backoff.py      # Generic exponential backoff with jitter
@@ -143,6 +149,7 @@ us-z-3/
 │   ├── zuhal_bulk.sh       # → pipeline.ops.zuhal_bulk
 │   ├── zuhal_rescue.sh     # → pipeline.ops.zuhal_rescue
 │   └── zuhal_usage_report.sh # → pipeline.ops.zuhal_usage_report
+├── mypy.ini
 ├── requirements.txt
 ├── pytest.ini
 └── .env.example
@@ -399,9 +406,11 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 ## Running tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q    # all 515 tests
-.venv/bin/python -m pytest tests/unit/ -q               # fast unit tests only
-.venv/bin/python -m pytest tests/e2e/ -q                # end-to-end subprocess tests
+make check                                              # full gate: pytest + mypy (run before every commit)
+.venv/bin/python -m pytest tests/ -q                   # tests only (619 tests)
+.venv/bin/mypy pipeline/                               # type-check only
+.venv/bin/python -m pytest tests/unit/ -q              # fast unit tests only
+.venv/bin/python -m pytest tests/e2e/ -q               # end-to-end subprocess tests
 ```
 
 ---

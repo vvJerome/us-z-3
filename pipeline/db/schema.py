@@ -395,6 +395,6 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
                 if not expected:
                     _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
 
-    await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    await conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
     await conn.commit()
     _log.info("Schema migration to v%d complete", SCHEMA_VERSION)

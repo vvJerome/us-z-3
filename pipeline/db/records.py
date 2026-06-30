@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import cast
 
 import aiosqlite
 
@@ -81,7 +82,7 @@ async def fetch_pending_validation(
         """,
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()  # type: ignore[return-value]
+        return cast(list[aiosqlite.Row], await cursor.fetchall())
 
 
 async def has_pending_validation(conn: aiosqlite.Connection) -> bool:
@@ -100,7 +101,7 @@ async def fetch_pending_discovery(
         "SELECT * FROM records WHERE record_state = 'DISCOVERING' LIMIT ?",
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()  # type: ignore[return-value]
+        return cast(list[aiosqlite.Row], await cursor.fetchall())
 
 
 async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> None:

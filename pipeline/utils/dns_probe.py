@@ -80,7 +80,7 @@ async def _resolve_mx(resolver: aiodns.DNSResolver, domain: str) -> str | None:
         records = await resolver.query(domain, "MX")
         if records:
             best = min(records, key=lambda r: r.priority)
-            return best.host
+            return str(best.host)
         return None
     except aiodns.error.DNSError:
         return None

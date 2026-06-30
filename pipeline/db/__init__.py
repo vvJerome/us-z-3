@@ -65,3 +65,4 @@ from pipeline.db.bbops_jobs import (  # noqa: F401
     mark_bbops_job_done,
     fetch_inflight_bbops_batches,
 )
+from pipeline.db.row_types import RecordRow  # noqa: F401

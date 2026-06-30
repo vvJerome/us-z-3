@@ -5,11 +5,13 @@ import csv
 import json
 import logging
 from pathlib import Path
+from typing import cast
 
 import aiosqlite
 
 from pipeline._dispatch_helpers import confidence_tier
 from pipeline.config import PipelineConfig
+from pipeline.db.row_types import RecordRow
 from pipeline.utils.text import domain_confidence_tier
 from pipeline.utils.owner_inference import owner_confidence_tier
 from pipeline import db
@@ -154,7 +156,7 @@ async def write_outputs(conn: aiosqlite.Connection, config: PipelineConfig) -> N
           FROM records WHERE record_state = 'VALIDATED'
         """
     ) as cursor:
-        rows = await cursor.fetchall()
+        rows = [cast(RecordRow, r) for r in await cursor.fetchall()]
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

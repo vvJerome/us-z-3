@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from typing import cast
 
 import aiosqlite
 
@@ -15,7 +16,7 @@ from pipeline.constants import (
     NOTIFY_POLL_TIMEOUT_S,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
-from pipeline.consumers.racknerd import RacknerdConsumer
+from pipeline.consumers.racknerd import NullRacknerd, RacknerdConsumer
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline.utils.serper_client import SerperClient
 from pipeline.models import BackendVerdict, PipelineHaltError
@@ -25,6 +26,7 @@ from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.text import parse_name
 from pipeline import db
+from pipeline.db.row_types import RecordRow
 from pipeline import dispatch_probes as dp
 from pipeline import dispatch_verdicts as dv
 from pipeline.db import State
@@ -32,6 +34,8 @@ from pipeline._dispatch_helpers import (
     catch_all_confidence_floor,
     compute_confidence_score,
     infra_retry_after,
+    inject_harvest_fallback,
+    inject_serper_fallback,
     pre_score,
     record_pattern,
     verifier_agreement,
@@ -68,7 +72,7 @@ class Dispatcher:
         self,
         config: PipelineConfig,
         conn: aiosqlite.Connection,
-        racknerd: RacknerdConsumer,
+        racknerd: RacknerdConsumer | NullRacknerd,
         bbops: BbopsAsyncConsumer,
         cost_tracker: CostTracker,
         stop_event: asyncio.Event | None = None,
@@ -186,7 +190,7 @@ class Dispatcher:
                 # Don't write partial verdicts on shutdown — records stay VALIDATING
                 # and will be recovered as DISCOVERED on next start
                 return
-            await self._process_record(row)
+            await self._process_record(cast(RecordRow, row))
 
     async def _fail(self, unique_id: str, reason: str, *args: object, failure_reason: str | None = None) -> None:
         """Terminal VALIDATION_FAILED write + stats bump. `reason` is a %-format string."""
@@ -196,7 +200,7 @@ class Dispatcher:
             await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED, **kw)
         self.stats["validation_failed"] += 1
 
-    async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
+    async def _load_candidates(self, row: RecordRow) -> list[str] | None:
         """Check dispatch budget and parse candidate_emails; mark VALIDATION_FAILED and return None if it can't proceed."""
         unique_id = row["unique_id"]
         # dispatch_attempts counts only re-queues where a real verdict was obtained.
@@ -216,7 +220,8 @@ class Dispatcher:
             await self._fail(unique_id, "no candidate_emails")
             return None
         try:
-            return json.loads(raw_candidates)
+            parsed: list[str] = json.loads(raw_candidates)
+            return parsed
         except (json.JSONDecodeError, TypeError):
             await self._fail(unique_id, "invalid candidate_emails JSON")
             return None
@@ -262,7 +267,7 @@ class Dispatcher:
         self.stats["validated"] += 1
         logger.info(log_msg, *log_args)
 
-    async def _process_record(self, row: aiosqlite.Row) -> None:
+    async def _process_record(self, row: RecordRow) -> None:
         unique_id = row["unique_id"]
         candidates = await self._load_candidates(row)
         if candidates is None:
@@ -326,8 +331,8 @@ class Dispatcher:
                     score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name)
                     await self._write_validated(
                         unique_id, email,
-                        BackendVerdict("ms_valid", "MS GetCredentialType probe", None),
-                        BackendVerdict("not_run", "skipped — MS probe hit", None),
+                        BackendVerdict("ms_valid", "MS GetCredentialType probe", ""),
+                        BackendVerdict("not_run", "skipped — MS probe hit", ""),
                         "valid", score,
                         0,  # MS probe is free, don't count against dispatch_attempts
                         pending_trace, _first, _last, candidate_domain, mx_provider,
@@ -352,7 +357,7 @@ class Dispatcher:
                     dp.safe_racknerd(self.racknerd, email), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at="")
+                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at=None)
             elapsed_rk = int((time.monotonic() - t_rk) * 1000)
             pending_trace.append({
                 "stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed_rk, "email": email,
@@ -372,7 +377,7 @@ class Dispatcher:
                 await self._write_validated(
                     unique_id, email,
                     rk_verdict,
-                    BackendVerdict("not_run", "skipped — Racknerd hit", None),
+                    BackendVerdict("not_run", "skipped — Racknerd hit", ""),
                     rk_verdict.status, score,
                     1,
                     pending_trace, _first, _last, candidate_domain, mx_provider,
@@ -394,7 +399,7 @@ class Dispatcher:
                     logger.debug("Re-queued %s (SSH tunnel not up, retry after %s)", unique_id, retry_after)
                     return
                 # Tunnel limit reached — treat as not_run and proceed bbops-only
-                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at="")
+                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at=None)
                 logger.debug("Tunnel requeue limit hit for %s — proceeding bbops-only", unique_id)
 
             # Racknerd gave blocked/error/invalid — run bbops
@@ -404,9 +409,9 @@ class Dispatcher:
                     dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at="")
+                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at=None)
             except BbopsUnhealthy:
-                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at="")
+                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at=None)
             elapsed_bb = int((time.monotonic() - t_bb) * 1000)
             pending_trace.append({
                 "stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed_bb, "email": email,
@@ -480,15 +485,15 @@ class Dispatcher:
 
             # Both invalid — optional Zuhal rescue when zuhal_on_both_invalid is enabled
             if self.zuhal is not None and self.config.zuhal_on_both_invalid and not skip_paid:
-                action = await dv.rescue_both_invalid(
+                rescue_action: str | None = await dv.rescue_both_invalid(
                     self, unique_id, email, rk_verdict, bb_verdict,
                     candidate_domain, strategy, agent_name, _first, _last,
                     mx_provider, pending_trace,
                 )
-                if action == "cost_skipped":
+                if rescue_action == "cost_skipped":
                     cost_skipped = True
                     break
-                if action == "terminal":
+                if rescue_action == "terminal":
                     return
                 # None → Zuhal also invalid/error — fall through to try next candidate
 
@@ -503,7 +508,7 @@ class Dispatcher:
             if i == fb_boundary and candidate_domain:
                 if self.harvest_enabled and not harvested:
                     harvested = True
-                    added = await dp.inject_harvest_fallback(
+                    added = await inject_harvest_fallback(
                         unique_id, candidates, _first, _last, strategy, mx_provider, candidate_domain,
                         self._harvest_rl, self.config.harvest_timeout_s,
                     )
@@ -512,7 +517,7 @@ class Dispatcher:
                         continue  # try harvested candidates before paying for Serper
                 if not serper_enriched and self.serper:
                     serper_enriched = True  # prevent re-injection on subsequent loops
-                    if await dp.inject_serper_fallback(
+                    if await inject_serper_fallback(
                         unique_id, row, candidates, self.serper, self.cache_conn, self.conn, self.cost_tracker,
                     ):
                         cost_skipped = True

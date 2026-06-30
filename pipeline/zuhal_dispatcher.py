@@ -166,9 +166,9 @@ class ZuhalDispatcher:
             poll_interval = base_interval
 
             tasks = [self._dispatch_one(row) for row in rows]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            dispatch_results = list(await asyncio.gather(*tasks, return_exceptions=True))
 
-            for res in results:
+            for res in dispatch_results:
                 if isinstance(res, PipelineHaltError):
                     raise res
                 if isinstance(res, BaseException):
