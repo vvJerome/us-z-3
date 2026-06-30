@@ -244,7 +244,7 @@ async def inject_serper_fallback(
     new_emails = [e for e in raw_emails if e not in existing]
     try:
         await db.mark_serper_enriched(conn, unique_id)
-    except Exception as exc:
+    except aiosqlite.Error as exc:
         logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
     serper.charge_costs(cost_tracker, "serper_dispatcher")
     if new_emails:
