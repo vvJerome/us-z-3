@@ -7,6 +7,12 @@ Output: `valid_emails.csv` (confirmed emails), `results.json` (run summary), `pi
 
 ---
 
+## Documentation
+
+[UST tracking sheet](https://docs.google.com/spreadsheets/d/1rxTe-nIAU35-6p1OOlVvS0GT6zpYvK0XYngoy0AI7wQ/edit?usp=sharing) - run totals, enhancement docs, and related reports.
+
+---
+
 ## Quick setup
 
 ```bash
