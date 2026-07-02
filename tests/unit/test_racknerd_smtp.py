@@ -21,6 +21,9 @@ def _mx_record(host: str, priority: int) -> MagicMock:
 
 
 def _consumer(**config_kwargs) -> RacknerdConsumer:
+    # helo_hostname's default factory touches the network (socket.getfqdn(), a UDP
+    # "connect" to pick a local IP) — pin it so these tests never depend on DNS/network.
+    config_kwargs.setdefault("helo_hostname", "test.verify.local")
     resolver = AsyncMock()
     return RacknerdConsumer(tunnel=None, config=RacknerdConfig(**config_kwargs), resolver=resolver)
 
@@ -418,26 +421,26 @@ class TestProbeSocks5:
 
 class TestRunSmtpProbeCleanup:
     async def test_rset_failure_does_not_fail_the_probe(self):
-        from tests.unit.test_racknerd import _fake_smtp
+        from tests.unit.test_racknerd import _fake_smtp, _probe_consumer
         smtp = _fake_smtp(rcpt_return=(250, "OK"))
         smtp.rset = AsyncMock(side_effect=RuntimeError("rset boom"))
 
-        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, _ = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "valid"
 
     async def test_quit_failure_does_not_fail_the_probe(self):
-        from tests.unit.test_racknerd import _fake_smtp
+        from tests.unit.test_racknerd import _fake_smtp, _probe_consumer
         smtp = _fake_smtp(rcpt_return=(250, "OK"))
         smtp.quit = AsyncMock(side_effect=RuntimeError("quit boom"))
 
-        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, _ = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "valid"
 
     async def test_malformed_response_code_returns_error(self):
-        from tests.unit.test_racknerd import _fake_smtp
+        from tests.unit.test_racknerd import _fake_smtp, _probe_consumer
         smtp = _fake_smtp(rcpt_return=(None, "garbage"))
 
-        status, msg = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, msg = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "error"
         assert "malformed" in msg.lower()
 
