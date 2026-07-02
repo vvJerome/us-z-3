@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
 
+# Cancel a superseded run on the same PR/branch instead of letting both finish —
+# avoids wasting runner minutes on a push that's already been overtaken.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,9 +23,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.lock
 
       - name: Install dependencies
         run: pip install -r requirements.lock
 
       - name: Test and type-check
         run: make check
+
+  docker-build:
+    # A Dockerfile-breaking change (bad COPY path, missing system dep) previously
+    # wasn't caught until after merge — build.yml only ran on push to main. This
+    # builds (never pushes) on every PR so that's a pre-merge gate too.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -70,14 +70,24 @@ Every PR uses this structure (use `/review-pr` to generate):
 
 Two workflows run on every PR:
 
-- **`test.yml`** (job `test`) — `make check` (pytest + mypy + coverage gate). **Required**:
-  `main` is branch-protected to block merge until this passes. No path filters, by
-  design — a required check that can be *skipped* (path/branch filters, commit-message
-  conditions) sits in "Pending" forever and blocks the merge permanently. Don't add
-  filters to this workflow without re-checking that consequence first.
+- **`test.yml`** — two jobs:
+  - `test` — `make check` (pytest + mypy + coverage gate). **Required**: `main` is
+    branch-protected to block merge until this passes. No path filters, by design —
+    a required check that can be *skipped* (path/branch filters, commit-message
+    conditions) sits in "Pending" forever and blocks the merge permanently. Don't add
+    filters to this workflow without re-checking that consequence first.
+  - `docker-build` — builds (never pushes) the image on every PR. **Required.**
+    `build.yml` only runs on push to `main`, so a Dockerfile-breaking change used to
+    only surface *after* merge; this catches it before.
 - **`pr-lint.yml`** (job `branch-name`) — validates the branch name against the
   convention above. **Advisory only, not required** — a bad branch name shows up as a
   failed check for visibility but never blocks a merge.
+
+Both `test.yml` jobs use `concurrency` with `cancel-in-progress: true` — a superseded
+push cancels the previous run's checks instead of letting both finish, so CI minutes
+aren't spent on a state that's already been overtaken. `release.yml`/`build.yml` use
+`concurrency` *without* cancellation (queue instead) — cancelling a tag push or a
+docker push mid-flight is worth avoiding even though both are reasonably atomic.
 
 Locally, `.claude/hooks/pre-push-check.sh` runs the same `make check` gate before any
 `git push` and blocks the push (exit 2) on failure — catches a broken push before it
@@ -88,13 +98,34 @@ reaches GitHub at all, rather than after a round trip to CI.
 Configured via the GitHub API, not just documentation — verify with
 `gh api repos/<owner>/<repo>/branches/main/protection`:
 
-- Required status check: `test` (non-strict — doesn't force branches to be rebased
-  onto latest `main` before merging).
+- Required status checks: `test`, `docker-build` (non-strict — doesn't force branches
+  to be rebased onto latest `main` before merging). A new required check must have
+  run successfully at least once in the repo before GitHub will let you select it —
+  merge the workflow first, then add it to the required list.
 - Pull request required before merging; 0 mandatory approvals (fits a solo/agent-heavy
   workflow — the gate is the test suite, not a review headcount).
 - Force-push and branch deletion blocked.
 - `enforce_admins: false` — the repo owner can still bypass in a genuine emergency;
   this is deliberately not maximally strict.
+- `delete_branch_on_merge: true` — merged PR branches clean up automatically.
+
+## Dependency and image hygiene
+
+- `.github/dependabot.yml` — weekly PRs for `pip` and `github-actions` ecosystems.
+  **Caveat**: CI/Docker install from `requirements.lock`, not `requirements.txt`, so a
+  Dependabot PR bumping the `.txt` ranges doesn't change what actually gets installed
+  until `make lock` regenerates the lock and the result is committed on top of it —
+  not fully automated, just surfaces "a range moved" so it isn't invisible forever.
+- Dependabot vulnerability alerts (CVE scanning) are a separate, explicit ask — not
+  enabled by default; ask before flipping this repo-level security setting.
+- `build.yml` scans the built image with Trivy (CRITICAL/HIGH, SARIF uploaded to the
+  Security tab) — advisory, never fails the build. Also rebuilds weekly on a schedule
+  (`cron: '0 6 * * 1'`) so `python:3.12-slim`'s upstream security patches reach the
+  shipped image even when nothing in this repo changes for a while.
+- GitHub Actions are pinned by major-version tag (`@v4`, not a commit SHA) —
+  deliberately not SHA-pinned. SHA-pinning is the stricter supply-chain-hardening
+  practice but adds real maintenance overhead (regular Dependabot-driven SHA bumps,
+  unreadable diffs); skipped to match "protocols, not too strict."
 
 ## Releases and versioning
 

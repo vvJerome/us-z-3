@@ -19,6 +19,12 @@ on:
 permissions:
   contents: write
 
+# Queue, don't cancel: two overlapping releases must run one-after-another so the
+# second run's "latest tag" read reflects the first run's completed tag — cancelling
+# a run mid-tag-push could leave a half-created tag/release behind.
+concurrency:
+  group: release-${{ github.workflow }}
+
 jobs:
   tag-and-release:
     runs-on: ubuntu-latest
