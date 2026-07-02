@@ -35,6 +35,13 @@ python -m pipeline status --db output/run_20260430/pipeline.db --watch 5
 
 # Re-queue discovery failures for a retry
 python -m pipeline reset --db output/run_20260430/pipeline.db --status discovery_failed
+
+# Patient retry pass: re-queue ONLY the "couldn't verify" failures (timed out / no
+# answer), leaving definitive-invalid records terminal, then re-run the dispatcher
+# with a longer timeout + more attempts so greylisting holds get a fair retry.
+python -m pipeline reset --db output/<run>/pipeline.db --status validation_failed --unverified-only
+RACKNERD_SMTP_TIMEOUT_S=25 python -m pipeline run --consumer-only --cherry-enabled \
+  --name <run> --max-dispatch-attempts 5
 ```
 
 Via the orchestrator (wraps the pipeline with per-officer ID generation and output merging):
@@ -101,7 +108,7 @@ us-z-3/
 │   └── utils/
 │       ├── dns_probe.py    # aiodns MX probe, shared resolver, parallel TLD gather
 │       ├── serper_client.py# Google search enrichment, enrichment_cache integration
-│       ├── zuhal_client.py # Zuhal rescue backend (runs only when both SMTP backends reject)
+│       ├── zuhal_client.py # Zuhal rescue backend (rescues SMTP-inconclusive records; decoupled queue)
 │       ├── ms_verify.py    # MS GetCredentialType probe (free, short-circuits Microsoft domains)
 │       ├── email_patterns.py # Pattern generation + per-MX ranking from pattern_stats
 │       ├── text.py         # Name parsing, domain stem generation, strategy assignment
@@ -186,19 +193,20 @@ InputRecord (RAW)
         invalid → skip candidate
         unknown → continue
 
-[2] Racknerd SMTP first; bbops only when Racknerd can't decide (sequential, lazy)
-        Racknerd valid / catch_all          → VALIDATED ✓ (bbops skipped, bbops_status=not_run)
-        Racknerd tunnel down                → re-queue, no burn
-        else (blocked/error/invalid)        → run bbops, then reconcile():
-          valid / catch_all (either backend) → VALIDATED  ✓
-          blocked (Racknerd)                 → re-queue, no burn (IP block, not email verdict)
-          both invalid                        → [3]
-          mixed error / tunnel down           → re-queue (no attempt burned)
+[2] Cherry fleet / Racknerd SMTP + bbops run CONCURRENTLY (asyncio.gather) as two co-equal
+    checkers — bbops is NOT a fallback. Short-circuits on the first `valid`. Then reconcile():
+        valid / catch_all (either backend)  → VALIDATED  ✓
+        both invalid                         → try next candidate
+                                               (Zuhal rescue is opt-in: --zuhal-on-both-invalid)
+        SMTP inconclusive (1 invalid + 1 error; both error/blocked)
+                                             → [3] if Zuhal configured, else re-queue (no burn)
+        tunnel down                          → re-queue, no burn
 
-[3] Zuhal rescue  (sequential, only when both SMTP → invalid)
+[3] Zuhal rescue (paid) — by default rescues the SMTP-INCONCLUSIVE records (NOT both-invalid),
+    via a decoupled NEEDS_ZUHAL worker pool (zuhal_decoupled, default on)
         valid / accept-all → VALIDATED  ✓
         circuit_open       → re-queue, no burn (auto-heal)
-        else               → try next candidate
+        else               → VALIDATION_FAILED
 
 All pattern candidates fail → harvest (free, --harvest) → Serper fallback (paid) → more candidates
 All candidates exhausted → VALIDATION_FAILED
@@ -218,20 +226,20 @@ browser TLS fingerprint, respects `robots.txt`, and is throttled by one global r
 
 ### OR-of-valids reconciliation conditions
 
-| Racknerd | bbops | Outcome | Note |
-|---|---|---|---|
-| `valid` | any | VALIDATED `valid` | |
-| any | `valid` | VALIDATED `valid` | |
-| `catch_all` | any | VALIDATED `catch_all` | |
-| any | `catch_all` | VALIDATED `catch_all` | |
-| `blocked` | any | re-queue | IP-level block; skip Zuhal |
-| `invalid` | `invalid` | Zuhal rescue | |
-| `invalid` | `error`/`not_run` | re-queue | Can't trust single invalid |
-| `error`/`not_run` | `invalid` | re-queue | Can't trust single invalid |
-| `error` | `error` | re-queue | Both inconclusive |
-| tunnel down | any | re-queue | `"tunnel not up"` in Racknerd message |
+| Racknerd | bbops | `reconcile()` | Default action | Note |
+|---|---|---|---|---|
+| `valid` | any | `valid` | VALIDATED | OR-of-valids — either backend wins |
+| any | `valid` | `valid` | VALIDATED | |
+| `catch_all` | any | `catch_all` | VALIDATED | gated by `catch_all_min_confidence` |
+| any | `catch_all` | `catch_all` | VALIDATED | |
+| `invalid` | `invalid` / `not_run` | `invalid` | try next candidate → VALIDATION_FAILED | Zuhal only with `--zuhal-on-both-invalid` |
+| `invalid` / `not_run` | `invalid` | `invalid` | try next candidate | `not_run` = disabled backend, treated definitive |
+| `invalid` | `error`/`blocked` | `unknown` | Zuhal rescue if configured, else re-queue | single invalid not trusted alone |
+| `error`/`blocked` | `invalid` | `unknown` | Zuhal rescue if configured, else re-queue | |
+| `error`/`blocked` | `error`/`blocked` | `unknown` | Zuhal rescue if configured, else re-queue | both inconclusive |
+| tunnel down | any (no positive) | `unknown` | re-queue, no burn | `"tunnel not up"` in Racknerd message |
 
-**Re-queue** = record returns to `DISCOVERED`. `dispatch_attempts` only increments on terminal verdicts; transient failures do not count against the attempt budget.
+**Re-queue** = record returns to `DISCOVERED`. `dispatch_attempts` increments only when at least one backend returned a definitive verdict (`valid`/`invalid`/`catch_all`); pure-infra outcomes (both inconclusive, tunnel down, Zuhal circuit-open) do not count against the attempt budget.
 
 ---
 
@@ -366,14 +374,138 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 
 ## Environment variables
 
+All live in `.env` (gitignored); see `.env.example` for a copy-paste template. Only
+`SERPER_API_KEY` plus one SMTP egress source (RackNerd host, `SMTP_HOSTS`, or a Cherry
+fleet) are needed to run.
+
+**Core**
+
 | Variable | Required | Default |
 |---|---|---|
 | `SERPER_API_KEY` | Yes | — |
-| `ZUHAL_API_KEY` | Yes (dispatcher) | — |
-| `RACKNERD_HOST` | Yes (dispatcher) | — |
+| `ZUHAL_API_KEY` | For Zuhal rescue (empty = rescue disabled) | — |
+| `ZEROBOUNCE_API_KEY` | For the post-pipeline ZB ingest only | — |
+| `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
+
+**SMTP egress — single RackNerd VPS / per-worker SMTP tuning**
+
+| Variable | Required | Default |
+|---|---|---|
+| `RACKNERD_HOST` | Yes* | — |
 | `RACKNERD_SSH_USER` | No | `egress` |
 | `RACKNERD_SSH_KEY` | No | `~/.ssh/racknerd_egress` |
-| `BBOPS_BASE_URL` | No | `https://email-verifier.bbops.io` |
+| `RACKNERD_HELO_HOSTNAME` | No — overrides SMTP HELO/MAIL FROM FQDN; fleet falls back to each worker's rDNS/PTR | — |
+| `RACKNERD_CONCURRENCY` | No — parallel SMTP channels per worker | `25` |
+| `RACKNERD_SMTP_TIMEOUT_S` | No | `8.0` |
+
+\* Not required when `--cherry-enabled`, `--smtp-hosts`, or `--racknerd-direct` is set.
+
+**Cherry Servers SMTP fleet**
+
+| Variable | Required | Default |
+|---|---|---|
+| `CHERRY_AUTH_TOKEN` | For provisioning / auto-heal | — |
+| `CHERRY_PROJECT_ID` | For the fleet | — |
+| `CHERRY_TEAM_ID` | For the auto-heal credit guard | — |
+| `CHERRY_REGION` | No | `EU-Nord-1` |
+| `CHERRY_PLAN` | No | `B2-1-1gb-20s-shared` |
+| `CHERRY_SSH_KEY` | No — private key; `<path>.pub` is registered with Cherry | `~/.ssh/cherry_fleet` |
+| `SMTP_HOSTS` | No — explicit worker IPs as a JSON list; overrides the inventory | `[]` |
+| `FLEET_CREDIT_FLOOR_EUR` | No — auto-heal refuses to provision below this | `0.10` |
+| `FLEET_MAX_REPROVISIONS` | No — per-run auto-heal cap | `10` |
+| `FLEET_SCALE_MAX` | No | `10` |
+
+**Durable state backup to R2/S3 (off by default)**
+
+| Variable | Required | Default |
+|---|---|---|
+| `BACKUP_ENABLED` | No — master switch | `false` |
+| `BACKUP_R2_ENDPOINT` | If `BACKUP_ENABLED` — S3-compatible endpoint incl. bucket | — |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | If backing up to R2 | — |
+| `BACKUP_DIR` | No — optional local copy alongside R2 | — |
+| `BACKUP_INTERVAL_S` | No | `300` |
+
+---
+
+## Cherry Servers SMTP fleet (migration)
+
+The SMTP layer migrated from a single RackNerd VPS to a **self-managing fleet of Cherry
+Servers** (hourly, API-provisioned). Architecture: a central coordinator opens one SSH
+SOCKS5 tunnel per worker; **each worker is just a stateless SMTP egress IP** (sshd +
+outbound port 25). All authoritative state stays in the coordinator's `pipeline.db`, so
+no state lives on any VPS (item 2). The fleet implements the same `verify(email)`
+dispatcher seam, so the rest of the pipeline is unchanged.
+
+- **Two co-equal checkers:** the Cherry fleet and bbops run **concurrently** under
+  OR-of-valids — bbops is not a fallback. RackNerd is retained only as an optional
+  failover worker. Zuhal rescue is unchanged.
+- **Live self-management** (`pipeline/fleet/control.py`): monitors each worker's
+  IP-reputation/health and **auto-heals** a degraded worker (drain → terminate →
+  reprovision a fresh IP → reattach) without pausing the run; **load-balances** to the
+  least-loaded healthy worker; **scales** via `scale_to` / a control file. Guards: a
+  credit floor and a per-run reprovision cap.
+- **Per-(worker, provider) telemetry** in `smtp_outcomes` drives provider-aware routing
+  and reroute-on-block (item 5).
+
+```bash
+# Provision a 4-worker fleet (last one in a reserve region for item 6)
+python -m pipeline.fleet provision --count 4 --reserve-region US-Chicago
+python -m pipeline.fleet status
+# Run the pipeline against the fleet
+python -m pipeline run -i input/<file> --cherry-enabled
+# Scale mid-run / tear down
+echo '{"scale_to": 6}' > output/fleet/control.json
+python -m pipeline.fleet teardown --yes        # deletes only fleet-provisioned servers
+```
+
+### Autonomous benchmark (provision → validate → tear down)
+
+One command, default config — point it at a dataset and it provisions a fresh fleet,
+waits for sshd, runs the real validation path, prints the SMTP verdict distribution, and
+**always tears the fleet down** (a `finally` plus a backup trap, so a crash/`kill`/Ctrl-C
+never leaks servers). No per-run scripts.
+
+```bash
+# Verdict distribution only
+python -m pipeline.fleet benchmark --input input/<file> --count 5
+# With a deliverability-accuracy score (email,zb_status CSV ground truth)
+python -m pipeline.fleet benchmark --input input/<file> --count 5 --ground-truth gt.csv
+scripts/cherry_benchmark.sh --input input/<file> --count 5   # thin wrapper, same flags
+```
+
+Zuhal rescue is off by default (it measures the SMTP fleet; pass `--with-zuhal` to keep
+the paid rescue on). `summarize()` reports per-record **decisive accuracy** (definitive
+verdicts that match ground-truth deliverability) and **coverage** (decided / attempted).
+
+### Throughput tuning (≥5k records/hour on a 5-worker fleet)
+
+The dispatcher short-circuits the SMTP fan-out on the first `valid` (a record the fleet
+validates directly no longer waits on the batched bbops backend). Beyond that, the dominant
+limiter is **per-recipient-domain serialization**: one shared semaphore caps concurrent
+probes per domain across the whole fleet, and free-mail domains dominate real data (gmail
+alone is ~30% of the Michigan set). The knobs (defaults already raised for fleets):
+
+| Setting | Default | High-throughput | Effect |
+|---|---|---|---|
+| `FLEET_DOMAIN_CONCURRENCY` | `10` | `10–15` | unblock gmail/yahoo; too high → provider 421-rate-limits cold IPs |
+| `FLEET_BLOCK_COOLDOWN_S` | `120` | `60` | a 421-blocked worker recovers fast instead of collapsing the fleet |
+| `--dispatch-backend-timeout-s` | `60` | `30` | caps the bbops-rescue wait on fleet-non-valid records (trades a little coverage) |
+| `--dispatch-concurrency` | `50` | `100` | keep moderate — over-driving cold IPs *lowers* throughput |
+
+```bash
+FLEET_DOMAIN_CONCURRENCY=10 FLEET_BLOCK_COOLDOWN_S=60 \
+  python -m pipeline run -i input/<file> --cherry-enabled \
+    --dispatch-concurrency 100 --dispatch-backend-timeout-s 30
+```
+
+Sustained ~6k/hour on 5 cold IPs with this. The ceiling is provider rate-limiting of
+cold IPs (gmail throttles low-reputation IPs) — to go higher, scale out to more IPs
+(`--count`/`scale_to`) rather than driving each IP harder.
+
+Fleet package: `pipeline/fleet/` (cherry_client, provisioner, worker, health, balancer,
+manager, control, wiring, benchmark, `__main__` = the provision/status/teardown/benchmark
+CLI). Durable backup: `pipeline/storage/` (R2/S3 via SigV4, no boto3), enabled with
+`BACKUP_ENABLED=true`.
 
 ---
 
@@ -392,11 +524,11 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 | `--harvest` | off | Scrape the business website for emails/officers (free) before the paid Serper fallback |
 | `--chunk-size N` | 100 | Records per producer batch |
 | `--dns-concurrency N` | 100 | Parallel DNS semaphore size |
-| `--dispatch-concurrency N` | 20 | Parallel dispatcher workers |
+| `--dispatch-concurrency N` | 50 | Parallel dispatcher workers |
 | `--dispatch-backend-timeout-s S` | 60.0 | Per-backend timeout for Racknerd + bbops |
 | `--dispatch-chunk-size N` | 50 | Records fetched per dispatcher poll cycle |
 | `--racknerd-host HOST` | — | VPS hostname for SSH tunnel (required for dispatcher) |
-| `--racknerd-concurrency N` | 10 | Parallel SMTP connections via tunnel |
+| `--racknerd-concurrency N` | 25 | Parallel SMTP connections via tunnel |
 | `--no-racknerd` | off | Disable Racknerd backend (bbops + Zuhal only) |
 | `--racknerd-direct` | off | Skip SOCKS5 tunnel; connect directly to MX servers (use when running on the egress VPS) |
 | `--bbops-base-url URL` | bbops.io | Override bbops API base URL |
@@ -407,7 +539,7 @@ RAW → DISCOVERING → DISCOVERY_FAILED
 
 ```bash
 make check                                              # full gate: pytest + mypy (run before every commit)
-.venv/bin/python -m pytest tests/ -q                   # tests only (619 tests)
+.venv/bin/python -m pytest tests/ -q                   # tests only
 .venv/bin/mypy pipeline/                               # type-check only
 .venv/bin/python -m pytest tests/unit/ -q              # fast unit tests only
 .venv/bin/python -m pytest tests/e2e/ -q               # end-to-end subprocess tests
@@ -423,6 +555,6 @@ make check                                              # full gate: pytest + my
 | Racknerd SMTP | $0 | Fixed VPS cost; no per-probe fee |
 | bbops | Per contract | Async batch verifier; probes all non-MS records |
 | MS probe | $0 | Free; short-circuits all Microsoft 365 / Exchange Online domains |
-| Zuhal | $0.0005 | Rescue only — runs when both Racknerd + bbops return `invalid` |
+| Zuhal | $0.0005 | Rescue for SMTP-inconclusive records (decoupled queue); both-invalid only with `--zuhal-on-both-invalid` |
 
-Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record that fails both SMTP backends (typically 5–15% of records).
+Typical Serper-only cost: ~$0.001/record, ~$300 for 300k records. Zuhal rescue adds ~$0.0005 per record SMTP can't decide (typically 5–15% of records).

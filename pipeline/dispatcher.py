@@ -348,45 +348,23 @@ class Dispatcher:
 
                 # unknown/error → fall through to SMTP backends
 
-            # Sequential SMTP probe: Racknerd first, bbops only when Racknerd can't decide
+            # Co-equal concurrent SMTP fan-out: Racknerd + bbops run together as two
+            # equally-weighted checkers reconciled by OR-of-valids. bbops is not a fallback.
+            # We short-circuit on the first `valid` (decisive under OR-of-valids) so a record
+            # the fleet validates directly doesn't wait on the batched bbops backend; a record
+            # the fleet can't validate still waits for bbops to rescue it (coverage unchanged).
             timeout = self.config.dispatch_backend_timeout_s
+            t_smtp = time.monotonic()
+            rk_verdict, bb_verdict = await dp.run_backends(
+                self.racknerd, self.bbops, email, mx_provider, row["id"], timeout)
+            elapsed = int((time.monotonic() - t_smtp) * 1000)
 
-            t_rk = time.monotonic()
-            try:
-                rk_verdict = await asyncio.wait_for(
-                    dp.safe_racknerd(self.racknerd, email), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at=None)
-            elapsed_rk = int((time.monotonic() - t_rk) * 1000)
-            pending_trace.append({
-                "stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed_rk, "email": email,
-            })
-            last_rk = rk_verdict
+            pending_trace.append({"stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed, "email": email})
+            pending_trace.append({"stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed, "email": email})
 
-            # Racknerd valid: accept. catch_all: accept only if identity confidence
-            # clears the gate (flag default 0.0 = accept all, current behavior);
-            # below the gate, fall through to bbops for a second signal.
-            if rk_verdict.status == "valid" or (
-                rk_verdict.status == "catch_all"
-                and candidate_score >= catch_all_floor
-            ):
-                score = compute_confidence_score(
-                    email, candidate_domain, strategy, rk_verdict.status, agent_name
-                )
-                await self._write_validated(
-                    unique_id, email,
-                    rk_verdict,
-                    BackendVerdict("not_run", "skipped — Racknerd hit", ""),
-                    rk_verdict.status, score,
-                    1,
-                    pending_trace, _first, _last, candidate_domain, mx_provider,
-                    "Racknerd-validated (bbops skipped): %s → %s", unique_id, email,
-                    verifier_agreement="racknerd_only",
-                )
-                return
-
-            # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
+            # Tunnel down: re-queue within a backoff budget; once exhausted, stop trusting
+            # Racknerd's signal for this candidate so reconcile() falls back to bbops alone
+            # instead of hitting its unconditional tunnel-down → unknown special-case forever.
             if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
                 if tunnel_requeue_count < self.config.max_tunnel_requeues:
                     retry_after = infra_retry_after(tunnel_requeue_count)
@@ -398,25 +376,10 @@ class Dispatcher:
                     self.stats["requeued"] += 1
                     logger.debug("Re-queued %s (SSH tunnel not up, retry after %s)", unique_id, retry_after)
                     return
-                # Tunnel limit reached — treat as not_run and proceed bbops-only
                 rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at=None)
-                logger.debug("Tunnel requeue limit hit for %s — proceeding bbops-only", unique_id)
+                logger.debug("Tunnel requeue limit hit for %s — proceeding on bbops result", unique_id)
 
-            # Racknerd gave blocked/error/invalid — run bbops
-            t_bb = time.monotonic()
-            try:
-                bb_verdict = await asyncio.wait_for(
-                    dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at=None)
-            except BbopsUnhealthy:
-                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at=None)
-            elapsed_bb = int((time.monotonic() - t_bb) * 1000)
-            pending_trace.append({
-                "stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed_bb, "email": email,
-            })
-            last_bb = bb_verdict
+            last_rk, last_bb = rk_verdict, bb_verdict
 
             # bbops error: apply per-infra requeue budget (only when no Zuhal fallback;
             # with Zuhal configured, handle_inconclusive owns the error/unknown path)

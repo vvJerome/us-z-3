@@ -55,6 +55,10 @@ from pipeline.db.patterns import (  # noqa: F401
     get_pattern_rankings,
     record_pattern_result,
 )
+from pipeline.db.smtp_outcomes import (  # noqa: F401
+    record_smtp_outcome,
+    get_worker_provider_stats,
+)
 from pipeline.db.enrichment import (  # noqa: F401
     mark_serper_enriched,
     get_enrichment_cache,

@@ -123,8 +123,8 @@ class TestDispatcherReconciliation:
         assert row["candidate_email"] == "owner@acme.com"  # the harvested address won
         assert row["racknerd_status"] == "valid"
 
-    async def test_racknerd_valid_skips_bbops(self, test_db, config):
-        """Racknerd valid short-circuits: bbops is skipped (sequential flow)."""
+    async def test_racknerd_valid_runs_bbops_concurrently(self, test_db, config):
+        """Co-equal fan-out: bbops runs alongside Racknerd, not as a fallback."""
         await _insert_discovered(test_db, "rec1")
         await db.upsert_checkpoint(test_db, "producer_done", "true")
 
@@ -146,8 +146,8 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "valid"
         assert row["racknerd_status"] == "valid"
-        assert row["bbops_status"] == "not_run"  # skipped — Racknerd hit
-        bb.verify.assert_not_called()
+        assert row["bbops_status"] == "valid"  # bbops ran concurrently (co-equal checker)
+        bb.verify.assert_called()
 
     async def test_racknerd_valid_bbops_invalid_still_valid(self, test_db, config):
         await _insert_discovered(test_db, "rec1")
@@ -207,8 +207,8 @@ class TestDispatcherReconciliation:
         assert row["requeue_count"] == 1  # safety valve always increments
 
     async def test_tunnel_down_requeues_without_incrementing_attempt(self, test_db, config):
-        """Tunnel-down is a pure infra failure — re-queues without burning dispatch_attempts
-        and bbops is never called (early return before running bbops)."""
+        """Tunnel-down is a pure infra failure — re-queues without burning dispatch_attempts.
+        bbops runs concurrently, but its invalid verdict can't override the infra failure."""
         await _insert_discovered(test_db, "rec1")
 
         rk = _mock_racknerd("error", "tunnel not up")
@@ -227,7 +227,7 @@ class TestDispatcherReconciliation:
         assert row["record_state"] == State.DISCOVERED
         assert row["dispatch_attempts"] == 0  # infra transient — budget not consumed
         assert row["requeue_count"] == 1  # safety valve always increments
-        bb.verify.assert_not_called()  # bbops never runs when tunnel is down
+        bb.verify.assert_called()  # bbops runs concurrently; its invalid can't beat tunnel-down
 
     async def test_catch_all_writes_validated(self, test_db, config):
         await _insert_discovered(test_db, "rec1")
@@ -814,7 +814,7 @@ class TestCatchAllConfidenceGate:
             row = await cur.fetchone()
         assert row["record_state"] == State.VALIDATED
         assert row["final_verdict"] == "catch_all"
-        bb.verify.assert_not_called()
+        bb.verify.assert_called()  # bbops runs concurrently (co-equal); catch_all still wins
 
     async def test_catch_all_below_gate_not_validated(self, test_db, config):
         """With the gate raised above the candidate's pre_score, a catch_all is not accepted."""
@@ -900,7 +900,7 @@ class TestCandidateReorder:
             test_db, "rec1", ["zzz@example.com", "john.doe@example.com"]
         )
 
-        async def verify(email):
+        async def verify(email, mx_provider=None):
             status = "valid" if email == "john.doe@example.com" else "invalid"
             return BackendVerdict(status=status, message="", verified_at="2026-05-04T00:00:00Z")
 

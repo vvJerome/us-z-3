@@ -158,6 +158,7 @@ async def reset_failed_records(
     conn: aiosqlite.Connection,
     record_state: str = State.DISCOVERY_FAILED,
     phase: str | None = None,
+    unverified_only: bool = False,
 ) -> int:
     if phase:
         sql = """
@@ -174,6 +175,11 @@ async def reset_failed_records(
                 updated_at = datetime('now')
                 WHERE record_state = ?
             """
+            # Re-queue only "couldn't verify" failures (timed out / no answer); leave
+            # definitive-invalid records (final_verdict set) terminal so a patient retry
+            # pass does not re-probe addresses already known to be bad.
+            if unverified_only:
+                sql += " AND final_verdict IS NULL"
         else:
             sql = """
                 UPDATE records SET record_state = 'RAW', discovery_attempts = 0,
