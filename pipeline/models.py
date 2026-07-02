@@ -78,7 +78,7 @@ class BackendVerdict:
     """Result from a single SMTP backend for one email probe."""
     status: BackendStatus
     message: str
-    verified_at: str  # ISO timestamp
+    verified_at: str | None  # ISO timestamp; None for synthetic/stub verdicts
 
 
 FinalVerdict = Literal["valid", "invalid", "catch_all", "unknown"]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import aiosqlite
 
 
@@ -66,7 +68,7 @@ async def fetch_pending_zuhal(
         """,
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()  # type: ignore[return-value]
+        return cast(list[aiosqlite.Row], await cursor.fetchall())
 
 
 async def has_pending_zuhal(conn: aiosqlite.Connection) -> bool:

@@ -61,7 +61,7 @@ async def _zb_verify(
             # Normalise to match pipeline verdict labels
             if status == "catch-all":
                 status = "catch_all"
-            return status
+            return str(status)
         except Exception as exc:
             logger.warning("ZeroBounce error for %s: %s", email, exc)
             return "error"

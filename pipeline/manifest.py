@@ -279,7 +279,7 @@ def email_of(row: dict) -> str:
     for k in _EMAIL_KEYS:
         v = row.get(k)
         if v:
-            return v.strip().lower()
+            return str(v).strip().lower()
     return ""
 
 

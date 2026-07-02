@@ -29,7 +29,7 @@ log = logging.getLogger("ingest_zerobounce")
 def _get(row: dict, *keys: str) -> str:
     for k in keys:
         if k in row and (row[k] or "").strip():
-            return row[k].strip()
+            return str(row[k]).strip()
     return ""
 
 

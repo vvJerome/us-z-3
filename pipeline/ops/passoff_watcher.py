@@ -10,6 +10,7 @@ import argparse
 import csv
 import logging
 import signal
+import sqlite3
 import time
 from pathlib import Path
 
@@ -44,7 +45,7 @@ PASSOFF_COLS = [
 _running = True
 
 
-def _on_signal(signum, frame):
+def _on_signal(signum: int, frame: object) -> None:
     global _running
     _running = False
     log.info("Caught signal %d, stopping after current cycle", signum)
@@ -62,7 +63,7 @@ def ensure_passoff_header(path: Path) -> None:
         csv.DictWriter(f, fieldnames=PASSOFF_COLS).writeheader()
 
 
-def append_confirmed_from_zb(conn, src: Path, operator: str) -> int:
+def append_confirmed_from_zb(conn: sqlite3.Connection, src: Path, operator: str) -> int:
     """Append rows where zb_status in {valid, catch-all} that aren't yet in passoff."""
     out_path = passoff_path(operator)
     ensure_passoff_header(out_path)
@@ -106,7 +107,7 @@ def append_confirmed_from_zb(conn, src: Path, operator: str) -> int:
     return appended
 
 
-def append_confirmed_from_zuhal(conn, src: Path, operator: str) -> int:
+def append_confirmed_from_zuhal(conn: sqlite3.Connection, src: Path, operator: str) -> int:
     """Append rows where zuhal_verdict in {valid, catch_all} that haven't been
     seen by ZB yet and aren't yet in passoff. ZB-confirmed paths take precedence
     when both signals exist for the same email.
@@ -162,7 +163,7 @@ def file_fingerprint(path: Path) -> tuple[int, int]:
     return (int(st.st_mtime), st.st_size)
 
 
-def scan_once(conn, seen_fingerprints: dict[Path, tuple[int, int]]) -> None:
+def scan_once(conn: sqlite3.Connection, seen_fingerprints: dict[Path, tuple[int, int]]) -> None:
     for op in OPERATORS:
         for kind, root in (
             ("zuhal", US_OUT / "zuhaled" / op),

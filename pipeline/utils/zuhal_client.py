@@ -76,7 +76,8 @@ class ZuhalClient:
                 try:
                     data = await resp.json()
                     inner = data.get("data", {})
-                    return inner.get("remaining_credits")
+                    v = inner.get("remaining_credits")
+                    return int(v) if v is not None else None
                 except Exception:
                     return None
             return None

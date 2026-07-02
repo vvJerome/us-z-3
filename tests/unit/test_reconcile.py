@@ -2,7 +2,8 @@
 
 import pytest
 
-from pipeline.dispatcher import reconcile, _verifier_agreement
+from pipeline.reconcile import reconcile
+from pipeline._dispatch_helpers import verifier_agreement as _verifier_agreement
 from pipeline.models import BackendVerdict
 
 

@@ -14,6 +14,7 @@ from rapidfuzz import fuzz
 from pipeline.constants import SERVICE_BACKOFF
 from pipeline.models import EnrichmentResult, PipelineHaltError
 from pipeline.utils.backoff import with_backoff
+from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.text import normalize_business_name, parse_name
 from pipeline import db
@@ -63,7 +64,7 @@ class SerperClient:
         self.last_was_cache_hit = False  # set after each enrich() call
         self._credits_exhausted = False  # set on first 400 "not enough credits"
 
-    def charge_costs(self, cost_tracker, service: str) -> None:
+    def charge_costs(self, cost_tracker: CostTracker, service: str) -> None:
         """Charge for the last enrich() call (free on cache hit) plus its site: fallback retries, then reset the counter."""
         if self.last_was_cache_hit:
             cost_tracker.cache_hits += 1
@@ -282,7 +283,8 @@ class SerperClient:
             if resp.status in (429, 500, 503):
                 raise _RetryableHTTPError(resp.status)
             resp.raise_for_status()
-            return await resp.json()
+            data: dict[str, object] = await resp.json()
+            return data
 
     def _extract(
         self,
