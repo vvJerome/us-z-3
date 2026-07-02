@@ -34,6 +34,11 @@ class TestValidationMethod:
     def test_smtp_bbops_when_bbops_catch_all_racknerd_invalid(self):
         assert _validation_method("invalid", "catch_all", "dual_catch_all") == "smtp_bbops"
 
+    def test_smtp_both_when_dual_invalid_and_neither_backend_ok(self):
+        """dual_invalid with both backends genuinely invalid falls through to smtp_both
+        (both ran; neither validated) rather than misreporting a single-backend hit."""
+        assert _validation_method("invalid", "invalid", "dual_invalid") == "smtp_both"
+
     def test_zuhal_rescue_when_zuhal_status_valid(self):
         assert _validation_method("invalid", "invalid", "valid") == "zuhal_rescue"
 
