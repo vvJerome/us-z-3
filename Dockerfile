@@ -7,9 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies first (layer cache)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies first (layer cache). Pinned via requirements.lock
+# (regenerate with `make lock` after any requirements.txt change) so the image
+# that gets built is reproducible, not whatever the range resolves to today.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Copy all source code (entrypoint.py + pipeline/ + orchestrator/ packages)
 COPY . .

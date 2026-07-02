@@ -21,3 +21,4 @@ pytest-cov>=5.0,<6.0
 aioresponses>=0.7,<1.0
 autoflake>=2.3,<3.0
 types-requests>=2.31,<3.0
+pip-tools>=7.4,<8.0

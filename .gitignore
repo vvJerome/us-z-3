@@ -52,6 +52,7 @@ local/
 input/
 output/
 .coverage*
+htmlcov/
 .mypy_cache/
 
 # Enhancement-list working files (source spec, not part of the repo)
