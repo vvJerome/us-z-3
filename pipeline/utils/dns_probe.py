@@ -75,15 +75,20 @@ async def probe_domains(
 
 
 async def _resolve_mx(resolver: aiodns.DNSResolver, domain: str) -> str | None:
-    """Attempt MX lookup. Returns the highest-priority MX host or None."""
-    try:
-        records = await resolver.query(domain, "MX")
-        if records:
-            best = min(records, key=lambda r: r.priority)
-            return str(best.host)
-        return None
-    except aiodns.error.DNSError:
-        return None
+    """Attempt MX lookup. Returns the highest-priority MX host or None.
+
+    Does NOT catch DNSError — this runs inside with_backoff(retryable=_is_transient_dns_error)
+    in probe_domains(), which needs the real exception to decide whether to retry. Catching it
+    here would make every DNS error look like a clean "no MX record" to with_backoff, silently
+    disabling retries for transient failures (SERVFAIL/TIMEOUT) that are supposed to be retried.
+    _probe_one()'s outer except Exception still converts any DNSError that reaches it into
+    (domain, None), so permanent errors (NXDOMAIN etc.) end up with the same result as before.
+    """
+    records = await resolver.query(domain, "MX")
+    if records:
+        best = min(records, key=lambda r: r.priority)
+        return str(best.host)
+    return None
 
 
 def _is_transient_dns_error(exc: Exception) -> bool:
