@@ -68,6 +68,21 @@ class TestReconcileOrOfValids:
         assert result.final_verdict == "unknown"
         assert result.should_write is False
 
+    def test_bbops_valid_overrides_tunnel_down(self):
+        # Co-equal: a positive bbops verdict is honored even when Racknerd's tunnel is down.
+        result = reconcile(_v("error", "tunnel not up"), _v("valid"))
+        assert result.final_verdict == "valid"
+        assert result.should_write is True
+
+
+def test_greylisting_retry_after_is_future_within_jitter():
+    import datetime
+    from pipeline.reconcile import greylisting_retry_after
+    ts = greylisting_retry_after(minutes=15.0, jitter=0.4)
+    dt = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    delta_min = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
+    assert 8.0 <= delta_min <= 22.0  # 15 ± 40%, with margin
+
     def test_not_run_backends(self):
         result = reconcile(_v("not_run"), _v("not_run"))
         assert result.final_verdict == "unknown"

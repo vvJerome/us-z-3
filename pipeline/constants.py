@@ -44,6 +44,7 @@ MAX_WITHOUT_CANDIDATES: int = 3
 # --- Racknerd / direct SMTP ---
 RACKNERD_SMTP_TIMEOUT_S: float = 8.0
 RACKNERD_MX_CACHE_TTL_S: int = 3600       # 1 hour MX resolution cache
+RACKNERD_MX_CACHE_MAX: int = 10_000       # evict oldest quarter past this many domains
 RACKNERD_MX_MAX_HOSTS: int = 3            # probe up to N MX hosts per domain
 RACKNERD_SPAMHAUS_WINDOW_S: int = 60      # sliding window for block detection
 RACKNERD_SPAMHAUS_THRESHOLD: int = 100    # blocks in window before cooldown
@@ -55,6 +56,11 @@ TUNNEL_READY_INTERVAL_S: float = 0.5
 TUNNEL_STOP_TIMEOUT_S: float = 3.0
 TUNNEL_BACKOFF_START_S: float = 2.0
 TUNNEL_BACKOFF_MAX_S: float = 60.0
+
+# --- SMTP fleet (pipeline.fleet) ---
+FLEET_PTR_LOOKUP_TIMEOUT_S: float = 5.0   # cap the reverse-DNS lookup so a slow PTR can't block worker startup
+FLEET_AFFINITY_MAX: int = 100_000         # cap the per-email greylist-affinity map (LRU evict oldest)
+FLEET_DOMAIN_SEM_MAX: int = 10_000        # cap the per-recipient-domain semaphore map (evict idle LRU only)
 
 # --- Dispatcher ---
 DISPATCH_POLL_MAX_INTERVAL_S: int = 30
@@ -87,6 +93,30 @@ def is_untrustworthy_catchall_mx(mx_provider: str | None) -> bool:
         return False
     lp = mx_provider.lower()
     return any(p in lp for p in CATCHALL_UNTRUSTWORTHY_MX)
+
+
+# --- Mail provider classification (item 5: per-provider SMTP routing/limits) ---
+# Ordered MX-host substring → canonical provider label. First match wins, so order
+# matters when a host carries more than one brand token. Anything unmatched is
+# PROVIDER_OTHER. Security gateways (Proofpoint/Mimecast/Barracuda) are kept distinct
+# because they need their own concurrency/retry treatment, not the mailbox default.
+PROVIDER_MX_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("microsoft",    ("mail.protection.outlook.com", "protection.outlook", "outlook.com",
+                      "hotmail.com", "microsoft.com", "office365")),
+    ("google",       ("aspmx.l.google.com", "google.com", "googlemail.com", "gmail.com",
+                      "psmtp.com")),
+    ("yahoo",        ("yahoodns.net", "yahoo.com", "yahoo.net")),
+    ("zoho",         ("zoho.com", "zoho.eu", "zohomail")),
+    ("proofpoint",   ("pphosted.com", "ppe-hosted.com", "proofpoint")),
+    ("mimecast",     ("mimecast.com", "mimecast.co")),
+    ("barracuda",    ("barracudanetworks.com", "barracuda.com")),
+    ("icloud",       ("icloud.com", "me.com", "apple.com")),
+    ("amazon",       ("amazonaws.com", "awsapps.com")),
+    ("secureserver", ("secureserver.net",)),
+    ("yandex",       ("yandex",)),
+)
+PROVIDER_OTHER: str = "other"
+
 
 # --- Fallback domain blocklist ---
 # Known directory/aggregator domains that should never be used as a business domain.

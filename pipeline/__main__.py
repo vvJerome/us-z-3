@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import time
 from pathlib import Path
@@ -73,6 +74,8 @@ async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
     tasks: list[asyncio.Task] = []
     tunnel: SshSocksTunnel | None = None
     bbops_consumer: BbopsAsyncConsumer | None = None
+    fleet_ctx = None
+    backup_worker = None
 
     try:
         if not config.consumer_only:
@@ -87,8 +90,14 @@ async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
             if config.racknerd_helo_hostname:
                 rk_helo_kwargs["helo_hostname"] = config.racknerd_helo_hostname
 
-            racknerd: RacknerdConsumer | NullRacknerd
-            if config.racknerd_enabled and config.racknerd_direct:
+            # Polymorphic SMTP backend: fleet manager, single Racknerd consumer, or null.
+            racknerd: object
+            if config.cherry_enabled or config.smtp_hosts:
+                from pipeline.fleet.wiring import build_fleet
+                fleet_ctx = await build_fleet(config, conn, stop_event, resolver=shared_resolver)
+                racknerd = fleet_ctx.manager
+                logger.info("SMTP backend: Cherry fleet (%d workers)", len(fleet_ctx.manager.workers))
+            elif config.racknerd_enabled and config.racknerd_direct:
                 logger.info("Racknerd in direct mode (no SOCKS5 tunnel)")
                 tunnel = None
                 rk_config = RacknerdConfig(
@@ -190,7 +199,7 @@ async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
             dispatcher = Dispatcher(
                 config=config,
                 conn=conn,
-                racknerd=racknerd,
+                racknerd=racknerd,  # type: ignore[arg-type]
                 bbops=bbops_consumer,
                 cost_tracker=cost_tracker,
                 stop_event=stop_event,
@@ -223,6 +232,22 @@ async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
                     "Zuhal dispatcher started — decoupled rescue worker (concurrency=%d)",
                     config.zuhal_concurrency,
                 )
+
+        if config.backup_enabled and (config.backup_dir or config.backup_r2_endpoint):
+            from pipeline.storage import R2Client, SnapshotWorker
+            r2 = None
+            if config.backup_r2_endpoint:
+                ak, sk = os.environ.get("R2_ACCESS_KEY_ID", ""), os.environ.get("R2_SECRET_ACCESS_KEY", "")
+                if ak and sk:
+                    r2 = R2Client(config.backup_r2_endpoint, ak, sk, session=session)
+                else:
+                    logger.warning("backup_r2_endpoint set but R2 credentials missing — local backup only")
+            backup_worker = SnapshotWorker(
+                config.db_path, backup_dir=config.backup_dir,
+                interval_s=config.backup_interval_s, r2_client=r2,
+            )
+            tasks.append(asyncio.create_task(backup_worker.run(stop_event), name="backup"))
+            logger.info("State backup enabled (dir=%s, r2=%s)", config.backup_dir or "-", r2 is not None)
 
         if not tasks:
             logger.error("No workers to run — check flags")
@@ -290,6 +315,13 @@ async def cmd_run(args: argparse.Namespace, config: PipelineConfig) -> None:
             await bbops_consumer.stop()
         if tunnel:
             await tunnel.stop()
+        if fleet_ctx is not None:
+            await fleet_ctx.aclose()
+        if backup_worker is not None:
+            try:
+                await backup_worker.snapshot_once()
+            except Exception as exc:
+                logger.warning("final state snapshot failed: %s", exc)
 
         # Write final stats
         status_counts: dict[str, int] = {}
@@ -358,22 +390,26 @@ async def cmd_reset(args: argparse.Namespace) -> None:
 
     conn = await db.init_db(db_path)
 
-    _state_map = {
+    state_map = {
         "discovery_failed": "DISCOVERY_FAILED",
         "validation_failed": "VALIDATION_FAILED",
         "cost_skipped": "COST_SKIPPED",
     }
-    state = _state_map.get(args.status, args.status.upper())
+    state = state_map.get(args.status, args.status.upper())
+    unverified_only = getattr(args, "unverified_only", False)
 
     if args.dry_run:
-        async with conn.execute(
-            "SELECT COUNT(*) FROM records WHERE record_state = ?", (state,)
-        ) as cursor:
+        sql = "SELECT COUNT(*) FROM records WHERE record_state = ?"
+        if unverified_only:
+            sql += " AND final_verdict IS NULL"
+        async with conn.execute(sql, (state,)) as cursor:
             row = await cursor.fetchone()
             count = row[0] if row else 0
         print(f"Would re-queue {count} records with status '{args.status}'")
     else:
-        count = await db.reset_failed_records(conn, state, args.phase)
+        count = await db.reset_failed_records(
+            conn, state, args.phase, unverified_only=unverified_only
+        )
         print(f"Re-queued {count} records")
 
     await conn.close()
@@ -401,6 +437,8 @@ async def main() -> None:
         "racknerd_enabled", "racknerd_direct", "racknerd_host", "racknerd_ssh_user", "racknerd_ssh_key",
         "racknerd_ssh_port", "racknerd_socks_port",
         "racknerd_concurrency", "racknerd_smtp_timeout_s", "racknerd_helo_hostname",
+        "cherry_enabled", "smtp_hosts", "cherry_project_id", "cherry_region",
+        "cherry_fleet_size", "fleet_autoscale",
         "harvest_enabled",
         "bbops_base_url", "bbops_batch_size", "bbops_min_batch_size", "bbops_max_inflight",
         "max_attempts", "backoff_jitter",

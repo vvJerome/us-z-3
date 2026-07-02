@@ -234,7 +234,7 @@ class TestMxProvider:
 
 
 class TestPerMxSpamhausGuard:
-    def test_separate_providers_have_independent_cooldowns(self):
+    async def test_separate_providers_have_independent_cooldowns(self):
         consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")
@@ -245,19 +245,19 @@ class TestPerMxSpamhausGuard:
         assert guard_pp.is_cooling() is True
         assert guard_goog.is_cooling() is False
 
-    def test_same_provider_returns_same_guard_instance(self):
+    async def test_same_provider_returns_same_guard_instance(self):
         consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("pphosted.com")
         assert g1 is g2
 
-    def test_different_providers_return_different_guard_instances(self):
+    async def test_different_providers_return_different_guard_instances(self):
         consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("google.com")
         assert g1 is not g2
 
-    def test_blocked_provider_does_not_pause_other_providers(self):
+    async def test_blocked_provider_does_not_pause_other_providers(self):
         consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")

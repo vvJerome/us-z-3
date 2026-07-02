@@ -369,3 +369,49 @@ class TestDispatcherPath:
             f"stdout: {proc.stdout.read().decode()}\n"  # type: ignore[union-attr]
             f"stderr: {proc.stderr.read().decode()}"    # type: ignore[union-attr]
         )
+
+
+class TestResetCli:
+    """reset subcommand flags."""
+
+    def test_reset_unverified_only_dry_run_counts_only_unverified(self, tmp_path: Path):
+        """--unverified-only counts failures without a verdict, not definitive-invalid."""
+        import asyncio
+
+        from pipeline import db
+        from pipeline.db import State
+
+        db_path = tmp_path / "pipeline.db"
+
+        async def _seed():
+            conn = await db.init_db(db_path)
+            await conn.execute(
+                "INSERT INTO records (unique_id, record_state, candidate_email) VALUES (?,?,?)",
+                ("INCONCLUSIVE", State.VALIDATION_FAILED, "a@b.com"),
+            )
+            await conn.execute(
+                "INSERT INTO records (unique_id, record_state, candidate_email, final_verdict) "
+                "VALUES (?,?,?,?)",
+                ("INVALID", State.VALIDATION_FAILED, "a@b.com", "invalid"),
+            )
+            await conn.commit()
+            await conn.close()
+
+        asyncio.run(_seed())
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pipeline", "reset",
+                "--db", str(db_path),
+                "--status", "validation_failed",
+                "--unverified-only", "--dry-run",
+            ],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_test_env(),
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Would re-queue 1 records" in result.stdout

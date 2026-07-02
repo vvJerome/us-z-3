@@ -79,6 +79,7 @@ class BackendVerdict:
     status: BackendStatus
     message: str
     verified_at: str | None  # ISO timestamp; None for synthetic/stub verdicts
+    probe_host: str | None = None  # fleet worker/IP that ran this probe (None = single-host/bbops)
 
 
 FinalVerdict = Literal["valid", "invalid", "catch_all", "unknown"]
