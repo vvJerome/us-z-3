@@ -22,8 +22,24 @@ Every new function that contains logic (not just delegation) needs a test. Speci
 ## What to mock
 
 - External HTTP (Serper, Zuhal, Microsoft API) — use `aioresponses` or `unittest.mock.patch`.
-- `aiodns.DNSResolver.query` — patch to return fake MX records without real DNS.
+- `aiodns.DNSResolver.query` — patch to return fake MX records without real DNS. Pass an
+  explicit `resolver=` (e.g. `AsyncMock()`) to anything that constructs one (`RacknerdConsumer`,
+  `pipeline.fleet.wiring.build_fleet`) — the default-constructs-a-real-`aiodns.DNSResolver()`
+  fallback is a C extension (pycares) that is harmless on macOS but can leave the process unable
+  to exit cleanly on Linux CI. This is exactly what caused two consecutive broken `main` merges.
 - File system only if you can't use `tmp_path` (rare).
+- Don't let ambient machine state (a local `.env`, real env vars) leak into a `PipelineConfig()`
+  under test — set every field the test's assertions depend on explicitly. `RACKNERD_HOST` from
+  a developer's own `.env` passing locally while failing on a `.env`-less CI runner is the other
+  half of the same incident above.
+
+## Network is blocked by default
+
+`pytest.ini` sets `--disable-socket --allow-hosts=127.0.0.1,::1` — any test that touches a real
+external host fails immediately with a clear `SocketBlockedError` instead of hanging or silently
+depending on network reachability. Loopback is allowed (covers aiohttp connectors, local test
+servers, the event loop's self-pipe). If a test legitimately needs a real socket, mark it
+explicitly: `@pytest.mark.enable_socket` (see `pytest-socket` docs) — don't disable this globally.
 
 ## Test structure
 
