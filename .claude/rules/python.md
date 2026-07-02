@@ -36,6 +36,7 @@
 - Catch specific exceptions, not bare `except Exception` unless re-raising.
 - `PipelineHaltError` must always be re-raised — never swallowed.
 - Transient errors go to `logger.warning`; fatal errors to `logger.error` before raising.
+- **Sanctioned exception:** at the outer edge of a call to an external backend (Racknerd, bbops, Zuhal, Serper, Cherry, MS probe), `except Exception` swallowed into an `error`/`status="error"` result is the intended pattern — see `dispatch_probes.safe_racknerd`/`safe_bbops`/`zuhal_probe`. The caller's reconciliation logic (`reconcile()`) is written to treat "backend errored" uniformly regardless of *why* it errored, so narrowing the except clause there would just re-implement what `reconcile()` already does. This does not license a broad `except Exception` anywhere else. Backends that *can* raise `PipelineHaltError` (Serper, Zuhal — bad API key / no credits) re-raise it before the catch-all; Racknerd and bbops have no such failure mode and don't need the explicit re-raise, but if a backend gains one, add it.
 
 ## Comments
 
