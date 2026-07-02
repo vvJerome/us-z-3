@@ -1,0 +1,27 @@
+name: PR lint
+
+# Advisory only — deliberately NOT a required status check (see .claude/rules/git.md).
+# A bad branch name shows up as a failed check for visibility but never blocks a merge;
+# only the `test` job in test.yml is a hard gate.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          # Mirrors the convention in .claude/rules/git.md / the global git-workflow.md:
+          # <type>/<description> — lowercase, hyphens only, 2-50 chars after the slash.
+          PATTERN='^(feat|fix|refactor|docs|test|chore|perf|ci|revert)/[a-z0-9-]{2,50}$'
+          echo "Branch: $BRANCH"
+          if [[ ! "$BRANCH" =~ $PATTERN ]]; then
+            echo "::error::Branch name '$BRANCH' does not match <type>/<description> (lowercase, hyphens, 2-50 chars). Allowed types: feat fix refactor docs test chore perf ci revert."
+            exit 1
+          fi
+          echo "OK"

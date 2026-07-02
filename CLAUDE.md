@@ -547,6 +547,34 @@ make check                                              # full gate: pytest + my
 
 ---
 
+## Versioning
+
+Releases are manual, deliberate benchmarking checkpoints, not software publishes —
+nothing in the pipeline depends on one existing. A release is a `vX.Y.Z` git tag plus
+a GitHub Release with auto-generated notes, giving a fixed reference point to
+correlate a run's `results.json` against an exact commit, and a rollback target if a
+change silently degrades output quality without failing CI (e.g. a retry-logic bug
+that never raises, just quietly stops retrying).
+
+```bash
+/release [major|minor|patch]                  # default: patch
+gh workflow run release.yml -f bump=minor      # equivalent, direct
+```
+
+Version meaning is tied to checkable facts, not judgment calls — there's no public
+API here to version against:
+
+| Bump | Meaning |
+|---|---|
+| **MAJOR** | `SCHEMA_VERSION` (`pipeline/db/schema.py`) bumped, or the CSV column contract in `pipeline/output.py` changed |
+| **MINOR** | New feature/capability |
+| **PATCH** | Fix, refactor, or docs |
+
+See `.claude/rules/git.md` for the full PR-checks / branch-protection / release
+architecture.
+
+---
+
 ## Costs (live runs)
 
 | Service | Per call | Notes |

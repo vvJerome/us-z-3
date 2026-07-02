@@ -3,6 +3,7 @@ name: Build and push pipeline image
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -35,11 +36,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          TAGS="ghcr.io/${{ env.OWNER }}/us-z-3:latest,ghcr.io/${{ env.OWNER }}/us-z-3:${{ github.sha }}"
+          # Secondary/low-priority path: rsync-to-VPS is the real deploy target, but
+          # tag the image to match a release anyway in case the Kestra path is used.
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAGS="$TAGS,ghcr.io/${{ env.OWNER }}/us-z-3:${{ github.ref_name }}"
+          fi
+          echo "list=$TAGS" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ env.OWNER }}/us-z-3:latest
-            ghcr.io/${{ env.OWNER }}/us-z-3:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.list }}
