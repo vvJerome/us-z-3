@@ -30,8 +30,13 @@ def _fake_smtp(rcpt_return=(250, "OK"), rcpt_side_effect=None):
 
 def _probe_consumer() -> RacknerdConsumer:
     """A RacknerdConsumer for calling probe internals directly — helo_hostname pinned
-    so construction never touches the network via _default_helo_hostname()."""
-    return RacknerdConsumer(tunnel=None, config=RacknerdConfig(helo_hostname="test.verify.local"))
+    so construction never touches the network via _default_helo_hostname(), and a fake
+    resolver so it never constructs a real aiodns.DNSResolver() either."""
+    return RacknerdConsumer(
+        tunnel=None,
+        config=RacknerdConfig(helo_hostname="test.verify.local"),
+        resolver=AsyncMock(),
+    )
 
 
 class TestSpamhausGuard:
@@ -83,7 +88,7 @@ class TestRacknerdConsumerTunnelCheck:
         tunnel = MagicMock()
         tunnel.is_up.return_value = tunnel_up
         config = RacknerdConfig(concurrency=1, helo_hostname="test.verify.local")
-        consumer = RacknerdConsumer(tunnel=tunnel, config=config)
+        consumer = RacknerdConsumer(tunnel=tunnel, config=config, resolver=AsyncMock())
         return consumer
 
     async def test_returns_error_when_tunnel_down(self):
@@ -283,7 +288,7 @@ class TestMxProvider:
 
 class TestPerMxSpamhausGuard:
     async def test_separate_providers_have_independent_cooldowns(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"), resolver=AsyncMock())
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")
 
@@ -294,19 +299,19 @@ class TestPerMxSpamhausGuard:
         assert guard_goog.is_cooling() is False
 
     async def test_same_provider_returns_same_guard_instance(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"), resolver=AsyncMock())
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("pphosted.com")
         assert g1 is g2
 
     async def test_different_providers_return_different_guard_instances(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"), resolver=AsyncMock())
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("google.com")
         assert g1 is not g2
 
     async def test_blocked_provider_does_not_pause_other_providers(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"), resolver=AsyncMock())
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")
 
