@@ -35,23 +35,24 @@ async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
     # Cost + API call counts
     async with conn.execute(
         "SELECT estimated_cost_usd, serper_producer_calls, serper_dispatcher_calls, "
-        "zuhal_calls, racknerd_probes, bbops_probes, backend_disagreements "
+        "zuhal_calls, racknerd_probes, bbops_probes, backend_disagreements, serper_cache_hits "
         "FROM stats ORDER BY rowid DESC LIMIT 1"
     ) as cur:
-        row = await cur.fetchone()
-        if row:
-            lines.append(f"pipeline_cost_usd {row[0] or 0:.6f}")
-            serper_total = (row[1] or 0) + (row[2] or 0)
+        stats_row = await cur.fetchone()
+        if stats_row:
+            lines.append(f"pipeline_cost_usd {stats_row[0] or 0:.6f}")
+            serper_total = (stats_row[1] or 0) + (stats_row[2] or 0)
             for svc, n in (
-                ("serper_producer", row[1]),
-                ("serper_dispatcher", row[2]),
+                ("serper_producer", stats_row[1]),
+                ("serper_dispatcher", stats_row[2]),
                 ("serper", serper_total),
-                ("zuhal", row[3]),
-                ("racknerd", row[4]),
-                ("bbops", row[5]),
+                ("zuhal", stats_row[3]),
+                ("racknerd", stats_row[4]),
+                ("bbops", stats_row[5]),
             ):
                 lines.append(f'pipeline_api_calls_total{{service="{svc}"}} {n or 0}')
-            lines.append(f"pipeline_backend_disagreements_total {row[6] or 0}")
+            lines.append(f"pipeline_backend_disagreements_total {stats_row[6] or 0}")
+            lines.append(f"pipeline_serper_cache_hits_total {stats_row[7] or 0}")
 
     body = "\n".join(lines) + "\n"
     return aiohttp.web.Response(text=body, content_type="text/plain")

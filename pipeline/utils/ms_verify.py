@@ -19,6 +19,8 @@ import random
 
 import requests
 
+from pipeline.utils.providers import classify_provider
+
 logger = logging.getLogger("pipeline.consumer")
 
 MS_CREDENTIAL_URL = "https://login.microsoftonline.com/common/GetCredentialType?mkt=en-US"
@@ -33,21 +35,10 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
-# MX host substrings that indicate a Microsoft-hosted domain
-MS_MX_PATTERNS = (
-    "mail.protection.outlook.com",
-    "outlook.com",
-    "hotmail.com",
-    "microsoft.com",
-)
-
 
 def is_microsoft_mx(mx_provider: str | None) -> bool:
     """True if the MX host indicates Microsoft 365 or Exchange Online."""
-    if not mx_provider:
-        return False
-    lp = mx_provider.lower()
-    return any(p in lp for p in MS_MX_PATTERNS)
+    return classify_provider(mx_provider) == "microsoft"
 
 
 def _check_sync(email: str, timeout: float = 10.0) -> dict:

@@ -56,7 +56,3 @@ def setup_logging(config: PipelineConfig) -> None:
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(json_fmt)
         logger.addHandler(fh)
-
-
-def get_logger(name: str) -> logging.Logger:
-    return logging.getLogger(name)

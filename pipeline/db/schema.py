@@ -7,10 +7,7 @@ import aiosqlite
 
 _log = logging.getLogger("pipeline.db")
 
-
-_log = logging.getLogger("pipeline.db")
-
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +77,11 @@ CREATE TABLE IF NOT EXISTS records (
     canonical_source    TEXT,
     reconciliation_path TEXT,
 
+    -- SMTP fleet telemetry (item 5): worker/IP that ran the terminal SMTP probe
+    -- and the recipient's classified mail provider (pipeline.utils.providers).
+    probe_host          TEXT,
+    smtp_provider       TEXT,
+
     -- Enrichment tracking
     serper_enriched     INTEGER DEFAULT 0,
 
@@ -122,6 +124,7 @@ CREATE TABLE IF NOT EXISTS stats (
     validation_failed        INTEGER DEFAULT 0,
     serper_producer_calls    INTEGER DEFAULT 0,
     serper_dispatcher_calls  INTEGER DEFAULT 0,
+    serper_cache_hits        INTEGER DEFAULT 0,
     zuhal_calls              INTEGER DEFAULT 0,
     racknerd_probes          INTEGER DEFAULT 0,
     bbops_probes             INTEGER DEFAULT 0,
@@ -190,6 +193,20 @@ CREATE TABLE IF NOT EXISTS email_verification_cache (
     verified_at     TEXT DEFAULT (datetime('now'))
 );
 
+-- Per-(worker, provider) SMTP outcome counters — drives provider-aware routing,
+-- IP-reputation degradation detection, and failover (Improve-Existing item 5).
+CREATE TABLE IF NOT EXISTS smtp_outcomes (
+    worker_id   TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    valid       INTEGER DEFAULT 0,
+    invalid     INTEGER DEFAULT 0,
+    catch_all   INTEGER DEFAULT 0,
+    blocked     INTEGER DEFAULT 0,
+    error       INTEGER DEFAULT 0,
+    updated_at  TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (worker_id, provider)
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(record_state);
 CREATE INDEX IF NOT EXISTS idx_records_unique_id ON records(unique_id);
 CREATE INDEX IF NOT EXISTS idx_failures_unique_id ON failures(unique_id);
@@ -197,6 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_enrichment_cache_key ON enrichment_cache(business
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_batch ON bbops_jobs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_bbops_jobs_record ON bbops_jobs(record_id);
 CREATE INDEX IF NOT EXISTS idx_zuhal_jobs_status ON zuhal_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_smtp_outcomes_worker ON smtp_outcomes(worker_id);
 """
 
 # Migration statements from schema v3 → v4
@@ -281,6 +299,31 @@ _V12_MIGRATIONS: list[str] = [
 # Migration statements for schema v13
 _V13_MIGRATIONS: list[str] = [
     "ALTER TABLE records ADD COLUMN verifier_agreement TEXT",
+]
+
+# Migration statements for schema v14
+_V14_MIGRATIONS: list[str] = [
+    "ALTER TABLE stats ADD COLUMN serper_cache_hits INTEGER DEFAULT 0",
+]
+
+# Migration statements for schema v15 — SMTP fleet telemetry (additive).
+_V15_MIGRATIONS: list[str] = [
+    "ALTER TABLE records ADD COLUMN probe_host TEXT",
+    "ALTER TABLE records ADD COLUMN smtp_provider TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS smtp_outcomes (
+        worker_id   TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        valid       INTEGER DEFAULT 0,
+        invalid     INTEGER DEFAULT 0,
+        catch_all   INTEGER DEFAULT 0,
+        blocked     INTEGER DEFAULT 0,
+        error       INTEGER DEFAULT 0,
+        updated_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (worker_id, provider)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_smtp_outcomes_worker ON smtp_outcomes(worker_id)",
 ]
 
 # Migration statements for schema v10 — verdict-field standardization (additive).
@@ -372,6 +415,8 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         (11, _V11_MIGRATIONS),
         (12, _V12_MIGRATIONS),
         (13, _V13_MIGRATIONS),
+        (14, _V14_MIGRATIONS),
+        (15, _V15_MIGRATIONS),
     ]
     for target_version, stmts in migration_sets:
         if current_version >= target_version:
@@ -391,6 +436,6 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
                 if not expected:
                     _log.warning("Migration statement skipped (%s): %.120s", exc, stmt.strip())
 
-    await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    await conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
     await conn.commit()
     _log.info("Schema migration to v%d complete", SCHEMA_VERSION)

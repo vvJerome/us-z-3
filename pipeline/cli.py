@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser.add_argument("--phase", default=None,
                               choices=["dns", "serper"],
                               help="Filter by failure phase")
+    reset_parser.add_argument("--unverified-only", action="store_true",
+                              help="With --status validation_failed: re-queue only failures "
+                                   "without a definitive verdict (timed-out/unverified) for a "
+                                   "patient retry pass; leave definitive-invalid records terminal")
     reset_parser.add_argument("--dry-run", action="store_true",
                               help="Print count without making changes")
 
@@ -47,6 +51,8 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db", default=None, help="Override SQLite database path")
     parser.add_argument("--log-dir", default=None, help="Override log directory")
     parser.add_argument("--master-db", default=None, help="Master DB path — flush verified records here every 500 validations")
+    parser.add_argument("--enrichment-cache-db", default=None,
+                        help="Persistent Serper enrichment cache, shared across runs (default: cache is per-run only)")
 
     # Scope
     parser.add_argument("--limit", type=int, default=None, help="Max records to process")
@@ -63,18 +69,18 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--strategy", default="auto", choices=["auto", "with", "without"],
                         help="Email discovery strategy")
 
-    # Producer concurrency
-    parser.add_argument("--dns-concurrency", type=int, default=100, help="DNS semaphore size")
-    parser.add_argument("--serper-concurrency", type=int, default=15, help="Serper semaphore size")
+    # Producer concurrency (default=None → PipelineConfig/.env is the source of truth)
+    parser.add_argument("--dns-concurrency", type=int, default=None, help="DNS semaphore size")
+    parser.add_argument("--serper-concurrency", type=int, default=None, help="Serper semaphore size")
 
-    # Dispatcher
-    parser.add_argument("--dispatch-concurrency", type=int, default=20,
+    # Dispatcher (default=None → PipelineConfig/.env is the source of truth)
+    parser.add_argument("--dispatch-concurrency", type=int, default=None,
                         help="Concurrent records in dispatcher")
-    parser.add_argument("--dispatch-backend-timeout-s", type=float, default=60.0,
+    parser.add_argument("--dispatch-backend-timeout-s", type=float, default=None,
                         help="Per-backend timeout in seconds")
-    parser.add_argument("--dispatch-poll-interval-s", type=float, default=5.0,
+    parser.add_argument("--dispatch-poll-interval-s", type=float, default=None,
                         help="Dispatcher poll interval when queue is empty")
-    parser.add_argument("--dispatch-chunk-size", type=int, default=50,
+    parser.add_argument("--dispatch-chunk-size", type=int, default=None,
                         help="Records claimed per poll cycle")
 
     # Racknerd
@@ -89,15 +95,26 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--racknerd-host", default=None, help="Racknerd VPS hostname")
     parser.add_argument("--racknerd-ssh-user", default=None, help="SSH username")
     parser.add_argument("--racknerd-ssh-key", default=None, help="SSH private key path")
-    parser.add_argument("--racknerd-ssh-port", type=int, default=22, help="SSH port")
-    parser.add_argument("--racknerd-socks-port", type=int, default=1080, help="Local SOCKS5 port")
-    parser.add_argument("--racknerd-concurrency", type=int, default=10,
+    parser.add_argument("--racknerd-ssh-port", type=int, default=None, help="SSH port")
+    parser.add_argument("--racknerd-socks-port", type=int, default=None, help="Local SOCKS5 port")
+    parser.add_argument("--racknerd-concurrency", type=int, default=None,
                         help="Concurrent SMTP probes via Racknerd")
-    parser.add_argument("--racknerd-smtp-timeout-s", type=float, default=15.0,
+    parser.add_argument("--racknerd-smtp-timeout-s", type=float, default=None,
                         help="Per-SMTP-operation timeout")
     parser.add_argument("--racknerd-helo", dest="racknerd_helo_hostname", default=None,
                         help="SMTP EHLO/MAIL FROM domain (overrides RACKNERD_HELO_HOSTNAME env). "
                              "Use a real FQDN; IP literals are rejected by most MX servers.")
+
+    # Cherry Servers SMTP fleet
+    parser.add_argument("--cherry-enabled", action="store_true", default=None,
+                        help="Use the Cherry Servers SMTP fleet as the SMTP backend")
+    parser.add_argument("--smtp-hosts", nargs="*", default=None,
+                        help="Explicit SMTP worker IPs (overrides single --racknerd-host)")
+    parser.add_argument("--cherry-project-id", type=int, default=None, help="Cherry project id")
+    parser.add_argument("--cherry-region", default=None, help="Cherry region slug")
+    parser.add_argument("--cherry-fleet-size", type=int, default=None, help="Target fleet size")
+    parser.add_argument("--fleet-autoscale", dest="fleet_autoscale", action="store_true", default=None,
+                        help="Enable queue-depth autoscaling of the fleet")
 
     # bbops
     parser.add_argument("--bbops-base-url", default=None, help="bbops.io base URL")

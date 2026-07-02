@@ -25,6 +25,8 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 
 - One `aiodns.DNSResolver` per producer run — created in `__init__`, passed to every `probe_domains()` call.
 - Serper enrichment_cache is keyed by `(business_name_norm, agent_name_norm, state, provider)` — normalize with `.lower().strip()` before any cache lookup or write.
+- Cache writes only fire on a successful discovery (`result.candidate_emails` or `result.candidate_domain` non-empty), and store whichever query actually won (primary or one of the 4 fallbacks) — never the primary's raw response if a fallback later succeeded. A "found nothing" response is never cached.
+- The cache connection is `self.cache_conn` (producer) / `self.cache_conn` (dispatcher), not `self.conn` — it defaults to the per-run `conn` but points at a separate persistent file when `--enrichment-cache-db` is set, so successful discoveries survive across separate runs (e.g. retries fed via a new `--name`).
 - Fallback domain blocklist: any domain that appears as first-organic fallback for 2+ different businesses is promoted to `_fallback_blocklist` at runtime. Static seed is in `constants.FALLBACK_DOMAIN_BLOCKLIST`.
 - `process_trace` must have an entry for every stage that ran: `dns`, `patterns`, `serper`, and (if applicable) `input`.
 - `owner_confidence` (registered-agent → owner likelihood) is computed at discovery via `owner_inference.score_owner_confidence(record, has_website=bool(effective_domain))` and written like `domain_confidence`. It's a heuristic baseline, not ML — commercial-agent detection uses a light normalize (never `normalize_business_name`, which strips the very service-name tokens).
@@ -33,10 +35,10 @@ Any code that writes `record_state` directly via a string literal is wrong — u
 
 `_process_record()` order per email candidate:
 1. MS probe pre-filter (free) — only when `is_microsoft_mx(mx_provider)` is True; short-circuits on `valid`/`invalid`, falls through on `error`/`unknown`
-2. Racknerd SMTP first; on `valid`/`catch_all` (catch_all gated by confidence) return immediately with `bbops_status=not_run`. bbops runs **only** when Racknerd returns `blocked`/`error`/`invalid` — sequential and lazy, not a concurrent fan-out, so a confirmed Racknerd hit never spends a bbops call.
+2. Racknerd SMTP + bbops run **concurrently** (`asyncio.gather`) as two **co-equal checkers** — bbops is not a fallback. `reconcile()` applies OR-of-valids: a `valid`/`catch_all` from either backend wins (catch_all still gated by `catch_all_min_confidence`), even when the other backend's tunnel is down. Their independence (separate infra/IPs/job state) is the redundancy (item 6).
 3. OR-of-valids reconciliation (`reconcile()`) → `valid`, `catch_all`, `invalid`, or `unknown`
-4. If `unknown` (tunnel down / both inconclusive) → re-queue as DISCOVERED without burning `dispatch_attempts`
-5. If `invalid` and `self.zuhal is not None` → Zuhal rescue (sequential, paid)
+4. If `unknown` (1 invalid + 1 error, or both inconclusive) → hand to the Zuhal rescue layer when `self.zuhal` is set (decoupled NEEDS_ZUHAL worker by default, `zuhal_decoupled=True`); otherwise re-queue as DISCOVERED. Tunnel-down is special-cased to always re-queue without burning `dispatch_attempts`.
+5. If `invalid` (both backends definitively invalid) → record a pattern miss and try the next candidate (→ VALIDATION_FAILED when exhausted). Zuhal rescue on both-invalid is **opt-in** via `zuhal_on_both_invalid` / `--zuhal-on-both-invalid` (default off) — it is NOT the default rescue trigger.
 6. If Zuhal raises `ZuhalCircuitOpenError` → re-queue as DISCOVERED without burning `dispatch_attempts` (auto-heal)
 7. `email_to_template()` called after every terminal verdict to update `pattern_stats`
 

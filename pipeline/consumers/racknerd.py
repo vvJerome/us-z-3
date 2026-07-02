@@ -13,6 +13,7 @@ import aiodns
 import aiosmtplib
 
 from pipeline.constants import (
+    RACKNERD_MX_CACHE_MAX,
     RACKNERD_MX_CACHE_TTL_S,
     RACKNERD_MX_MAX_HOSTS,
     RACKNERD_SMTP_TIMEOUT_S,
@@ -20,7 +21,7 @@ from pipeline.constants import (
     RACKNERD_SPAMHAUS_THRESHOLD,
     RACKNERD_SPAMHAUS_WINDOW_S,
 )
-from pipeline.models import BackendVerdict
+from pipeline.models import BackendStatus, BackendVerdict
 from pipeline.tunnels.ssh_socks import SshSocksTunnel
 
 _log = logging.getLogger("pipeline.racknerd")
@@ -74,7 +75,7 @@ def _default_helo_hostname() -> str:
     return literal
 
 
-def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
+def _classify_smtp_rejection(exc_str: str) -> tuple[BackendStatus, str]:
     """Map a SMTPRecipientRefused exception string to (status, message).
 
     aiosmtplib only raises SMTPRecipientRefused for 5xx RCPT TO responses, which are
@@ -87,7 +88,7 @@ def _classify_smtp_rejection(exc_str: str) -> tuple[str, str]:
     return "invalid", f"SMTP error: {exc_str}"
 
 
-def _classify_5xx(code: int, msg: str) -> tuple[str, str]:
+def _classify_5xx(code: int, msg: str) -> tuple[BackendStatus, str]:
     """Map a 5xx tuple-return SMTP response to (status, message). Spamhaus → blocked; else invalid."""
     if any(kw in msg.lower() for kw in _SPAMHAUS_KEYWORDS):
         return "blocked", f"{code} {msg}"
@@ -174,8 +175,9 @@ class RacknerdConsumer:
             self._guards[provider] = _SpamhausGuard(name=provider)
         return self._guards[provider]
 
-    async def verify(self, email: str) -> BackendVerdict:
-        """Probe `email` via SOCKS5 SMTP. Returns a BackendVerdict."""
+    async def verify(self, email: str, mx_provider: str | None = None) -> BackendVerdict:
+        """Probe `email` via SOCKS5 SMTP. `mx_provider` is accepted for fleet-seam parity
+        (unused — the per-provider guard here is keyed off the resolved MX host, not this arg)."""
         async with self._sem:
             return await self._verify_inner(email)
 
@@ -194,7 +196,7 @@ class RacknerdConsumer:
             # can re-queue rather than permanently invalidating the address.
             return BackendVerdict(status="error", message="no MX/A record", verified_at=_ISO_NOW())
 
-        last_status = "error"
+        last_status: BackendStatus = "error"
         last_msg = "no hosts probed"
 
         for mx_host in mx_hosts[:RACKNERD_MX_MAX_HOSTS]:
@@ -215,7 +217,7 @@ class RacknerdConsumer:
                 return BackendVerdict(status="blocked", message=msg, verified_at=_ISO_NOW())
             # error → try next MX host
 
-        return BackendVerdict(status=last_status, message=last_msg, verified_at=_ISO_NOW())  # type: ignore[arg-type]
+        return BackendVerdict(status=last_status, message=last_msg, verified_at=_ISO_NOW())
 
     async def _resolve_mx(self, domain: str) -> list[str]:
         """Resolve MX records with a 1-hour TTL cache."""
@@ -240,7 +242,7 @@ class RacknerdConsumer:
             except aiodns.error.DNSError:
                 pass
 
-        if len(self._mx_cache) >= 10_000:
+        if len(self._mx_cache) >= RACKNERD_MX_CACHE_MAX:
             # Drop the oldest quarter to bound memory on large runs
             evict = list(self._mx_cache)[: len(self._mx_cache) // 4]
             for k in evict:
@@ -248,12 +250,12 @@ class RacknerdConsumer:
         self._mx_cache[domain] = (hosts, now + RACKNERD_MX_CACHE_TTL_S)
         return hosts
 
-    async def _probe_mx(self, email: str, mx_host: str) -> tuple[str, str]:
+    async def _probe_mx(self, email: str, mx_host: str) -> tuple[BackendStatus, str]:
         if self.config.direct:
             return await self._probe_direct(email, mx_host)
         return await self._probe_socks5(email, mx_host)
 
-    async def _probe_direct(self, email: str, mx_host: str) -> tuple[str, str]:
+    async def _probe_direct(self, email: str, mx_host: str) -> tuple[BackendStatus, str]:
         """Direct TCP connection to mx_host:25 — no SOCKS5 (use when already on the egress IP)."""
         cfg = self.config
         try:
@@ -271,11 +273,11 @@ class RacknerdConsumer:
         except Exception as exc:
             return "error", f"probe error: {exc}"
 
-    async def _probe_socks5(self, email: str, mx_host: str) -> tuple[str, str]:
+    async def _probe_socks5(self, email: str, mx_host: str) -> tuple[BackendStatus, str]:
         """SOCKS5-proxied connection to mx_host:25 via the SSH tunnel."""
         cfg = self.config
         try:
-            from python_socks.async_.asyncio import Proxy  # type: ignore[import]
+            from python_socks.async_.asyncio import Proxy
         except ImportError:
             _log.error("python-socks not installed — cannot probe via SOCKS5")
             return "error", "python-socks not installed"
@@ -343,7 +345,7 @@ class RacknerdConsumer:
 
     async def _run_smtp_probe(
         self, smtp: aiosmtplib.SMTP, email: str, mx_host: str
-    ) -> tuple[str, str]:
+    ) -> tuple[BackendStatus, str]:
         """Run EHLO/MAIL/RCPT sequence on an already-connected SMTP client."""
         cfg = self.config
         try:
@@ -371,3 +373,14 @@ class RacknerdConsumer:
                 await asyncio.wait_for(smtp.quit(), timeout=3.0)
             except Exception:
                 pass
+
+
+class NullRacknerd:
+    """Stub used when --no-racknerd is set; always returns not_run so bbops handles validation."""
+
+    async def verify(self, email: str, mx_provider: str | None = None) -> "BackendVerdict":
+        from pipeline.models import BackendVerdict
+        return BackendVerdict(status="not_run", message="racknerd disabled", verified_at=None)
+
+    def is_up(self) -> bool:
+        return False

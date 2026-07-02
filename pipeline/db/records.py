@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import cast
 
 import aiosqlite
 
@@ -81,7 +82,7 @@ async def fetch_pending_validation(
         """,
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()  # type: ignore[return-value]
+        return cast(list[aiosqlite.Row], await cursor.fetchall())
 
 
 async def has_pending_validation(conn: aiosqlite.Connection) -> bool:
@@ -100,7 +101,7 @@ async def fetch_pending_discovery(
         "SELECT * FROM records WHERE record_state = 'DISCOVERING' LIMIT ?",
         (limit,),
     ) as cursor:
-        return await cursor.fetchall()  # type: ignore[return-value]
+        return cast(list[aiosqlite.Row], await cursor.fetchall())
 
 
 async def update_record_discovery(conn: aiosqlite.Connection, result: dict) -> None:
@@ -170,12 +171,23 @@ async def requeue_record(
     await conn.commit()
 
 
+_ALLOWED_STATUS_FIELDS: frozenset[str] = frozenset({
+    "failure_reason", "candidate_email", "candidate_emails", "confidence_score",
+    "final_verdict", "zuhal_status", "canonical_status", "canonical_source",
+    "reconciliation_path", "record_state",
+})
+
+
 async def update_record_status(
     conn: aiosqlite.Connection,
     unique_id: str,
     record_state: str,
     **extra_fields: object,
 ) -> None:
+    unknown = extra_fields.keys() - _ALLOWED_STATUS_FIELDS
+    if unknown:
+        raise ValueError(f"update_record_status: unknown column(s): {unknown}")
+
     sets = ["record_state = ?", "updated_at = datetime('now')"]
     values: list[object] = [record_state]
 

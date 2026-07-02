@@ -64,10 +64,10 @@ async def upload(session: aiohttp.ClientSession, key: str, emails: list[str]) ->
         body = await resp.json()
         if resp.status != 200:
             raise RuntimeError(f"upload {resp.status}: {body}")
-    job_id = body.get("data", {}).get("job_id")
-    if not job_id:
+    raw_id = body.get("data", {}).get("job_id")
+    if not raw_id:
         raise RuntimeError(f"upload returned no job_id: {body}")
-    return job_id
+    return str(raw_id)
 
 
 async def poll(session: aiohttp.ClientSession, key: str, job_id: str) -> None:
@@ -110,7 +110,7 @@ async def download(session: aiohttp.ClientSession, key: str, job_id: str) -> dic
     return out
 
 
-async def process_chunk(session, key, idx, total, emails) -> dict[str, str]:
+async def process_chunk(session: aiohttp.ClientSession, key: str, idx: int, total: int, emails: list[str]) -> dict[str, str]:
     job_id = await upload(session, key, emails)
     log.info("[chunk %d/%d] uploaded %d emails -> %s", idx, total, len(emails), job_id)
     await poll(session, key, job_id)
@@ -146,7 +146,7 @@ async def main_async() -> None:
     with args.input.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         header = reader.fieldnames or []
-        if not _input_has_required_columns(header):
+        if not _input_has_required_columns(list(header)):
             log.error(
                 "input %s missing required columns. Got %r. "
                 "Need 'unique_id' plus one of {'candidate_email','Email','email'}. "
@@ -176,7 +176,7 @@ async def main_async() -> None:
     failures = 0
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900)) as session:
-        async def bounded(idx, chunk):
+        async def bounded(idx: int, chunk: list[str]) -> dict[str, str]:
             nonlocal failures
             async with sem:
                 try:

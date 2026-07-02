@@ -101,6 +101,53 @@ async def test_without_strategy_with_domain_hint_shares_cache(mem_db):
     assert mock_api.call_count == 1
 
 
+# ── success-only cache gating (cross-run cache) ───────────────────────────────
+
+async def test_failed_lookup_is_not_cached(mem_db):
+    """A 'found nothing' response is never written to enrichment_cache, so a later
+    retry of a DISCOVERY_FAILED record gets a fresh Serper attempt, not a free miss."""
+    client = _client()
+
+    with patch.object(client, "_call_api", new_callable=AsyncMock) as mock_api:
+        mock_api.return_value = _EMPTY_RESPONSE
+        await client.enrich("Acme Corp", None, "NC", None, "without", conn=mem_db)
+        await client.enrich("Acme Corp", None, "NC", None, "without", conn=mem_db)
+
+    assert mock_api.call_count == 2  # second call did not hit a cached miss
+
+
+async def test_fallback_win_is_cached_under_primary_key(mem_db):
+    """When a fallback query succeeds after the primary query misses, the winning
+    response is cached — not the primary's failed response — so a later cache hit
+    for the same business/agent/state/strategy reflects the success."""
+    client = _client()
+    call_count = 0
+    hit_response = {
+        "organic": [{"snippet": "contact@nrvfd.org info", "link": "https://nrvfd.org"}],
+        "knowledgeGraph": {},
+    }
+
+    async def _mock_api(query: str) -> dict:
+        nonlocal call_count
+        call_count += 1
+        return _EMPTY_RESPONSE if call_count == 1 else hit_response
+
+    with patch.object(client, "_call_api", side_effect=_mock_api):
+        first = await client.enrich(
+            "Norwood Rural Volunteer Fire Department", None, "NC", None, "without", conn=mem_db,
+        )
+    assert call_count == 2
+    assert first.candidate_emails  # fallback won
+
+    with patch.object(client, "_call_api", new_callable=AsyncMock) as mock_api:
+        second = await client.enrich(
+            "Norwood Rural Volunteer Fire Department", None, "NC", None, "without", conn=mem_db,
+        )
+
+    mock_api.assert_not_called()  # served from cache
+    assert second.candidate_emails  # cache reflects the fallback's win, not the primary's miss
+
+
 # ── ignore_cache ──────────────────────────────────────────────────────────────
 
 async def test_ignore_cache_bypasses_cached_result(mem_db):
@@ -279,6 +326,28 @@ async def test_charge_costs_cache_hit_only_charges_fallbacks():
     client.charge_costs(cost, "serper_dispatcher")
 
     assert cost.counts.get("serper_dispatcher", 0) == 0
+
+
+async def test_charge_costs_cache_hit_records_cache_hit():
+    """Cache hit increments cost_tracker.cache_hits so hit rate is measurable."""
+    client = _client()
+    client.last_was_cache_hit = True
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.cache_hits == 1
+
+
+async def test_charge_costs_live_call_does_not_record_cache_hit():
+    """A live (non-cached) call leaves cost_tracker.cache_hits at 0."""
+    client = _client()
+    client.last_was_cache_hit = False
+    cost = CostTracker()
+
+    client.charge_costs(cost, "serper_dispatcher")
+
+    assert cost.cache_hits == 0
 
 
 # ── Serper credits exhaustion ─────────────────────────────────────────────────

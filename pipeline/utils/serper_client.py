@@ -14,6 +14,7 @@ from rapidfuzz import fuzz
 from pipeline.constants import SERVICE_BACKOFF
 from pipeline.models import EnrichmentResult, PipelineHaltError
 from pipeline.utils.backoff import with_backoff
+from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.rate_limiter import TokenBucket
 from pipeline.utils.text import normalize_business_name, parse_name
 from pipeline import db
@@ -63,9 +64,11 @@ class SerperClient:
         self.last_was_cache_hit = False  # set after each enrich() call
         self._credits_exhausted = False  # set on first 400 "not enough credits"
 
-    def charge_costs(self, cost_tracker, service: str) -> None:
+    def charge_costs(self, cost_tracker: CostTracker, service: str) -> None:
         """Charge for the last enrich() call (free on cache hit) plus its site: fallback retries, then reset the counter."""
-        if not self.last_was_cache_hit:
+        if self.last_was_cache_hit:
+            cost_tracker.cache_hits += 1
+        else:
             cost_tracker.record_call(service)
         for _ in range(self._fallback_calls):
             cost_tracker.record_call(service)
@@ -131,10 +134,8 @@ class SerperClient:
                 ),
             )
 
-            if conn is not None:
-                await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(data))
-
             result = self._extract(data, business_name, query, domain_hint=domain_hint, strategy=strategy, agent_name=agent_name, fallback_blocklist=fallback_blocklist)
+            winning_data = data
 
             # Fallback: if site:-scoped query returned no emails, retry without site: filter
             if domain_hint and not result.candidate_emails and "site:" in query:
@@ -164,6 +165,7 @@ class SerperClient:
                         query_used=fallback_query,
                         raw_snippets=fallback.raw_snippets,
                     )
+                    winning_data = data2
 
             # Third fallback: agent-name-focused query when primary found neither emails nor domain.
             # Registered agents are often individual lawyers whose contact appears under their name,
@@ -204,6 +206,7 @@ class SerperClient:
                         query_used=agent_query,
                         raw_snippets=agent_result.raw_snippets,
                     )
+                    winning_data = data3
 
             # 4th fallback: for long business names (4+ significant words), retry with
             # first 3 words only. Full legal names like "BREWER-LOWDER-MCCUISTON POST 9010
@@ -243,6 +246,13 @@ class SerperClient:
                         query_used=short_query,
                         raw_snippets=short_result.raw_snippets,
                     )
+                    winning_data = data4
+
+            # Cache only successful discoveries — a "found nothing" response is never
+            # written, so a later retry of a DISCOVERY_FAILED record always gets a
+            # genuinely fresh Serper attempt instead of a free replay of the old miss.
+            if conn is not None and (result.candidate_emails or result.candidate_domain):
+                await db.set_enrichment_cache(conn, biz_norm, cache_agent_norm, state, cache_provider, json.dumps(winning_data))
 
             return result
 
@@ -273,7 +283,8 @@ class SerperClient:
             if resp.status in (429, 500, 503):
                 raise _RetryableHTTPError(resp.status)
             resp.raise_for_status()
-            return await resp.json()
+            data: dict[str, object] = await resp.json()
+            return data
 
     def _extract(
         self,

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import logging
 import time
+from typing import cast
 
 import aiosqlite
 
@@ -12,13 +12,11 @@ from pipeline.config import PipelineConfig
 from pipeline.constants import (
     DISPATCH_POLL_EMPTY_BACKOFF_THRESHOLD,
     DISPATCH_POLL_MAX_INTERVAL_S,
-    INFRA_RETRY_BASE_MINUTES,
-    INFRA_RETRY_MULTIPLIER,
     HEARTBEAT_INTERVAL_S,
     NOTIFY_POLL_TIMEOUT_S,
 )
 from pipeline.consumers.bbops_async import BbopsAsyncConsumer, BbopsUnhealthy
-from pipeline.consumers.racknerd import RacknerdConsumer
+from pipeline.consumers.racknerd import NullRacknerd, RacknerdConsumer
 from pipeline.utils.zuhal_client import ZuhalClient
 from pipeline.utils.serper_client import SerperClient
 from pipeline.models import BackendVerdict, PipelineHaltError
@@ -26,18 +24,21 @@ from pipeline.utils.cost_tracker import CostTracker
 from pipeline.utils.ms_verify import is_microsoft_mx
 from pipeline.utils.notify import open_notify_reader
 from pipeline.utils.rate_limiter import TokenBucket
-from pipeline.utils.email_patterns import generate_ranked_candidates
 from pipeline.utils.text import parse_name
-from pipeline.harvest import harvest, infer_templates
 from pipeline import db
+from pipeline.db.row_types import RecordRow
 from pipeline import dispatch_probes as dp
 from pipeline import dispatch_verdicts as dv
 from pipeline.db import State
 from pipeline._dispatch_helpers import (
     catch_all_confidence_floor,
     compute_confidence_score,
+    infra_retry_after,
+    inject_harvest_fallback,
+    inject_serper_fallback,
     pre_score,
     record_pattern,
+    verifier_agreement,
 )
 from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests)
     DEFINITIVE,
@@ -48,27 +49,6 @@ from pipeline.reconcile import (  # noqa: F401  (reconcile re-exported for tests
 )
 
 logger = logging.getLogger("pipeline.dispatcher")
-
-
-
-def _infra_retry_after(requeue_count: int) -> str:
-    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
-    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
-    dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _verifier_agreement(rk: str, bb: str) -> str:
-    rk_ok = rk in ("valid", "catch_all")
-    bb_ok = bb in ("valid", "catch_all")
-    if rk_ok and bb_ok:
-        return "both"
-    if rk_ok:
-        return "racknerd_only"
-    if bb_ok:
-        return "bbops_only"
-    return "unknown"
-
 
 
 # ---------------------------------------------------------------------------
@@ -92,15 +72,17 @@ class Dispatcher:
         self,
         config: PipelineConfig,
         conn: aiosqlite.Connection,
-        racknerd: RacknerdConsumer,
+        racknerd: RacknerdConsumer | NullRacknerd,
         bbops: BbopsAsyncConsumer,
         cost_tracker: CostTracker,
         stop_event: asyncio.Event | None = None,
         zuhal: ZuhalClient | None = None,
         serper: SerperClient | None = None,
+        cache_conn: aiosqlite.Connection | None = None,
     ) -> None:
         self.config = config
         self.conn = conn
+        self.cache_conn = cache_conn if cache_conn is not None else conn
         self.racknerd = racknerd
         self.bbops = bbops
         self.cost_tracker = cost_tracker
@@ -208,7 +190,7 @@ class Dispatcher:
                 # Don't write partial verdicts on shutdown — records stay VALIDATING
                 # and will be recovered as DISCOVERED on next start
                 return
-            await self._process_record(row)
+            await self._process_record(cast(RecordRow, row))
 
     async def _fail(self, unique_id: str, reason: str, *args: object, failure_reason: str | None = None) -> None:
         """Terminal VALIDATION_FAILED write + stats bump. `reason` is a %-format string."""
@@ -218,7 +200,7 @@ class Dispatcher:
             await db.update_record_status(self.conn, unique_id, State.VALIDATION_FAILED, **kw)
         self.stats["validation_failed"] += 1
 
-    async def _load_candidates(self, row: aiosqlite.Row) -> list[str] | None:
+    async def _load_candidates(self, row: RecordRow) -> list[str] | None:
         """Check dispatch budget and parse candidate_emails; mark VALIDATION_FAILED and return None if it can't proceed."""
         unique_id = row["unique_id"]
         # dispatch_attempts counts only re-queues where a real verdict was obtained.
@@ -238,7 +220,8 @@ class Dispatcher:
             await self._fail(unique_id, "no candidate_emails")
             return None
         try:
-            return json.loads(raw_candidates)
+            parsed: list[str] = json.loads(raw_candidates)
+            return parsed
         except (json.JSONDecodeError, TypeError):
             await self._fail(unique_id, "invalid candidate_emails JSON")
             return None
@@ -284,69 +267,7 @@ class Dispatcher:
         self.stats["validated"] += 1
         logger.info(log_msg, *log_args)
 
-    async def _inject_harvest_fallback(
-        self, unique_id: str, candidates: list[str], first: str, last: str,
-        strategy: str, mx_provider: str | None, domain: str,
-    ) -> int:
-        """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
-        try:
-            result = await harvest(
-                domain, rate_limiter=self._harvest_rl, timeout_s=self.config.harvest_timeout_s,
-            )
-        except Exception as exc:
-            logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
-            return 0
-        existing = set(candidates)
-        new: list[str] = []
-        # House convention first: a scraped name paired to a harvested email reveals the
-        # template, so generate OUR officer's address with it (synthetic top-ranked pattern).
-        templates = infer_templates(result.emails, result.officers, domain)
-        if templates:
-            rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
-            # strategy is always "with"/"without" from the row; mypy sees only str.
-            for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
-                if c not in existing:
-                    new.append(c)
-                    existing.add(c)
-        for e in result.emails:  # then the literal harvested addresses
-            if e not in existing:
-                new.append(e)
-                existing.add(e)
-        candidates.extend(new)
-        logger.info(
-            "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
-            unique_id, domain, len(result.emails), len(result.officers), len(new),
-            " [BLOCKED]" if result.blocked else "",
-        )
-        return len(new)
-
-    async def _inject_serper_fallback(
-        self, unique_id: str, row: aiosqlite.Row, candidates: list[str]
-    ) -> bool:
-        """Inject Serper enrichment (skipped in producer on DNS hit) after patterns are exhausted; return True if cost-skipped."""
-        if self.cost_tracker.ceiling_reached():
-            logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
-            await db.update_record_status(self.conn, unique_id, State.COST_SKIPPED)
-            return True
-        existing = set(candidates)
-        raw_emails = await dp.serper_enrich(self.serper, self.conn, unique_id, row)
-        new_emails = [e for e in raw_emails if e not in existing]
-        try:
-            await db.mark_serper_enriched(self.conn, unique_id)
-        except Exception as exc:
-            logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
-        self.serper.charge_costs(self.cost_tracker, "serper_dispatcher")
-        if new_emails:
-            candidates.extend(new_emails)
-            logger.info(
-                "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
-                unique_id, len(new_emails), self.serper.last_was_cache_hit,
-            )
-        else:
-            logger.debug("Serper fallback for %s: no candidates found", unique_id)
-        return False
-
-    async def _process_record(self, row: aiosqlite.Row) -> None:
+    async def _process_record(self, row: RecordRow) -> None:
         unique_id = row["unique_id"]
         candidates = await self._load_candidates(row)
         if candidates is None:
@@ -410,8 +331,8 @@ class Dispatcher:
                     score = compute_confidence_score(email, candidate_domain, strategy, "valid", agent_name)
                     await self._write_validated(
                         unique_id, email,
-                        BackendVerdict("ms_valid", "MS GetCredentialType probe", None),
-                        BackendVerdict("not_run", "skipped — MS probe hit", None),
+                        BackendVerdict("ms_valid", "MS GetCredentialType probe", ""),
+                        BackendVerdict("not_run", "skipped — MS probe hit", ""),
                         "valid", score,
                         0,  # MS probe is free, don't count against dispatch_attempts
                         pending_trace, _first, _last, candidate_domain, mx_provider,
@@ -427,48 +348,26 @@ class Dispatcher:
 
                 # unknown/error → fall through to SMTP backends
 
-            # Sequential SMTP probe: Racknerd first, bbops only when Racknerd can't decide
+            # Co-equal concurrent SMTP fan-out: Racknerd + bbops run together as two
+            # equally-weighted checkers reconciled by OR-of-valids. bbops is not a fallback.
+            # We short-circuit on the first `valid` (decisive under OR-of-valids) so a record
+            # the fleet validates directly doesn't wait on the batched bbops backend; a record
+            # the fleet can't validate still waits for bbops to rescue it (coverage unchanged).
             timeout = self.config.dispatch_backend_timeout_s
+            t_smtp = time.monotonic()
+            rk_verdict, bb_verdict = await dp.run_backends(
+                self.racknerd, self.bbops, email, mx_provider, row["id"], timeout)
+            elapsed = int((time.monotonic() - t_smtp) * 1000)
 
-            t_rk = time.monotonic()
-            try:
-                rk_verdict = await asyncio.wait_for(
-                    dp.safe_racknerd(self.racknerd, email), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                rk_verdict = BackendVerdict(status="error", message="racknerd timeout", verified_at="")
-            elapsed_rk = int((time.monotonic() - t_rk) * 1000)
-            pending_trace.append({
-                "stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed_rk, "email": email,
-            })
-            last_rk = rk_verdict
+            pending_trace.append({"stage": "racknerd", "outcome": rk_verdict.status, "ms": elapsed, "email": email})
+            pending_trace.append({"stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed, "email": email})
 
-            # Racknerd valid: accept. catch_all: accept only if identity confidence
-            # clears the gate (flag default 0.0 = accept all, current behavior);
-            # below the gate, fall through to bbops for a second signal.
-            if rk_verdict.status == "valid" or (
-                rk_verdict.status == "catch_all"
-                and candidate_score >= catch_all_floor
-            ):
-                score = compute_confidence_score(
-                    email, candidate_domain, strategy, rk_verdict.status, agent_name
-                )
-                await self._write_validated(
-                    unique_id, email,
-                    rk_verdict,
-                    BackendVerdict("not_run", "skipped — Racknerd hit", None),
-                    rk_verdict.status, score,
-                    1,
-                    pending_trace, _first, _last, candidate_domain, mx_provider,
-                    "Racknerd-validated (bbops skipped): %s → %s", unique_id, email,
-                    verifier_agreement="racknerd_only",
-                )
-                return
-
-            # Tunnel down: re-queue once; on second failure skip Racknerd and run bbops-only
+            # Tunnel down: re-queue within a backoff budget; once exhausted, stop trusting
+            # Racknerd's signal for this candidate so reconcile() falls back to bbops alone
+            # instead of hitting its unconditional tunnel-down → unknown special-case forever.
             if rk_verdict.status == "error" and "tunnel not up" in rk_verdict.message:
                 if tunnel_requeue_count < self.config.max_tunnel_requeues:
-                    retry_after = _infra_retry_after(tunnel_requeue_count)
+                    retry_after = infra_retry_after(tunnel_requeue_count)
                     async with self._write_lock:
                         await db.requeue_record(
                             self.conn, unique_id, increment_attempts=False,
@@ -477,31 +376,16 @@ class Dispatcher:
                     self.stats["requeued"] += 1
                     logger.debug("Re-queued %s (SSH tunnel not up, retry after %s)", unique_id, retry_after)
                     return
-                # Tunnel limit reached — treat as not_run and proceed bbops-only
-                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at="")
-                logger.debug("Tunnel requeue limit hit for %s — proceeding bbops-only", unique_id)
+                rk_verdict = BackendVerdict(status="not_run", message="tunnel limit reached", verified_at=None)
+                logger.debug("Tunnel requeue limit hit for %s — proceeding on bbops result", unique_id)
 
-            # Racknerd gave blocked/error/invalid — run bbops
-            t_bb = time.monotonic()
-            try:
-                bb_verdict = await asyncio.wait_for(
-                    dp.safe_bbops(self.bbops, row["id"], email), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                bb_verdict = BackendVerdict(status="error", message="bbops timeout", verified_at="")
-            except BbopsUnhealthy:
-                bb_verdict = BackendVerdict(status="not_run", message="bbops unhealthy", verified_at="")
-            elapsed_bb = int((time.monotonic() - t_bb) * 1000)
-            pending_trace.append({
-                "stage": "bbops", "outcome": bb_verdict.status, "ms": elapsed_bb, "email": email,
-            })
-            last_bb = bb_verdict
+            last_rk, last_bb = rk_verdict, bb_verdict
 
             # bbops error: apply per-infra requeue budget (only when no Zuhal fallback;
             # with Zuhal configured, handle_inconclusive owns the error/unknown path)
             if bb_verdict.status == "error" and self.zuhal is None:
                 if bbops_requeue_count < self.config.max_bbops_requeues:
-                    retry_after = _infra_retry_after(bbops_requeue_count)
+                    retry_after = infra_retry_after(bbops_requeue_count)
                     async with self._write_lock:
                         await db.requeue_record(
                             self.conn, unique_id, increment_attempts=False,
@@ -558,21 +442,21 @@ class Dispatcher:
                     pending_trace, _first, _last, candidate_domain, mx_provider,
                     "Validated %s → %s [rk=%s bb=%s]",
                     unique_id, email, rk_verdict.status, bb_verdict.status,
-                    verifier_agreement=_verifier_agreement(rk_verdict.status, bb_verdict.status),
+                    verifier_agreement=verifier_agreement(rk_verdict.status, bb_verdict.status),
                 )
                 return
 
             # Both invalid — optional Zuhal rescue when zuhal_on_both_invalid is enabled
             if self.zuhal is not None and self.config.zuhal_on_both_invalid and not skip_paid:
-                action = await dv.rescue_both_invalid(
+                rescue_action: str | None = await dv.rescue_both_invalid(
                     self, unique_id, email, rk_verdict, bb_verdict,
                     candidate_domain, strategy, agent_name, _first, _last,
                     mx_provider, pending_trace,
                 )
-                if action == "cost_skipped":
+                if rescue_action == "cost_skipped":
                     cost_skipped = True
                     break
-                if action == "terminal":
+                if rescue_action == "terminal":
                     return
                 # None → Zuhal also invalid/error — fall through to try next candidate
 
@@ -587,15 +471,18 @@ class Dispatcher:
             if i == fb_boundary and candidate_domain:
                 if self.harvest_enabled and not harvested:
                     harvested = True
-                    added = await self._inject_harvest_fallback(
+                    added = await inject_harvest_fallback(
                         unique_id, candidates, _first, _last, strategy, mx_provider, candidate_domain,
+                        self._harvest_rl, self.config.harvest_timeout_s,
                     )
                     if added:
                         fb_boundary += added
                         continue  # try harvested candidates before paying for Serper
                 if not serper_enriched and self.serper:
                     serper_enriched = True  # prevent re-injection on subsequent loops
-                    if await self._inject_serper_fallback(unique_id, row, candidates):
+                    if await inject_serper_fallback(
+                        unique_id, row, candidates, self.serper, self.cache_conn, self.conn, self.cost_tracker,
+                    ):
                         cost_skipped = True
                         break
 
@@ -631,7 +518,7 @@ class Dispatcher:
         while not self.stop_event.is_set():
             try:
                 await db.upsert_dispatcher_heartbeat(self.conn)
-            except Exception as exc:
+            except aiosqlite.Error as exc:
                 logger.debug("Dispatcher heartbeat failed: %s", exc)
             try:
                 await asyncio.wait_for(asyncio.shield(self.stop_event.wait()), timeout=HEARTBEAT_INTERVAL_S)

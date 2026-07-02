@@ -23,7 +23,8 @@ async def _robots_allows(session: AsyncSession, base: str, timeout_s: float) -> 
     rp = RobotFileParser()
     try:
         status, body = await _get(session, base + "/robots.txt", timeout_s)
-    except Exception:
+    except Exception as exc:
+        logger.debug("robots.txt fetch failed for %s: %s", base, exc)
         return None
     if status >= 400:
         return None  # no usable robots.txt → not disallowed

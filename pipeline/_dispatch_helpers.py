@@ -1,11 +1,46 @@
 from __future__ import annotations
 
+import datetime
+import logging
+
 import aiosqlite
 from rapidfuzz import fuzz
 
 from pipeline import db
-from pipeline.constants import is_untrustworthy_catchall_mx
-from pipeline.utils.email_patterns import email_to_template
+from pipeline.db.row_types import RecordRow
+from pipeline.models import PipelineHaltError
+from pipeline.constants import (
+    INFRA_RETRY_BASE_MINUTES,
+    INFRA_RETRY_MULTIPLIER,
+    is_untrustworthy_catchall_mx,
+)
+from pipeline.db import State
+from pipeline.harvest import harvest, infer_templates
+from pipeline.utils.cost_tracker import CostTracker
+from pipeline.utils.email_patterns import email_to_template, generate_ranked_candidates
+from pipeline.utils.rate_limiter import TokenBucket
+from pipeline.utils.serper_client import SerperClient
+
+logger = logging.getLogger("pipeline.dispatcher")
+
+def infra_retry_after(requeue_count: int) -> str:
+    """Exponential backoff for infra re-queues: 5min → 15min → 45min."""
+    minutes = INFRA_RETRY_BASE_MINUTES * (INFRA_RETRY_MULTIPLIER ** requeue_count)
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def verifier_agreement(rk: str, bb: str) -> str:
+    rk_ok = rk in ("valid", "catch_all")
+    bb_ok = bb in ("valid", "catch_all")
+    if rk_ok and bb_ok:
+        return "both"
+    if rk_ok:
+        return "racknerd_only"
+    if bb_ok:
+        return "bbops_only"
+    return "unknown"
+
 
 GENERIC_PREFIXES: frozenset[str] = frozenset({
     "info", "contact", "hello", "admin", "support", "sales", "help",
@@ -133,3 +168,91 @@ async def record_pattern(
     tmpl = email_to_template(email, first, last, candidate_domain)
     if tmpl:
         await db.record_pattern_result(conn, mx_provider, tmpl, success=success)
+
+
+async def inject_harvest_fallback(
+    unique_id: str,
+    candidates: list[str],
+    first: str,
+    last: str,
+    strategy: str,
+    mx_provider: str | None,
+    domain: str,
+    rate_limiter: TokenBucket | None,
+    timeout_s: float,
+) -> int:
+    """Scrape the domain for real emails; add house-convention + direct candidates. Returns count added."""
+    if rate_limiter is None:
+        return 0
+    try:
+        result = await harvest(domain, rate_limiter=rate_limiter, timeout_s=timeout_s)
+    except Exception as exc:
+        logger.warning("Harvest failed for %s (%s): %s", unique_id, domain, exc)
+        return 0
+    existing = set(candidates)
+    new: list[str] = []
+    templates = infer_templates(result.emails, result.officers, domain)
+    if templates:
+        rankings = [{"template": t, "success_count": 1, "total_count": 1} for t in templates]
+        for c in generate_ranked_candidates(first, last, domain, strategy, rankings=rankings):  # type: ignore[arg-type]
+            if c not in existing:
+                new.append(c)
+                existing.add(c)
+    for e in result.emails:
+        if e not in existing:
+            new.append(e)
+            existing.add(e)
+    candidates.extend(new)
+    logger.info(
+        "Harvest for %s (%s): %d emails, %d officers, +%d candidates%s",
+        unique_id, domain, len(result.emails), len(result.officers), len(new),
+        " [BLOCKED]" if result.blocked else "",
+    )
+    return len(new)
+
+
+async def inject_serper_fallback(
+    unique_id: str,
+    row: RecordRow,
+    candidates: list[str],
+    serper: SerperClient,
+    cache_conn: aiosqlite.Connection,
+    conn: aiosqlite.Connection,
+    cost_tracker: CostTracker,
+) -> bool:
+    """Inject Serper enrichment after patterns exhausted; return True if cost-skipped."""
+    if cost_tracker.ceiling_reached():
+        logger.info("Cost ceiling reached before Serper fallback — skipping %s", unique_id)
+        await db.update_record_status(conn, unique_id, State.COST_SKIPPED)
+        return True
+    existing = set(candidates)
+    try:
+        result = await serper.enrich(
+            business_name=row["business_name"] or "",
+            agent_name=row["agent_name"] if row["strategy"] == "with" else None,
+            state=row["state"] or "",
+            domain_hint=row["candidate_domain"] or None,
+            strategy="with" if row["strategy"] == "with" else "without",
+            conn=cache_conn,
+        )
+        raw_emails = result.candidate_emails
+    except PipelineHaltError:
+        raise
+    except Exception as exc:
+        logger.warning("Serper fallback error for %s: %s", unique_id, exc)
+        raw_emails = []
+    new_emails = [e for e in raw_emails if e not in existing]
+    try:
+        await db.mark_serper_enriched(conn, unique_id)
+    except aiosqlite.Error as exc:
+        logger.warning("Failed to persist serper_enriched flag for %s: %s", unique_id, exc)
+    serper.charge_costs(cost_tracker, "serper_dispatcher")
+    if new_emails:
+        candidates.extend(new_emails)
+        logger.info(
+            "Serper fallback for %s: %d new candidates after patterns exhausted (cache=%s)",
+            unique_id, len(new_emails), serper.last_was_cache_hit,
+        )
+    else:
+        logger.debug("Serper fallback for %s: no candidates found", unique_id)
+    return False

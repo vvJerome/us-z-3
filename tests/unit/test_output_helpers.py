@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from pipeline.__main__ import _validation_method, _zuhal_verdict
+from pipeline.output import _validation_method, _zuhal_verdict
 from pipeline.constants import DNS_TLDS
 
 

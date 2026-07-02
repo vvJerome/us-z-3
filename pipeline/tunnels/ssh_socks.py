@@ -31,6 +31,8 @@ class TunnelConfig:
     backoff_start_s: float = field(default=TUNNEL_BACKOFF_START_S)
     backoff_max_s: float = field(default=TUNNEL_BACKOFF_MAX_S)
     autorestart: bool = True
+    strict_host_key_checking: str = "accept-new"
+    known_hosts_file: str | None = None   # set "/dev/null" for ephemeral, reused-IP cloud workers
 
 
 class SshSocksTunnel:
@@ -100,7 +102,7 @@ class SshSocksTunnel:
     def _ssh_cmd(self) -> list[str]:
         cfg = self.config
         key_path = str(Path(cfg.ssh_key).expanduser())
-        return [
+        cmd = [
             "ssh",
             "-N",
             "-D", f"{cfg.bind_addr}:{cfg.socks_port}",
@@ -109,9 +111,13 @@ class SshSocksTunnel:
             "-o", f"ServerAliveInterval={cfg.server_alive_interval}",
             "-o", f"ServerAliveCountMax={cfg.server_alive_count_max}",
             "-o", "ExitOnForwardFailure=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            f"{cfg.user}@{cfg.host}",
+            "-o", f"StrictHostKeyChecking={cfg.strict_host_key_checking}",
         ]
+        if cfg.known_hosts_file:
+            # Ephemeral cloud workers recycle IPs — pinning host keys would break a reused IP.
+            cmd += ["-o", f"UserKnownHostsFile={cfg.known_hosts_file}"]
+        cmd.append(f"{cfg.user}@{cfg.host}")
+        return cmd
 
     async def _spawn(self) -> None:
         cmd = self._ssh_cmd()

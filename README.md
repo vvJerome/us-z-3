@@ -49,7 +49,7 @@ Given a list of businesses from public filing records, this pipeline:
 **Why Hetzner for the pipeline, Cherry Servers for SMTP:**
 The pipeline code runs on Hetzner. All SMTP probes exit through Cherry Servers, whose IP addresses have clean reputations — mail servers accept connections from them. Hetzner's own IP is never exposed to mail servers.
 
-> **Cherry Servers fleet** (`feat/cherry-fleet-migration`) is implemented and in alpha testing. It provisions, monitors, and tears down Cherry egress workers automatically via the Cherry Servers API. See [Cherry Fleet](#cherry-servers-smtp-fleet-alpha) below.
+> **Cherry Servers fleet** is opt-in (`--cherry-enabled` / `--smtp-hosts`). It provisions, monitors, and tears down Cherry egress workers automatically via the Cherry Servers API. See [Cherry Fleet](#cherry-servers-smtp-fleet) below.
 
 ---
 
@@ -227,8 +227,6 @@ Cost ceiling hit before Zuhal → COST_SKIPPED
 ---
 
 ## Cherry Servers SMTP Fleet
-
-> **Branch:** `feat/cherry-fleet-migration`
 
 **The IP reputation problem:** Budget VPS providers (Racknerd, Contabo, Hostinger) have IP ranges that end up in Spamhaus blocklists because other customers on the same network send spam. When the pipeline's egress IP is blocklisted, Gmail, Microsoft, and Proofpoint reject connections before even seeing the RCPT command.
 
