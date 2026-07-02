@@ -28,6 +28,12 @@ def _fake_smtp(rcpt_return=(250, "OK"), rcpt_side_effect=None):
     return smtp
 
 
+def _probe_consumer() -> RacknerdConsumer:
+    """A RacknerdConsumer for calling probe internals directly — helo_hostname pinned
+    so construction never touches the network via _default_helo_hostname()."""
+    return RacknerdConsumer(tunnel=None, config=RacknerdConfig(helo_hostname="test.verify.local"))
+
+
 class TestSpamhausGuard:
     def test_not_cooling_initially(self):
         guard = _SpamhausGuard()
@@ -76,7 +82,7 @@ class TestRacknerdConsumerTunnelCheck:
     def _make_consumer(self, tunnel_up: bool) -> RacknerdConsumer:
         tunnel = MagicMock()
         tunnel.is_up.return_value = tunnel_up
-        config = RacknerdConfig(concurrency=1)
+        config = RacknerdConfig(concurrency=1, helo_hostname="test.verify.local")
         consumer = RacknerdConsumer(tunnel=tunnel, config=config)
         return consumer
 
@@ -113,7 +119,7 @@ class TestRacknerdSmtpResponseParsing:
     async def test_2xx_is_valid(self):
         """End-to-end through _run_smtp_probe, not just the raw classification helper."""
         smtp = _fake_smtp(rcpt_return=(250, "2.1.5 OK"))
-        status, msg = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, msg = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "valid"
         assert "250" in msg
 
@@ -121,17 +127,17 @@ class TestRacknerdSmtpResponseParsing:
         smtp = _fake_smtp(rcpt_return=(
             554, "5.7.1 Service unavailable; Client host blocked by spamhaus zen.spamhaus.org",
         ))
-        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, _ = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "blocked"
 
     async def test_no_such_user_is_invalid(self):
         smtp = _fake_smtp(rcpt_return=(550, "5.1.1 no such user here"))
-        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, _ = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "invalid"
 
     async def test_4xx_is_error(self):
         smtp = _fake_smtp(rcpt_return=(421, "4.2.1 try again later"))
-        status, msg = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        status, msg = await _probe_consumer()._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
         assert status == "error"
         assert "4xx temporary" in msg
 
@@ -277,7 +283,7 @@ class TestMxProvider:
 
 class TestPerMxSpamhausGuard:
     async def test_separate_providers_have_independent_cooldowns(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")
 
@@ -288,19 +294,19 @@ class TestPerMxSpamhausGuard:
         assert guard_goog.is_cooling() is False
 
     async def test_same_provider_returns_same_guard_instance(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("pphosted.com")
         assert g1 is g2
 
     async def test_different_providers_return_different_guard_instances(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
         g1 = consumer._guard_for("pphosted.com")
         g2 = consumer._guard_for("google.com")
         assert g1 is not g2
 
     async def test_blocked_provider_does_not_pause_other_providers(self):
-        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1))
+        consumer = RacknerdConsumer(tunnel=None, config=RacknerdConfig(concurrency=1, helo_hostname="test.verify.local"))
         guard_pp = consumer._guard_for("pphosted.com")
         guard_goog = consumer._guard_for("google.com")
 
