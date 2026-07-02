@@ -8,6 +8,10 @@
           {
             "type": "command",
             "command": "bash .claude/hooks/pre-bash-secret-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pre-push-check.sh"
           }
         ]
       },
