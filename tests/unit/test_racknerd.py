@@ -226,10 +226,14 @@ class TestRacknerdSmtpResponseParsing:
         from unittest.mock import patch
         from pipeline.consumers.racknerd import _default_helo_hostname
 
-        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"):
+        fake_sock = MagicMock()
+        fake_sock.getsockname.return_value = ("10.0.0.5", 0)
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"), \
+             patch("pipeline.consumers.racknerd.socket.socket", return_value=fake_sock):
             result = _default_helo_hostname()
         # Backward compat: still returns IP literal — but RacknerdConfig will warn.
         assert result.startswith("[") and result.endswith("]")
+        fake_sock.connect.assert_called_once_with(("8.8.8.8", 80))
 
     def test_helo_hostname_falls_back_to_gethostbyname_when_udp_trick_fails(self):
         """No FQDN and no outbound route (UDP connect fails) — fall back to gethostbyname."""
