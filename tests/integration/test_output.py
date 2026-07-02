@@ -49,7 +49,7 @@ class TestWriteOutputsCsv:
         await _insert_validated(conn, "rec1")
         await _insert_validated(conn, "rec2", candidate_email="bob@acme.com")
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         csv_path = tmp_path / "valid_emails.csv"
@@ -65,7 +65,7 @@ class TestWriteOutputsCsv:
         await _insert_validated(conn, "rec1")
         await _insert_validated(conn, "rec2", record_state=State.VALIDATION_FAILED, final_verdict="invalid")
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         with open(tmp_path / "valid_emails.csv", newline="", encoding="utf-8") as f:
@@ -82,7 +82,7 @@ class TestWriteOutputsCsv:
             canonical_status="catch_all", canonical_source="zuhal",
         )
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         with open(tmp_path / "valid_emails.csv", newline="", encoding="utf-8") as f:
@@ -101,7 +101,7 @@ class TestWriteOutputsCsv:
         conn = await db.init_db(tmp_path / "pipeline.db")
         await _insert_validated(conn, "rec1", domain_confidence=None, owner_confidence=None)
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         with open(tmp_path / "valid_emails.csv", newline="", encoding="utf-8") as f:
@@ -115,7 +115,7 @@ class TestWriteOutputsCsv:
     async def test_no_validated_records_still_writes_header_only_csv(self, tmp_path: Path):
         conn = await db.init_db(tmp_path / "pipeline.db")
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         csv_path = tmp_path / "valid_emails.csv"
@@ -129,7 +129,7 @@ class TestWriteOutputsCsv:
         conn = await db.init_db(tmp_path / "pipeline.db")
         out_dir = tmp_path / "nested" / "run1"
 
-        config = PipelineConfig(output_dir=out_dir)
+        config = PipelineConfig(output_dir=out_dir, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         assert (out_dir / "valid_emails.csv").exists()
@@ -142,7 +142,7 @@ class TestWriteOutputsResultsJson:
         await _insert_validated(conn, "rec1")
         await _insert_validated(conn, "rec2", record_state=State.VALIDATION_FAILED, final_verdict="invalid")
 
-        config = PipelineConfig(output_dir=tmp_path)
+        config = PipelineConfig(output_dir=tmp_path, racknerd_enabled=False)
         await write_outputs(conn, config)
 
         results_path = tmp_path / "results.json"
