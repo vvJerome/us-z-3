@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Bumps requirements.txt's version ranges — but CI/Docker install from
+  # requirements.lock, not requirements.txt (see .claude/rules/git.md), so a
+  # Dependabot PR here doesn't change what actually gets installed until
+  # `make lock` is run and the regenerated lock is committed on top of it.
+  # Not fully automated; this at least surfaces "a range moved" instead of
+  # nothing ever prompting a look.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
