@@ -45,7 +45,7 @@ Shared fixtures live in `tests/conftest.py`. Don't define the same fixture in mu
 
 ## Passing bar
 
-807 tests, 0 failures, 0 errors. mypy 0 errors across 76 source files. Any regression is a blocker.
+901 tests, 0 failures, 0 errors. mypy 0 errors across 76 source files. Coverage gate enforced at 80% (`--cov-fail-under=80` in `pytest.ini`; actual is ~88%) — a PR that drops it below 80% fails `make check` outright. Any regression is a blocker.
 
 Run `make check` before marking any task complete (runs pytest + mypy). If you don't have `make`, run both manually:
 ```bash

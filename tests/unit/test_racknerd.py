@@ -14,6 +14,20 @@ from pipeline.constants import (
 )
 
 
+def _fake_smtp(rcpt_return=(250, "OK"), rcpt_side_effect=None):
+    """A mock aiosmtplib.SMTP client with the EHLO/MAIL/RCPT/RSET/QUIT sequence stubbed."""
+    smtp = MagicMock()
+    smtp.ehlo = AsyncMock(return_value=(250, "OK"))
+    smtp.mail = AsyncMock(return_value=(250, "OK"))
+    if rcpt_side_effect is not None:
+        smtp.rcpt = AsyncMock(side_effect=rcpt_side_effect)
+    else:
+        smtp.rcpt = AsyncMock(return_value=rcpt_return)
+    smtp.rset = AsyncMock(return_value=(250, "OK"))
+    smtp.quit = AsyncMock(return_value=(221, "Bye"))
+    return smtp
+
+
 class TestSpamhausGuard:
     def test_not_cooling_initially(self):
         guard = _SpamhausGuard()
@@ -35,6 +49,21 @@ class TestSpamhausGuard:
         guard = _SpamhausGuard()
         # Should return without sleeping
         await asyncio.wait_for(guard.wait_if_cooling(), timeout=0.1)
+
+    async def test_wait_if_cooling_actually_sleeps_while_cooling(self):
+        guard = _SpamhausGuard()
+        guard._cooldown_until = time.monotonic() + 0.05
+        start = time.monotonic()
+        await guard.wait_if_cooling()
+        assert time.monotonic() - start >= 0.04
+
+    def test_events_outside_window_are_evicted_before_threshold_check(self):
+        guard = _SpamhausGuard()
+        # Backdate an old event past the sliding window so record_block()'s
+        # eviction loop actually pops it instead of just appending forever.
+        guard._events.append(time.monotonic() - RACKNERD_SPAMHAUS_WINDOW_S - 1)
+        guard.record_block()
+        assert len(guard._events) == 1  # old event evicted, only the new one remains
 
     def test_cooldown_expires(self):
         guard = _SpamhausGuard()
@@ -81,31 +110,30 @@ class TestRacknerdConsumerTunnelCheck:
 class TestRacknerdSmtpResponseParsing:
     """Test SMTP response code → status mapping without a real tunnel."""
 
-    def test_2xx_is_valid(self):
-        # Use the parsing logic directly via _probe_mx internals
-        from pipeline.consumers.racknerd import _INVALID_KEYWORDS, _SPAMHAUS_KEYWORDS
-        code, msg = 250, "2.1.5 OK"
-        assert 200 <= code <= 399
-        # → "valid"
+    async def test_2xx_is_valid(self):
+        """End-to-end through _run_smtp_probe, not just the raw classification helper."""
+        smtp = _fake_smtp(rcpt_return=(250, "2.1.5 OK"))
+        status, msg = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        assert status == "valid"
+        assert "250" in msg
 
-    def test_spamhaus_5xx_is_blocked(self):
-        from pipeline.consumers.racknerd import _SPAMHAUS_KEYWORDS
-        code, msg = 554, "5.7.1 Service unavailable; Client host blocked by spamhaus zen.spamhaus.org"
-        assert code >= 500
-        assert any(kw in msg.lower() for kw in _SPAMHAUS_KEYWORDS)
-        # → "blocked"
+    async def test_spamhaus_5xx_is_blocked(self):
+        smtp = _fake_smtp(rcpt_return=(
+            554, "5.7.1 Service unavailable; Client host blocked by spamhaus zen.spamhaus.org",
+        ))
+        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        assert status == "blocked"
 
-    def test_no_such_user_is_invalid(self):
-        from pipeline.consumers.racknerd import _INVALID_KEYWORDS
-        code, msg = 550, "5.1.1 no such user here"
-        assert code >= 500
-        assert any(kw in msg.lower() for kw in _INVALID_KEYWORDS)
-        # → "invalid"
+    async def test_no_such_user_is_invalid(self):
+        smtp = _fake_smtp(rcpt_return=(550, "5.1.1 no such user here"))
+        status, _ = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        assert status == "invalid"
 
-    def test_4xx_is_error(self):
-        code, msg = 421, "4.2.1 try again later"
-        assert 400 <= code < 500
-        # → "error" (temporary failure)
+    async def test_4xx_is_error(self):
+        smtp = _fake_smtp(rcpt_return=(421, "4.2.1 try again later"))
+        status, msg = await RacknerdConsumer(tunnel=None)._run_smtp_probe(smtp, "a@b.com", "mx.b.com")
+        assert status == "error"
+        assert "4xx temporary" in msg
 
     def test_recipient_not_found_is_invalid(self):
         """GoDaddy 550 'Recipient not found' must classify as invalid via SMTPRecipientRefused path."""
@@ -192,6 +220,16 @@ class TestRacknerdSmtpResponseParsing:
         # Backward compat: still returns IP literal — but RacknerdConfig will warn.
         assert result.startswith("[") and result.endswith("]")
 
+    def test_helo_hostname_falls_back_to_gethostbyname_when_udp_trick_fails(self):
+        """No FQDN and no outbound route (UDP connect fails) — fall back to gethostbyname."""
+        from pipeline.consumers.racknerd import _default_helo_hostname
+
+        with patch("pipeline.consumers.racknerd.socket.getfqdn", return_value="racknerd-0a2741a"), \
+             patch("pipeline.consumers.racknerd.socket.socket", side_effect=OSError("no route")), \
+             patch("pipeline.consumers.racknerd.socket.gethostbyname", return_value="10.0.0.5"):
+            result = _default_helo_hostname()
+        assert result == "[10.0.0.5]"
+
     def test_helo_hostname_uses_fqdn_when_valid(self):
         """When socket.getfqdn() returns a real FQDN, use it directly."""
         from unittest.mock import patch
@@ -225,6 +263,10 @@ class TestMxProvider:
         assert _mx_provider("mx1.pphosted.com") == "pphosted.com"
         assert _mx_provider("eu-smtp-1.mimecast.com") == "mimecast.com"
         assert _mx_provider("mail.protection.outlook.com") == "outlook.com"
+
+    def test_single_label_host_returned_unchanged(self):
+        """A malformed/unqualified MX host with no dot at all — fall back to the raw value."""
+        assert _mx_provider("localhost") == "localhost"
 
     def test_two_part_domain_unchanged(self):
         assert _mx_provider("google.com") == "google.com"
